@@ -1,0 +1,12 @@
+backends_commit:
+  vllm: b6553be1bc75f046b00046a4ad7576364d03c835
+backends_version:
+  FlagScale: 0.8.0
+  vllm: 0.9.1
+commit: f7170e36acbb1be7ded047cc598bc03971095903
+contact: ''
+device_type: Test_encry
+models:
+- '1'
+task:
+- inference
