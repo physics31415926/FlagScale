@@ -1,0 +1,19 @@
+diff --git a/.github/ISSUE_TEMPLATE/question.md b/.github/ISSUE_TEMPLATE/question.md
+deleted file mode 100644
+index b3d89a0a..00000000
+--- a/.github/ISSUE_TEMPLATE/question.md
++++ /dev/null
+@@ -1,12 +0,0 @@
+----
+-name: QUESTION
+-about: Ask a question about Megatron-LM that is not a bug, regression or enhancement
+-  request
+-title: "[QUESTION]"
+-labels: ''
+-assignees: ''
+-
+----
+-
+-**Your question**
+-Ask a clear and concise question about Megatron-LM.
+

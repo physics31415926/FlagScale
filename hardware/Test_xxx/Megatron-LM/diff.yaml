@@ -1,0 +1,11 @@
+backends_commit:
+  Megatron-LM: fdfcef87004205eca69ea462b375578185ea01f6
+backends_version:
+  Megatron-LM: .12.0
+commit: 4e768051e88f30ce018f4d620e46249713670dc5
+contact: ''
+device_type: Test_xxx
+models:
+- '3'
+task:
+- train

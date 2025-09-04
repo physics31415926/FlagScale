@@ -1,0 +1,17 @@
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 5965c16d..75023684 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -112,9 +112,11 @@ class TopKRouter(Router):
+                 torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
+                 persistent=False,
+             )
++            self.local_tokens_per_expert = self.local_tokens_per_expert.cuda()
+             self.register_buffer(
+                 'expert_bias', torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
+             )
++            self.expert_bias = self.expert_bias.cuda()
+         else:
+             self.local_tokens_per_expert = None
+             self.expert_bias = None
+

@@ -1,0 +1,13 @@
+diff --git a/megatron/core/tensor_parallel/cross_entropy.py b/megatron/core/tensor_parallel/cross_entropy.py
+index 27c8f063..bd589083 100644
+--- a/megatron/core/tensor_parallel/cross_entropy.py
++++ b/megatron/core/tensor_parallel/cross_entropy.py
+@@ -59,6 +59,7 @@ class VocabParallelCrossEntropy:
+         predicted_logits_1d = logits_2d[arange_1d, masked_target_1d]
+         predicted_logits_1d = predicted_logits_1d.clone().contiguous()
+         predicted_logits = predicted_logits_1d.view_as(target)
++        # print(f'target_mask is {target_mask.shape}, {target_mask.dtype}, predicted_logits is {predicted_logits.shape}, {predicted_logits.dtype}')
+         predicted_logits[target_mask] = 0.0
+ 
+         exp_logits = vocab_parallel_logits
+

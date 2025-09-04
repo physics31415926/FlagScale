@@ -1,0 +1,13 @@
+diff --git a/.coveragerc b/.coveragerc
+deleted file mode 100644
+index 0e37a547..00000000
+--- a/.coveragerc
++++ /dev/null
+@@ -1,6 +0,0 @@
+-[html]
+-directory = coverage
+-
+-[run]
+-data_file = .coverage_$LOCAL_RANK
+-relative_files = true
+

@@ -1,0 +1,39 @@
+diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
+index 1d5725cc..ab667855 100644
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -1344,16 +1344,30 @@ try:
+ 
+     from transformer_engine.pytorch.permutation import (
+         moe_permute,
+-        moe_sort_chunks_by_index,
++        # moe_sort_chunks_by_index,
+         moe_unpermute,
+     )
+ 
+     fused_permute = moe_permute
+     fused_unpermute = moe_unpermute
+-    fused_sort_chunks_by_index = moe_sort_chunks_by_index
++    fused_sort_chunks_by_index = None #moe_sort_chunks_by_index
+ 
+ except ImportError:
+ 
+     fused_permute = None
+     fused_unpermute = None
+     fused_sort_chunks_by_index = None
++
++try:
++
++    from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
++
++    def te_parallel_cross_entropy(logits: torch.Tensor, labels: torch.Tensor):
++        """Wrapper function for TE's Cross Entropy Loss kernel"""
++        return parallel_cross_entropy(
++            logits, labels, 0.0, False, get_tensor_model_parallel_group(check_initialized=False)
++        )
++
++except ImportError:
++
++    te_parallel_cross_entropy = None
+\ No newline at end of file
+

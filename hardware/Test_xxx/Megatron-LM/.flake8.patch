@@ -1,0 +1,12 @@
+diff --git a/.flake8 b/.flake8
+deleted file mode 100644
+index 1e35e0c4..00000000
+--- a/.flake8
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[flake8]
+-max-line-length = 100
+-extend-ignore = E203,E501,F401,E402,E714
+-per-file-ignores = __init__.py:F401
+\ No newline at end of file
+

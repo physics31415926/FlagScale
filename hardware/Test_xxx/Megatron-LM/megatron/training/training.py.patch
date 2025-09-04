@@ -1,0 +1,54 @@
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 7cf6fcbd..768dcd2c 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -52,6 +52,7 @@ from megatron.core.rerun_state_machine import (
+     RerunDataIterator,
+     RerunMode,
+ )
++from megatron.core.fp8_utils import get_fp8_scale_and_amax
+ from megatron.training.initialize import initialize_megatron
+ from megatron.training.initialize import write_args_to_tensorboard
+ from megatron.training.initialize import set_jit_fusion_options
+@@ -582,9 +583,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
+     # GPU allocation.
+     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
+     # in the fully_shard function of FSDP2 instead.
+-    if not (args.use_torch_fsdp2 and args.use_cpu_initialization) and not args.init_model_with_meta_device:
+-        for model_module in model:
+-            model_module.cuda(torch.cuda.current_device())
++    # if not (args.use_torch_fsdp2 and args.use_cpu_initialization) and not args.init_model_with_meta_device:
++    #     for model_module in model:
++    #         model_module.cuda(torch.cuda.current_device())
+ 
+     # Fp16 conversion.
+     if args.fp16 or args.bf16:
+@@ -595,15 +596,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
+     # param) to its amax_history. The following logic will correct the amax_history back.
+     for model_module in model:
+         for param in model_module.parameters():
+-            if is_float8tensor(param) and param._fp8_meta is not None:
+-                fp8_meta = param._fp8_meta['scaling_fwd']
+-                fp8_meta_index = param._fp8_meta_index
+-                if hasattr(param, 'get_high_precision_init_val'):
+-                    fp8_meta.amax_history[0][fp8_meta_index].copy_(
+-                        param.get_high_precision_init_val().abs().max()
+-                    )
+-                else:
+-                    fp8_meta.amax_history[0][fp8_meta_index] = 0
++            if is_float8tensor(param): #and param._fp8_meta is not None:
++                # TODO(yehua.zhang): move the fp8_meta_index
++                scale, amax = get_fp8_scale_and_amax(param)
++                # amax = 0
++                amax[0].zero_()
++                # fp8_meta = param._fp8_meta['scaling_fwd']
++                # fp8_meta_index = param._fp8_meta_index
++                # if hasattr(param, 'get_high_precision_init_val'):
++                #     fp8_meta.amax_history[0][fp8_meta_index].copy_(
++                #         param.get_high_precision_init_val().abs().max()
++                #     )
++                # else:
++                #     fp8_meta.amax_history[0][fp8_meta_index] = 0
+ 
+     if wrap_with_ddp:
+         if args.use_torch_fsdp2:
