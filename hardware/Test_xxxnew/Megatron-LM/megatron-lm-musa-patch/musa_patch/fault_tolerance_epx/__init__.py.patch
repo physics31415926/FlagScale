@@ -1,0 +1,10 @@
+diff --git a/megatron-lm-musa-patch/musa_patch/fault_tolerance_epx/__init__.py b/megatron-lm-musa-patch/musa_patch/fault_tolerance_epx/__init__.py
+new file mode 100644
+index 00000000..3d1537ff
+--- /dev/null
++++ b/megatron-lm-musa-patch/musa_patch/fault_tolerance_epx/__init__.py
+@@ -0,0 +1,3 @@
++from . import param_and_grad_buffer
++from . import data_samplers
++from . import epx_model_and_optimizer
+

@@ -1,0 +1,22 @@
+diff --git a/.gitignore b/.gitignore
+deleted file mode 100644
+index fd081062..00000000
+--- a/.gitignore
++++ /dev/null
+@@ -1,14 +0,0 @@
+-__pycache__
+-*.so
+-build
+-.coverage_*
+-*.egg-info
+-*~
+-slurm*
+-logs
+-.vscode
+-local/
+-.gitmodules
+-wandb/
+-onelogger.log
+-onelogger.err
+\ No newline at end of file
+

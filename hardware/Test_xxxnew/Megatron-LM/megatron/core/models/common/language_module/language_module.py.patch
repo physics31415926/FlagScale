@@ -1,0 +1,29 @@
+diff --git a/megatron/core/models/common/language_module/language_module.py b/megatron/core/models/common/language_module/language_module.py
+index cb26be12..898e7f0b 100644
+--- a/megatron/core/models/common/language_module/language_module.py
++++ b/megatron/core/models/common/language_module/language_module.py
+@@ -13,7 +13,10 @@ from megatron.core.transformer.enums import AttnBackend
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.transformer_config import TransformerConfig
+ from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+-
++try:
++    from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
++except:
++    te_parallel_cross_entropy = None
+ 
+ class LanguageModule(MegatronModule):
+     """Base language module that has common helper functions used across GPT, BERT etc.
+@@ -76,7 +79,10 @@ class LanguageModule(MegatronModule):
+         # [b s] => [s b]
+         labels = labels.transpose(0, 1).contiguous()
+         if self.config.cross_entropy_loss_fusion:
+-            loss = fused_vocab_parallel_cross_entropy(logits, labels)
++            # loss = fused_vocab_parallel_cross_entropy(logits, labels)
++            # HACK(yehua.zhang): replace fuse cross entropy to triton
++            labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
++            loss = te_parallel_cross_entropy(logits, labels)
+         else:
+             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+ 
+

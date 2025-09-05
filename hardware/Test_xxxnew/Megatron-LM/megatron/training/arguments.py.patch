@@ -1,0 +1,26 @@
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 06f06dae..8d2dac15 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -1083,8 +1083,10 @@ def _add_network_size_args(parser):
+                        help='Maximum number of position embeddings to use. '
+                        'This is the size of position embedding.')
+     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
+-                        choices=['learned_absolute', 'rope', 'relative', 'none'],
++                        choices=['learned_absolute', 'rope', 'relative', 'none', 'mrope'],
+                         help='Position embedding type.')
++    group.add_argument('--mrope-section', nargs='+', type=int, default=None,
++                       help='Multimodal rope section is for channel dimension, empty by default.')
+     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
+                         help='Number of buckets for relative position embeddings.')
+     group.add_argument('--relative-attention-max-distance', type=int, default=128,
+@@ -2012,6 +2014,8 @@ def _add_tokenizer_args(parser):
+     group.add_argument('--tokenizer-type', type=str,
+                        default=None,
+                        choices=['BertWordPieceLowerCase',
++                                'Qwen2TokenizerFS',
++                                'Qwen2VLTokenizer',
+                                 'BertWordPieceCase',
+                                 'GPT2BPETokenizer',
+                                 'SentencePieceTokenizer',
+

@@ -1,0 +1,16 @@
+diff --git a/megatron/core/tensor_parallel/mappings.py b/megatron/core/tensor_parallel/mappings.py
+index cdd72068..66bf2083 100644
+--- a/megatron/core/tensor_parallel/mappings.py
++++ b/megatron/core/tensor_parallel/mappings.py
+@@ -439,6 +439,10 @@ class _AllToAll(torch.autograd.Function):
+                 dtype=input.dtype,
+                 device=torch.cuda.current_device(),
+             )
++        # print(f'output_split_sizes is {output_split_sizes}')
++        # print(f'input_split_sizes is {input_split_sizes}')
++        # print(f'output is {output.shape}')
++        # print(f'input is {input.shape}')
+         torch.distributed.all_to_all_single(
+             output,
+             input,
+

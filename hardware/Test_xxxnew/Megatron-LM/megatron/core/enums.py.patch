@@ -1,0 +1,18 @@
+diff --git a/megatron/core/enums.py b/megatron/core/enums.py
+index 46e7d3b7..c74700d6 100644
+--- a/megatron/core/enums.py
++++ b/megatron/core/enums.py
+@@ -8,3 +8,12 @@ class ModelType(enum.Enum):
+     encoder_and_decoder = 2
+     retro_encoder = 3
+     retro_decoder = 4
++
++
++class Fp8Recipe(str, enum.Enum):
++    """FP8 recipe names: delayed, tensorwise, mxfp8, blockwise."""
++
++    delayed = "delayed"
++    tensorwise = "tensorwise"
++    mxfp8 = "mxfp8"
++    blockwise = "blockwise"
+
