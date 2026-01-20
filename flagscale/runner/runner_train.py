@@ -464,6 +464,7 @@ class SSHTrainRunner(RunnerBase):
         monitor=False,
         interval=10,
         enable_monitoring=None,
+        **kwargs,
     ):
         # Read from config if not explicitly provided
         if enable_monitoring is None:

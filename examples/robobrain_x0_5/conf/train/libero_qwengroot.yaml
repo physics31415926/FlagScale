@@ -14,6 +14,9 @@ output_directory: outputs/libero_qwengroot/checkpoints/ckpt_out
 log_freq: 10
 train_steps: 100
 
+shuffle_buffer_size: null
+shuffle_over_epochs_multiplier: -1
+
 framework:
   name: QwenGR00T
   qwenvl:
