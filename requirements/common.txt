@@ -1,0 +1,5 @@
+# Common dependencies used by all tasks
+# Platform-agnostic packages including configuration management and experiment tracking
+
+hydra-core
+wandb

@@ -1,4 +1,7 @@
-name: Common Unit Tests
+name: Common Functional Tests - Inference
+
+# Inference task workflow - currently minimal tests
+# Install scripts and test infrastructure are ready
 
 on:
   workflow_call:
@@ -7,10 +10,10 @@ on:
         required: true
         type: string
         description: Platform name (e.g., cuda, default)
-      device:
+      test_matrix:
         required: true
         type: string
-        description: Device type (e.g., a100, a800, h100, generic)
+        description: JSON array of test configurations
       image:
         required: true
         type: string
@@ -39,20 +42,24 @@ on:
         default: "/root/miniconda3"
 
 jobs:
-  unit_test:
+  functional_test_inference:
     defaults:
       run:
         shell: bash
     env:
       PROJECT_ROOT: /workspace/FlagScale
     runs-on: ${{ fromJson(inputs.runs_on) }}
-    name: unit-${{ inputs.device }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test_config: ${{ fromJson(inputs.test_matrix) }}
     container:
       image: ${{ inputs.image }}
       ports:
         - 80
       volumes: ${{ fromJson(inputs.container_volumes) }}
       options: ${{ inputs.container_options }}
+
     steps:
       - name: Download source code artifact (attempt 1)
         uses: actions/download-artifact@v4
@@ -102,7 +109,7 @@ jobs:
         run: |
           git config --global --add safe.directory $PROJECT_ROOT
 
-      - name: Install dependencies for unit tests
+      - name: Install dependencies for inference
         run: |
           set -euo pipefail
           cd $PROJECT_ROOT
@@ -111,7 +118,7 @@ jobs:
           CONDA_PATH='${{ inputs.conda_path }}'
 
           # Build install command with optional conda parameters
-          INSTALL_CMD="./tools/install/install.sh --platform ${{ inputs.platform }} --task train --retry-count 3"
+          INSTALL_CMD="./tools/install/install.sh --platform ${{ inputs.platform }} --task inference --retry-count 3"
           if [ -n "$CONDA_ENV" ]; then
             INSTALL_CMD="$INSTALL_CMD --conda-env $CONDA_ENV"
             if [ -n "$CONDA_PATH" ]; then
@@ -121,27 +128,28 @@ jobs:
 
           # Run install script (handles conda activation internally if needed)
           eval $INSTALL_CMD
-
-          # Copy test data (keep existing logic)
-          mkdir -p /opt/data
-          cp -r /home/gitlab-runner/data/Megatron-LM/* /opt/data/ || true
-          cp -r /home/gitlab-runner/tokenizers/Megatron-LM/* /opt/data/ || true
         timeout-minutes: 30
 
-      - name: Run unit tests
-        id: unit_test
+      - name: Run functional tests
+        id: functional_test
         run: |
           set -euo pipefail
           cd $PROJECT_ROOT
 
           PLATFORM='${{ inputs.platform }}'
-          DEVICE='${{ inputs.device }}'
+          DEVICE='${{ matrix.test_config.device }}'
+          TASK='${{ matrix.test_config.task }}'
+          MODEL='${{ matrix.test_config.model }}'
+          CASE='${{ matrix.test_config.case }}'
           CONDA_ENV='${{ inputs.conda_env }}'
           CONDA_PATH='${{ inputs.conda_path }}'
 
-          echo "Running unit tests"
+          echo "Running functional tests for inference"
           echo "Platform: $PLATFORM"
           echo "Device: $DEVICE"
+          echo "Task: $TASK"
+          echo "Model: $MODEL"
+          echo "Case: ${CASE:-all}"
           echo "Project root: $PROJECT_ROOT"
 
           # Source conda utilities for reusable functions
@@ -163,19 +171,22 @@ jobs:
           echo "Python location: $(which python)"
           echo "Python version: $(python --version)"
 
-          # Run unit tests using run_tests.sh
+          # Run functional tests using run_tests.sh
           bash "$PROJECT_ROOT/tests/test_utils/runners/run_tests.sh" \
             --platform "$PLATFORM" \
             --device "$DEVICE" \
-            --type unit
+            --type functional \
+            --task "$TASK" \
+            --model "$MODEL" \
+            --list "$CASE"
           exit_code=$?
 
           if [ $exit_code -eq 0 ]; then
-            echo "✅ Unit tests passed for $PLATFORM/$DEVICE"
+            echo "✅ Functional tests passed for $PLATFORM/$DEVICE/$TASK/$MODEL/$CASE"
           else
-            echo "❌ Unit tests failed for $PLATFORM/$DEVICE (exit code: $exit_code)"
+            echo "❌ Functional tests failed for $PLATFORM/$DEVICE/$TASK/$MODEL/$CASE (exit code: $exit_code)"
           fi
 
           echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
           exit $exit_code
-        timeout-minutes: 90
+        timeout-minutes: 60
