@@ -232,9 +232,7 @@ class SshLauncher(LauncherBase):
         elif self.task_type == "rl":
             ray_cmd = []
             if self.resources is not None:
-                runtime_env = self.config.experiment.runner.get("runtime_env")
-                if not runtime_env:
-                    raise ValueError(f"No 'runtime_env' configuration found in task config: {self.config.experiment}")
+                runtime_env = self.config.experiment.runner.get("runtime_env", None)
                 ray_dashboard_port = self.config.experiment.runner.get("ray_dashboard_port", 8265)
                 ray_cmd = [
                     "ray",
