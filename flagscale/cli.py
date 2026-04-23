@@ -485,6 +485,41 @@ def pull(
 
 
 # ============================================================================
+# Agent Command: flagscale agent [--provider] [--model] [--config]
+# ============================================================================
+
+
+@app.command()
+def agent(
+    provider: str = typer.Option("anthropic", "--provider", "-p", help="LLM provider (anthropic, openai)"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model name (default: provider's default)"),
+    base_url: str | None = typer.Option(None, "--base-url", "-b", help="API base URL (for proxies/gateways)"),
+    config: Path | None = typer.Option(None, "--config", "-c", help="Agent config YAML path"),
+    query: str | None = typer.Argument(None, help="Single-shot query (non-interactive mode)"),
+):
+    """Start the FlagScale interactive agent, or run a single query."""
+    from flagscale.agent.react.config import AgentConfig
+    from flagscale.agent.react.agent import ReactAgent
+
+    if config:
+        cfg = AgentConfig.from_yaml(str(config))
+        if provider != "anthropic":
+            cfg.provider = provider
+        if model:
+            cfg.model = model
+        if base_url:
+            cfg.base_url = base_url
+    else:
+        cfg = AgentConfig.auto_load(provider=provider, model=model, base_url=base_url)
+
+    if query:
+        cfg.confirm_commands = False
+
+    agent_instance = ReactAgent(cfg)
+    agent_instance.run(single_shot_query=query)
+
+
+# ============================================================================
 # Version
 # ============================================================================
 

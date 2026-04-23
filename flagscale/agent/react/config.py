@@ -1,0 +1,123 @@
+"""Agent configuration."""
+
+import os
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import yaml
+
+
+DEFAULT_MODELS = {
+    "openai": "gpt-4o",
+    "anthropic": "claude-sonnet-4-20250514",
+}
+
+
+@dataclass
+class AgentConfig:
+    provider: str = "anthropic"
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    max_iterations: int = 50
+    max_context_tokens: int = 100000
+    shell_timeout: int = 120
+    dangerous_commands_check: bool = True
+    confirm_commands: bool = True
+    max_cost: float = 0.0
+    session_dir: Optional[str] = None
+    auto_skill: bool = True
+    plugin_tool_dirs: List[str] = field(default_factory=list)
+    skill_dirs: List[str] = field(default_factory=list)
+    shell_env: Dict[str, str] = field(default_factory=dict)
+    _config_path: Optional[str] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.model is None:
+            env_model = os.environ.get("ANTHROPIC_MODEL") if self.provider == "anthropic" else None
+            self.model = env_model or DEFAULT_MODELS.get(self.provider, "claude-sonnet-4-20250514")
+
+        if self.api_key is None:
+            if self.provider == "anthropic":
+                self.api_key = (
+                    os.environ.get("ANTHROPIC_AUTH_TOKEN")
+                    or os.environ.get("ANTHROPIC_API_KEY")
+                )
+            elif self.provider == "openai":
+                self.api_key = os.environ.get("OPENAI_API_KEY")
+
+        if self.base_url is None:
+            if self.provider == "anthropic":
+                self.base_url = os.environ.get("ANTHROPIC_BASE_URL")
+            elif self.provider == "openai":
+                self.base_url = os.environ.get("OPENAI_BASE_URL")
+
+        if not self.skill_dirs:
+            builtin_dir = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "skills"
+            )
+            project_dir = os.path.join(os.getcwd(), ".flagscale", "skills")
+            user_dir = os.path.join(Path.home(), ".flagscale", "skills")
+            self.skill_dirs = [builtin_dir, project_dir, user_dir]
+
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
+            if var not in self.shell_env:
+                val = os.environ.get(var)
+                if val:
+                    self.shell_env[var] = val
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "AgentConfig":
+        """Load config from a YAML file. Unknown keys are ignored."""
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        valid_fields = {f.name for f in cls.__dataclass_fields__.values() if not f.name.startswith("_")}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        config = cls(**filtered)
+        config._config_path = path
+        return config
+
+    @classmethod
+    def auto_load(cls, **overrides) -> "AgentConfig":
+        """Try loading from env var or default paths, then apply overrides."""
+        config_path = os.environ.get("FLAGSCALE_AGENT_CONFIG")
+        if not config_path:
+            candidates = [
+                os.path.join(os.getcwd(), ".flagscale", "agent.yaml"),
+                os.path.join(Path.home(), ".flagscale", "agent.yaml"),
+            ]
+            for c in candidates:
+                if os.path.isfile(c):
+                    config_path = c
+                    break
+
+        if config_path and os.path.isfile(config_path):
+            config = cls.from_yaml(config_path)
+        else:
+            config = cls()
+            config._config_path = config_path
+
+        for k, v in overrides.items():
+            if v is not None and hasattr(config, k):
+                setattr(config, k, v)
+        return config
+
+    def reload(self):
+        """Reload config from the original YAML file, if available."""
+        if not self._config_path or not os.path.isfile(self._config_path):
+            return False
+        with open(self._config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        valid_fields = {f.name for f in self.__dataclass_fields__.values() if not f.name.startswith("_")}
+        for k, v in data.items():
+            if k in valid_fields:
+                setattr(self, k, v)
+        # Re-inherit proxy env vars for any not explicitly set in YAML
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
+            if var not in self.shell_env:
+                val = os.environ.get(var)
+                if val:
+                    self.shell_env[var] = val
+        return True
