@@ -13,15 +13,16 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIProvider(LLMProvider):
-    def __init__(self, model: str, api_key: str, base_url: str = None):
+    def __init__(self, model: str, api_key: str, base_url: str = None, max_tokens: int = 8192):
         self._model = model
+        self._max_tokens = max_tokens
         kwargs = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
         self._client = OpenAI(**kwargs)
 
     def chat(self, messages: List[Dict[str, Any]], tools: List[dict]) -> Dict[str, Any]:
-        kwargs = {"model": self._model, "messages": messages}
+        kwargs = {"model": self._model, "messages": messages, "max_tokens": self._max_tokens}
         if tools:
             kwargs["tools"] = tools
 
@@ -45,6 +46,7 @@ class OpenAIProvider(LLMProvider):
         kwargs = {
             "model": self._model,
             "messages": messages,
+            "max_tokens": self._max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }

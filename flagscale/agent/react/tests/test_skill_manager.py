@@ -78,3 +78,61 @@ class TestSkillManager:
         meta, body = SkillManager._parse_frontmatter(content)
         assert meta == {}
         assert body == "Body."
+
+
+@pytest.fixture
+def param_skill_dir(tmp_path):
+    """Create a skill with parameters defined in frontmatter."""
+    d = tmp_path / "skills"
+    d.mkdir()
+    s = d / "deploy"
+    s.mkdir()
+    (s / "SKILL.md").write_text(
+        "---\n"
+        "name: deploy\n"
+        "description: Deploy a model\n"
+        "parameters:\n"
+        "  - name: model_name\n"
+        "    description: Model to deploy\n"
+        "    required: false\n"
+        "    default: qwen3\n"
+        "  - name: replicas\n"
+        "    description: Number of replicas\n"
+        "    required: false\n"
+        "---\n"
+        "Deploy {model_name} with {replicas} replicas."
+    )
+    return [str(d)]
+
+
+class TestParameterizedSkills:
+    def test_load_with_params(self, param_skill_dir):
+        mgr = SkillManager(param_skill_dir)
+        content = mgr.load("deploy", model_name="llama3", replicas="4")
+        assert "llama3" in content
+        assert "4 replicas" in content
+
+    def test_load_with_defaults(self, param_skill_dir):
+        mgr = SkillManager(param_skill_dir)
+        content = mgr.load("deploy", replicas="2")
+        assert "qwen3" in content
+        assert "2 replicas" in content
+
+    def test_load_no_params_keeps_placeholders(self, param_skill_dir):
+        mgr = SkillManager(param_skill_dir)
+        content = mgr.load("deploy")
+        assert "qwen3" in content
+        assert "{replicas}" in content
+
+    def test_list_includes_parameters(self, param_skill_dir):
+        mgr = SkillManager(param_skill_dir)
+        skills = mgr.list_skills()
+        assert len(skills) == 1
+        assert len(skills[0]["parameters"]) == 2
+        assert skills[0]["parameters"][0]["name"] == "model_name"
+
+    def test_extra_params_ignored(self, param_skill_dir):
+        mgr = SkillManager(param_skill_dir)
+        content = mgr.load("deploy", model_name="llama3", replicas="4", unknown="x")
+        assert "llama3" in content
+        assert "{unknown}" not in content

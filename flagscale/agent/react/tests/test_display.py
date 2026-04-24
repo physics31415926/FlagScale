@@ -36,7 +36,8 @@ class TestDisplay:
     def test_fmt_tokens(self):
         assert display._fmt_tokens(999) == "999"
         assert display._fmt_tokens(1000) == "1,000"
-        assert display._fmt_tokens(1234567) == "1,234,567"
+        assert display._fmt_tokens(100000) == "100k"
+        assert display._fmt_tokens(1234567) == "1234k"
 
     def test_color_helpers(self):
         os.environ.pop("NO_COLOR", None)

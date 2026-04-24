@@ -2,13 +2,25 @@
 
 import pytest
 
-from flagscale.agent.react.retry import retry_with_backoff
+from flagscale.agent.react.retry import retry_with_backoff, _is_retryable_exception
 
 
 class FakeAPIError(Exception):
     def __init__(self, status_code):
         self.status_code = status_code
         super().__init__(f"API error {status_code}")
+
+
+class ConnectionError(Exception):
+    pass
+
+
+class APIConnectionError(Exception):
+    pass
+
+
+class APITimeoutError(Exception):
+    pass
 
 
 class TestRetryWithBackoff:
@@ -49,3 +61,59 @@ class TestRetryWithBackoff:
             raise ValueError("bad input")
         with pytest.raises(ValueError):
             retry_with_backoff(fn, max_retries=3, base_delay=0.01)
+
+    def test_retry_on_connection_error(self):
+        attempts = []
+        def fn():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise ConnectionError("connection reset")
+            return "ok"
+        result = retry_with_backoff(fn, max_retries=3, base_delay=0.01)
+        assert result == "ok"
+        assert len(attempts) == 3
+
+    def test_retry_on_api_connection_error(self):
+        attempts = []
+        def fn():
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise APIConnectionError("failed to connect")
+            return "ok"
+        result = retry_with_backoff(fn, max_retries=3, base_delay=0.01)
+        assert result == "ok"
+        assert len(attempts) == 2
+
+    def test_retry_on_api_timeout_error(self):
+        attempts = []
+        def fn():
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise APITimeoutError("timed out")
+            return "ok"
+        result = retry_with_backoff(fn, max_retries=3, base_delay=0.01)
+        assert result == "ok"
+        assert len(attempts) == 2
+
+    def test_connection_error_exhausted(self):
+        def fn():
+            raise ConnectionError("always fails")
+        with pytest.raises(ConnectionError):
+            retry_with_backoff(fn, max_retries=2, base_delay=0.01)
+
+
+class TestIsRetryableException:
+    def test_connection_error(self):
+        assert _is_retryable_exception(ConnectionError("test"))
+
+    def test_api_connection_error(self):
+        assert _is_retryable_exception(APIConnectionError("test"))
+
+    def test_api_timeout_error(self):
+        assert _is_retryable_exception(APITimeoutError("test"))
+
+    def test_value_error_not_retryable(self):
+        assert not _is_retryable_exception(ValueError("test"))
+
+    def test_generic_exception_not_retryable(self):
+        assert not _is_retryable_exception(Exception("test"))

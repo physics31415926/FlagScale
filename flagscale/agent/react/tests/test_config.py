@@ -26,8 +26,8 @@ class TestAgentConfig:
         assert cfg.provider == "anthropic"
         assert "claude" in cfg.model
         assert cfg.max_iterations == 50
-        assert cfg.max_context_tokens == 100000
-        assert cfg.shell_timeout == 120
+        assert cfg.max_context_tokens == 200000
+        assert cfg.shell_remind_interval == 120
         assert cfg.dangerous_commands_check is True
 
     def test_anthropic_default_model(self):
@@ -70,12 +70,12 @@ class TestAgentConfig:
     def test_from_yaml(self, tmp_path):
         f = tmp_path / "config.yaml"
         f.write_text(
-            "provider: anthropic\nmax_iterations: 10\nshell_timeout: 60\n"
+            "provider: anthropic\nmax_iterations: 10\nshell_remind_interval: 60\n"
         )
         cfg = AgentConfig.from_yaml(str(f))
         assert cfg.provider == "anthropic"
         assert cfg.max_iterations == 10
-        assert cfg.shell_timeout == 60
+        assert cfg.shell_remind_interval == 60
 
     def test_from_yaml_ignores_unknown(self, tmp_path):
         f = tmp_path / "config.yaml"

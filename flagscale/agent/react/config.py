@@ -22,16 +22,22 @@ class AgentConfig:
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     max_iterations: int = 50
-    max_context_tokens: int = 100000
-    shell_timeout: int = 120
+    max_context_tokens: int = 200000
+    shell_remind_interval: int = 120
     dangerous_commands_check: bool = True
     confirm_commands: bool = True
+    mode: str = "confirm"  # "confirm" or "auto"
     max_cost: float = 0.0
+    max_output_tokens: int = 8192
     session_dir: Optional[str] = None
     auto_skill: bool = True
+    auto_plan: bool = True
     plugin_tool_dirs: List[str] = field(default_factory=list)
     skill_dirs: List[str] = field(default_factory=list)
     shell_env: Dict[str, str] = field(default_factory=dict)
+    pricing: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    cache_ttl_days: int = 7
+    memory_ttl_days: int = 7
     _config_path: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -67,6 +73,11 @@ class AgentConfig:
                 val = os.environ.get(var)
                 if val:
                     self.shell_env[var] = val
+
+        if self.mode not in ("confirm", "auto"):
+            self.mode = "confirm"
+        if self.mode == "auto":
+            self.confirm_commands = False
 
     @classmethod
     def from_yaml(cls, path: str) -> "AgentConfig":
@@ -114,7 +125,13 @@ class AgentConfig:
         for k, v in data.items():
             if k in valid_fields:
                 setattr(self, k, v)
-        # Re-inherit proxy env vars for any not explicitly set in YAML
+        # Re-run post-init validation
+        if self.mode not in ("confirm", "auto"):
+            self.mode = "confirm"
+        if self.mode == "auto":
+            self.confirm_commands = False
+        else:
+            self.confirm_commands = True
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
             if var not in self.shell_env:
                 val = os.environ.get(var)

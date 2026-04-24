@@ -15,8 +15,9 @@ logger = logging.getLogger(__name__)
 class AnthropicProvider(LLMProvider):
     schema_format = "anthropic"
 
-    def __init__(self, model: str, api_key: str, base_url: str = None):
+    def __init__(self, model: str, api_key: str, base_url: str = None, max_tokens: int = 8192):
         self._model = model
+        self._max_tokens = max_tokens
         kwargs = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
@@ -35,7 +36,7 @@ class AnthropicProvider(LLMProvider):
 
     def _build_kwargs(self, messages, tools):
         system, chat_messages = self._split_system(messages)
-        kwargs = {"model": self._model, "max_tokens": 4096, "messages": chat_messages}
+        kwargs = {"model": self._model, "max_tokens": self._max_tokens, "messages": chat_messages}
         if system:
             kwargs["system"] = system
         if tools:

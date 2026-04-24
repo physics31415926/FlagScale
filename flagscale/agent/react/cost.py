@@ -2,22 +2,30 @@
 
 PRICING = {
     "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
     "claude-sonnet-4": {"input": 3.0, "output": 15.0},
+    "claude-opus-4-7": {"input": 15.0, "output": 75.0},
     "claude-opus-4": {"input": 15.0, "output": 75.0},
+    "mco-4": {"input": 15.0, "output": 75.0},
+    "claude-haiku-4-5": {"input": 0.80, "output": 4.0},
     "claude-haiku-4": {"input": 0.80, "output": 4.0},
     "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
     "gpt-4o": {"input": 2.5, "output": 10.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4-turbo": {"input": 10.0, "output": 30.0},
+    "gpt-4.1": {"input": 2.0, "output": 8.0},
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
 }
 
 
 class CostTracker:
     """Track token usage and estimate costs in USD."""
 
-    def __init__(self, model: str, max_cost: float = 0.0):
+    def __init__(self, model: str, max_cost: float = 0.0, custom_pricing: dict = None):
         self._model = model
         self._max_cost = max_cost
+        self._custom_pricing = custom_pricing or {}
         self._total_input = 0
         self._total_output = 0
 
@@ -30,6 +38,9 @@ class CostTracker:
         return self._total_output
 
     def _get_pricing(self):
+        for key, pricing in self._custom_pricing.items():
+            if key in self._model:
+                return pricing
         for key, pricing in PRICING.items():
             if key in self._model:
                 return pricing

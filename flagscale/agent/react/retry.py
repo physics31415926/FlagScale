@@ -7,6 +7,16 @@ logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 529)
 
+RETRYABLE_EXCEPTION_NAMES = (
+    "ConnectionError",
+    "ConnectionResetError",
+    "TimeoutError",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "APIConnectionError",
+    "APITimeoutError",
+)
+
 
 def retry_with_backoff(fn, max_retries=3, base_delay=1.0):
     """Call fn(), retrying on transient API errors with exponential backoff."""
@@ -16,8 +26,11 @@ def retry_with_backoff(fn, max_retries=3, base_delay=1.0):
             return fn()
         except Exception as e:
             last_exc = e
+            if attempt >= max_retries:
+                raise
+
             status = _extract_status(e)
-            if status and status in RETRYABLE_STATUS_CODES and attempt < max_retries:
+            if status and status in RETRYABLE_STATUS_CODES:
                 delay = base_delay * (2 ** attempt)
                 logger.warning(
                     "API call failed (status=%s), retrying in %.1fs (%d/%d): %s",
@@ -25,6 +38,16 @@ def retry_with_backoff(fn, max_retries=3, base_delay=1.0):
                 )
                 time.sleep(delay)
                 continue
+
+            if _is_retryable_exception(e):
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "API call failed (%s), retrying in %.1fs (%d/%d): %s",
+                    type(e).__name__, delay, attempt + 1, max_retries, e,
+                )
+                time.sleep(delay)
+                continue
+
             raise
     raise last_exc
 
@@ -41,3 +64,11 @@ def _extract_status(exc):
         if isinstance(code, int):
             return code
     return None
+
+
+def _is_retryable_exception(exc):
+    """Check if exception type matches known retryable network errors."""
+    for cls in type(exc).__mro__:
+        if cls.__name__ in RETRYABLE_EXCEPTION_NAMES:
+            return True
+    return False

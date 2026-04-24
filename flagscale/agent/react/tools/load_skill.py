@@ -5,7 +5,7 @@ from flagscale.agent.react.tools.base import Tool
 
 class LoadSkillTool(Tool):
     name = "load_skill"
-    description = "Load a skill by name. Returns the skill content that provides specialized instructions."
+    description = "Load a skill by name. Returns the skill content that provides specialized instructions. Extra arguments are passed as parameters to fill placeholders in the skill body."
     parameters = {
         "type": "object",
         "properties": {
@@ -15,14 +15,16 @@ class LoadSkillTool(Tool):
             },
         },
         "required": ["name"],
+        "additionalProperties": True,
     }
 
     def __init__(self, skill_manager):
         self._skill_manager = skill_manager
 
     def execute(self, **kwargs) -> str:
-        name = kwargs["name"]
+        name = kwargs.pop("name")
         try:
-            return self._skill_manager.load(name)
+            content = self._skill_manager.load(name, **kwargs)
+            return f"SUCCESS: Skill '{name}' loaded.\n\n{content}"
         except Exception as e:
             return f"ERROR: loading skill '{name}': {e}"

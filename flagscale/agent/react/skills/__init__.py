@@ -46,19 +46,37 @@ class SkillManager:
                             "name": meta.get("name", entry),
                             "description": meta.get("description", ""),
                             "keywords": meta.get("keywords", []),
+                            "parameters": meta.get("parameters", []),
                         }
                     except Exception:
-                        seen_paths[skill_file] = {"name": entry, "description": "", "keywords": []}
+                        seen_paths[skill_file] = {"name": entry, "description": "", "keywords": [], "parameters": []}
         return list(seen_paths.values())
 
-    def load(self, name: str) -> str:
-        """Load a skill by frontmatter name or directory name. Later directories take priority."""
+    def load(self, name: str, **params) -> str:
+        """Load a skill by frontmatter name or directory name. Later directories take priority.
+
+        Optional keyword arguments are substituted into {param_name} placeholders
+        in the skill body. Parameters defined in frontmatter with defaults are
+        used when not provided by the caller.
+        """
         mapping = self._scan()
         skill_file = mapping.get(name)
         if skill_file is None:
             raise FileNotFoundError(f"Skill '{name}' not found in: {self._dirs}")
         meta, body = self._parse_file(skill_file)
         skill_name = meta.get("name", name)
+
+        param_defs = meta.get("parameters", [])
+        if isinstance(param_defs, list):
+            for pdef in param_defs:
+                if isinstance(pdef, dict):
+                    pname = pdef.get("name", "")
+                    if pname and pname not in params and "default" in pdef:
+                        params[pname] = pdef["default"]
+
+        for k, v in params.items():
+            body = body.replace(f"{{{k}}}", str(v))
+
         return f"<skill name=\"{skill_name}\">\n{body}\n</skill>"
 
     def _parse_file(self, path: str) -> Tuple[dict, str]:

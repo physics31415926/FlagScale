@@ -62,3 +62,21 @@ class TestCostTracker:
         ct = CostTracker("claude-sonnet-4-20250514-latest")
         ct.add(1_000_000, 0)
         assert ct.estimate_cost() > 0
+
+    def test_custom_pricing(self):
+        custom = {"my-custom-model": {"input": 5.0, "output": 20.0}}
+        ct = CostTracker("my-custom-model", custom_pricing=custom)
+        ct.add(1_000_000, 100_000)
+        expected = 1_000_000 * 5.0 / 1_000_000 + 100_000 * 20.0 / 1_000_000
+        assert ct.estimate_cost() == expected
+
+    def test_custom_pricing_overrides_builtin(self):
+        custom = {"claude-sonnet-4": {"input": 10.0, "output": 50.0}}
+        ct = CostTracker("claude-sonnet-4-20250514", custom_pricing=custom)
+        ct.add(1_000_000, 0)
+        assert ct.estimate_cost() == 10.0
+
+    def test_custom_pricing_empty(self):
+        ct = CostTracker("claude-sonnet-4-20250514", custom_pricing={})
+        ct.add(1_000_000, 0)
+        assert ct.estimate_cost() == 3.0
