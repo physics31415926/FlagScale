@@ -298,8 +298,10 @@ class ShellTool(Tool):
             _sleep_m = re.search(r"\bsleep\s+(\d+)", command)
             if _sleep_m:
                 secs = _sleep_m.group(1)
-                sys.stdout.write(f"\033[2m   ⏳ Waiting {secs}s (health checks active during wait)...\033[0m\n")
-                sys.stdout.flush()
+                from flagscale.agent.react import display
+                with display._stdout_lock:
+                    sys.stdout.write(f"\033[2m   ⏳ Waiting {secs}s (health checks active during wait)...\033[0m\n")
+                    sys.stdout.flush()
 
             start = time.time()
             next_check = min(30, self._remind_interval)
@@ -404,12 +406,16 @@ class ShellTool(Tool):
                     if long_run_approved:
                         recent = stdout_chunks[-5:] + stderr_chunks[-5:]
                         if recent and not self._quiet:
-                            sys.stdout.write("\n")
-                            print(f"\033[2m   ⏳ [{time_str}] Recent output:\033[0m")
+                            from flagscale.agent.react import display
+                            lines_out = [f"\033[2m   ⏳ [{time_str}] Recent output:\033[0m"]
                             for line in recent[-5:]:
-                                print(f"\033[2m   │ {line.rstrip()}\033[0m")
-                            sys.stdout.flush()
+                                lines_out.append(f"\033[2m   │ {line.rstrip()}\033[0m")
+                            with display._stdout_lock:
+                                sys.stdout.write("\n" + "\n".join(lines_out) + "\n")
+                                sys.stdout.flush()
                     else:
+                        from flagscale.agent.react import display
+                        display._stop_all_spinners()
                         sys.stdout.write("\n")
                         sys.stdout.flush()
                         recent = stdout_chunks[-10:] + stderr_chunks[-10:]

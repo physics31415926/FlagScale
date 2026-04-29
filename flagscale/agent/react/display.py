@@ -74,6 +74,44 @@ def blue(text):
     return _c256(117, text)
 
 
+def _term_width():
+    """Get terminal width, default 120."""
+    try:
+        return os.get_terminal_size().columns
+    except (AttributeError, ValueError, OSError):
+        return 120
+
+
+def _char_width(c):
+    """Terminal display width of a single character."""
+    import unicodedata
+    w = unicodedata.east_asian_width(c)
+    return 2 if w in ('W', 'F') else 1
+
+
+def _visible_width(text):
+    """Display width of text excluding ANSI escape sequences."""
+    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    return sum(_char_width(c) for c in plain)
+
+
+def _truncate_to_width(text, max_width):
+    """Truncate text so display width fits within max_width."""
+    if _visible_width(text) <= max_width:
+        return text
+    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    width = 0
+    cut = 0
+    for i, c in enumerate(plain):
+        cw = _char_width(c)
+        if width + cw > max_width - 3:
+            cut = i
+            break
+        width += cw
+        cut = i + 1
+    return plain[:cut] + "..." + "\033[0m"
+
+
 def _fmt_tokens(n):
     if n is None:
         return "?"
@@ -181,10 +219,12 @@ def banner(provider, model, mode=None, extra_lines=None):
 # ── Thinking ────────────────────────────────────────────────────────────
 
 def thinking():
+    _stop_all_spinners()
     _write(dim("⏳ Thinking..."))
 
 
 def thinking_clear():
+    _stop_all_spinners()
     _write("\r\033[K")
 
 
@@ -212,7 +252,8 @@ def tool_start(name, args_summary=""):
     label = f"  {icon} {name}"
     if args_summary:
         label += f" {args_summary}"
-    _print(dim(label), end="", flush=True)
+    tw = _term_width()
+    _print(_truncate_to_width(dim(label), tw), end="", flush=True)
     if name == "shell":
         _active_spinner = _Spinner()
         _print()
@@ -275,6 +316,7 @@ class _ParallelDisplay:
                 _print(dim(label))
             return
         # Print initial lines with pending indicator
+        tw = _term_width()
         with _stdout_lock:
             for name, args in self._tools:
                 icon = _tool_icon(name)
@@ -282,7 +324,8 @@ class _ParallelDisplay:
                 if args:
                     label += f" {args}"
                 frame = self._FRAMES[0]
-                sys.stdout.write(f"  {dim(label)} {dim(frame)}\n")
+                line = f"  {dim(label)} {dim(frame)}"
+                sys.stdout.write(f"{_truncate_to_width(line, tw)}\n")
             sys.stdout.flush()
         self._thread = threading.Thread(target=self._animate, daemon=True)
         self._thread.start()
@@ -306,6 +349,7 @@ class _ParallelDisplay:
         with self._lock:
             results = dict(self._results)
             extra = self._extra_lines
+        tw = _term_width()
         with _stdout_lock:
             total_up = self._n + extra
             if total_up > 0:
@@ -330,7 +374,7 @@ class _ParallelDisplay:
                 else:
                     frame = self._FRAMES[self._frame % len(self._FRAMES)]
                     line = f"  {dim(label)} {dim(frame)}"
-                sys.stdout.write(f"\r\033[K{line}\n")
+                sys.stdout.write(f"\r\033[K{_truncate_to_width(line, tw)}\n")
             if extra > 0:
                 sys.stdout.write(f"\033[{extra}B")
             sys.stdout.flush()
@@ -355,7 +399,10 @@ def parallel_tools_start(tool_summaries):
     tool_summaries: list of (name, args_summary) tuples
     Returns: _ParallelDisplay instance
     """
-    global _parallel_display
+    global _active_spinner, _parallel_display
+    if _active_spinner:
+        _active_spinner.stop()
+        _active_spinner = None
     _parallel_display = _ParallelDisplay(tool_summaries)
     _parallel_display.start()
     return _parallel_display
@@ -385,6 +432,7 @@ def parallel_tools_finish():
 # ── Turn / session summary ──────────────────────────────────────────────
 
 def turn_summary(turn_num, elapsed, input_tokens, output_tokens):
+    _stop_all_spinners()
     parts = [f"Turn {turn_num}", f"{elapsed:.1f}s",
              f"↑{_fmt_tokens(input_tokens)} ↓{_fmt_tokens(output_tokens)}"]
     _print(dim(f"── {' | '.join(parts)} ──"))

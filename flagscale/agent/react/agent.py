@@ -96,6 +96,9 @@ Working directory: {cwd}
    - Model size selection: if multiple sizes/configs exist and user didn't specify, list options with parameter counts and recommend the smallest, but let user choose.
    - Data preparation: if data needs downloading, present options (existing demo data / smallest real subset with size / synthetic data) and let user choose. NEVER start downloading multi-GB datasets without confirmation.
    - Download speed issues: if a download is running < 500KB/s for a large file, stop and ask user whether to continue, try a mirror, or provide data manually.
+   - Model weights / large data download: ALWAYS confirm before downloading. Present a summary table: name, estimated size, target path. Let user confirm or adjust paths.
+
+   WORKSPACE & STORAGE: All artifacts (models, datasets, experiments, checkpoints, logs, conda envs) follow a standard layout under a shared storage root. Load the `workspace-layout` skill before any of these operations: downloading models/data, creating conda envs, generating train configs, or launching training. The skill handles storage detection, path conventions, experiment isolation (never overwrite), disk space pre-checks, and user confirmation.
 
 5. PROACTIVE PROBLEM DETECTION. When you discover something wrong (bad config values, resource conflicts, missing files, OOM risks), flag it immediately and fix it if the fix is safe. Don't silently work around problems, but also don't stop everything to write an essay about it. "Found TP=8 causes OOM on 80GB GPUs for this model size, switching to TP=4 PP=2." — then do it.
 
@@ -1380,8 +1383,8 @@ class ReactAgent:
             error = "ERROR" in result[:20] if result else False
             detail = ""
             if error and result:
-                first_line = result.split('\n')[0].replace("ERROR:", "").strip()[:60]
-                detail = first_line
+                raw = result.split('\n')[0].replace("ERROR:", "").strip()
+                detail = (raw[:57] + "...") if len(raw) > 60 else raw
             display.parallel_tool_update(idx_to_line[idx], elapsed, error, detail)
             return result
 
@@ -1445,8 +1448,8 @@ class ReactAgent:
                 header = "\n".join(f"[{a}]" for a in annotations)
                 result = header + "\n" + result
         if error and result:
-            first_line = result.split('\n')[0].replace("ERROR:", "").strip()[:60]
-            detail = first_line
+            raw = result.split('\n')[0].replace("ERROR:", "").strip()
+            detail = (raw[:57] + "...") if len(raw) > 60 else raw
         display.tool_done(tool_name, elapsed, detail=detail, error=error)
         return result
 
