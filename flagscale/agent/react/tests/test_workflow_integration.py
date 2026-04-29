@@ -23,7 +23,6 @@ def _make_config(tmp_path):
         model="gpt-4",
         api_key="test-key",
         max_iterations=5,
-        max_cost=0.0,
         session_dir=str(tmp_path / "sessions"),
         skill_dirs=[SKILLS_DIR],
         plugin_tool_dirs=[],
@@ -121,7 +120,7 @@ class TestSkillManagerIntegration:
         expected = {
             "env-setup", "topo-detect", "model-porter", "data-prep",
             "train-config", "train-run", "train-monitor", "reproduce",
-            "precision-alignment",
+            "precision-alignment", "ops-discipline",
         }
         assert expected.issubset(names)
 

@@ -18,7 +18,6 @@ def _make_config(tmp_path, **overrides):
         model="claude-sonnet-4-20250514",
         api_key="test-key",
         max_iterations=5,
-        max_cost=0.0,
         session_dir=str(tmp_path / "sessions"),
         skill_dirs=[str(tmp_path / "skills")],
         plugin_tool_dirs=[],

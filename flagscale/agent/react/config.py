@@ -27,7 +27,6 @@ class AgentConfig:
     dangerous_commands_check: bool = True
     confirm_commands: bool = True
     mode: str = "confirm"  # "confirm" or "auto"
-    max_cost: float = 0.0
     max_output_tokens: int = 8192
     session_dir: Optional[str] = None
     auto_skill: bool = True
@@ -35,7 +34,6 @@ class AgentConfig:
     plugin_tool_dirs: List[str] = field(default_factory=list)
     skill_dirs: List[str] = field(default_factory=list)
     shell_env: Dict[str, str] = field(default_factory=dict)
-    pricing: Dict[str, Dict[str, float]] = field(default_factory=dict)
     cache_ttl_days: int = 7
     memory_ttl_days: int = 7
     _config_path: Optional[str] = field(default=None, repr=False)

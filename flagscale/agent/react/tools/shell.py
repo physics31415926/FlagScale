@@ -87,15 +87,22 @@ def _strip_grep_patterns(command: str) -> str:
 
 def _default_confirm(command: str) -> bool:
     """Ask user to confirm a potentially risky command."""
+    from flagscale.agent.react import display
+    if display._active_spinner:
+        display._active_spinner.stop()
+        display._active_spinner = None
     print(f"\n\033[33m⚠  Risky command:\033[0m {command}")
     try:
         answer = input("\033[33m   Allow? [y/N/a(llow all similar)]: \033[0m").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return False
-    if answer in ("a", "allow"):
-        return "allow_pattern"
-    return answer in ("y", "yes")
+    result = "allow_pattern" if answer in ("a", "allow") else (answer in ("y", "yes"))
+    if result:
+        display._active_spinner = display._Spinner()
+        print()
+        display._active_spinner.start()
+    return result
 
 
 _SELF_KILL_RE = re.compile(
@@ -228,6 +235,7 @@ class ShellTool(Tool):
     def execute(self, **kwargs) -> str:
         command = kwargs["command"]
         skip_confirm = kwargs.pop("_skip_confirm", False)
+        self._quiet = skip_confirm  # suppress dots/progress in parallel mode
 
         if self._check_dangerous and _FATAL_RE.search(command):
             return f"FATAL: Refused to execute potentially dangerous command: {command}"
@@ -294,7 +302,6 @@ class ShellTool(Tool):
                 sys.stdout.flush()
 
             start = time.time()
-            dot_count = 0
             next_check = min(30, self._remind_interval)
             long_run_approved = True
             last_output_snapshot = ""
@@ -338,8 +345,13 @@ class ShellTool(Tool):
                         else:
                             reason = decision.get("reason", "")
                             if reason:
-                                sys.stdout.write(f"\n\033[2m   🩺 [{time_str}] {reason}\033[0m\n")
-                                sys.stdout.flush()
+                                from flagscale.agent.react import display
+                                msg = f"\n\033[2m   🩺 [{time_str}] {reason}\033[0m\n"
+                                with display._stdout_lock:
+                                    sys.stdout.write(msg)
+                                    sys.stdout.flush()
+                                    if display._parallel_display and not display._parallel_display._stop.is_set():
+                                        display._parallel_display.add_extra_lines(2)
                             # LLM decides next check interval
                             ncs = decision.get("next_check_seconds")
                             if isinstance(ncs, (int, float)) and 30 <= ncs <= 300:
@@ -390,9 +402,8 @@ class ShellTool(Tool):
                                 )
 
                     if long_run_approved:
-                        # Silent progress: just show recent output, no prompt
                         recent = stdout_chunks[-5:] + stderr_chunks[-5:]
-                        if recent:
+                        if recent and not self._quiet:
                             sys.stdout.write("\n")
                             print(f"\033[2m   ⏳ [{time_str}] Recent output:\033[0m")
                             for line in recent[-5:]:
@@ -426,18 +437,10 @@ class ShellTool(Tool):
                             if partial:
                                 return f"TERMINATED by user after {int(elapsed)}s. Partial output:\n{partial}"
                             return f"TERMINATED by user after {int(elapsed)}s."
-                if elapsed >= 3 and int(elapsed) % 3 == 0 and int(elapsed) // 3 > dot_count:
-                    dot_count = int(elapsed) // 3
-                    sys.stdout.write("\033[2m.\033[0m")
-                    sys.stdout.flush()
                 time.sleep(0.2)
 
             t_out.join(timeout=5)
             t_err.join(timeout=5)
-
-            if dot_count > 0:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
 
             output = ""
             if stdout_chunks:
