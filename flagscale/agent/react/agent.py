@@ -20,9 +20,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style as PromptStyle
 
 from flagscale.agent.react import display
-from flagscale.agent.react.cache import KnowledgeCache
 from flagscale.agent.react.config import AgentConfig
-from flagscale.agent.react.history import HistoryManager
+from flagscale.agent.react.history import HistoryManager, COMPACTION_NOTICE
 from flagscale.agent.react.logger import setup_logging
 from flagscale.agent.react.providers import get_provider
 from flagscale.agent.react.retry import retry_with_backoff
@@ -35,9 +34,9 @@ from flagscale.agent.react.tools.read_file import ReadFileTool
 from flagscale.agent.react.tools.shell import ShellTool
 from flagscale.agent.react.tools.write_file import WriteFileTool
 from flagscale.agent.react.tools.web_fetch import WebFetchTool
-from flagscale.agent.react.tools.cache_write import CacheWriteTool
-from flagscale.agent.react.tools.cache_read import CacheReadTool
 from flagscale.agent.react.tools.find_log import FindLatestLogTool
+from flagscale.agent.react.tools.parse_metrics import ParseTrainingMetricsTool
+from flagscale.agent.react.tools.workspace_state import WorkspaceStateTool
 from flagscale.agent.react.memory import SessionMemory
 from flagscale.agent.react.tools.memory_write import MemoryWriteTool
 from flagscale.agent.react.tools.memory_read import MemoryReadTool
@@ -51,13 +50,14 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You are FlagScale Agent, a hands-on infrastructure engineer specialized in large model training with the FlagScale framework. You are not an assistant that explains — you are a partner that executes.
 
 Tools:
-- read_file / write_file / edit_file: File operations
-- shell: Execute shell commands
+- read_file / write_file / edit_file: File operations. ALWAYS use write_file to create files and edit_file to modify files — never use shell heredocs (cat << EOF), echo/printf redirection, or sed for file operations. Shell is for running commands, not writing files.
+- shell: Execute shell commands (run programs, check status, install packages, launch training)
 - web_fetch: Fetch URL content (docs, GitHub pages, error references)
 - load_skill: Load specialized skill instructions
-- cache_write / cache_read: Persist and retrieve project knowledge across sessions
 - memory_write / memory_read: Persist and retrieve key findings, decisions, and todos across sessions
 - find_latest_log: One-shot locate and display the latest training log for an experiment
+- parse_training_metrics: Parse training metrics from log files with health checks
+- workspace_state: Persist and retrieve workspace context across sessions
 - plan_create / plan_update / plan_status: Task planning for complex multi-step work
 
 Skills available:
@@ -137,7 +137,7 @@ Working directory: {cwd}
 
 ## Knowledge caching
 
-- Cache project structure/config/dependency analysis for future sessions. Check <project-knowledge> tags before re-reading.
+- Check <context-summary> tags before re-reading — they contain conclusions from compacted context.
 
 ## Task planning
 
@@ -145,7 +145,33 @@ Working directory: {cwd}
 
 {plan_context}
 {memory_context}
-{cache_context}
+{workspace_context}
+
+## Decision discipline
+
+Before choosing between implementation approaches, LIST ALL CONSTRAINTS first:
+- What does the framework support? (check docs/source, don't guess)
+- What are the memory/performance limits?
+- What has already been tried and failed?
+Then evaluate each approach against ALL constraints before picking one.
+Never start implementing before this analysis is done.
+
+## One-problem-at-a-time
+
+When debugging or aligning precision:
+1. Identify ONE hypothesis
+2. Design a verification experiment
+3. Run it and confirm/reject
+4. Only move to the next hypothesis after confirming this one is ruled out
+Never stack multiple unverified changes.
+
+## Training health quick-checks
+
+After any training run:
+- ce_loss ≈ ln(vocab_size) → model output is random. Stop and check: weights loaded? forward pass correct?
+- grad_norm = 0 or num_zeros ≈ total_params → gradients not flowing. Check loss computation, frozen params.
+- loss not decreasing after 10+ steps → learning rate, optimizer, or data issue.
+These checks happen BEFORE celebrating success or moving to the next task.
 
 ## Language
 
@@ -168,7 +194,6 @@ Users can type these slash commands directly (handled by the client, not by you)
 - `/save [path]` — save conversation to file
 - `/load <path>` — load a saved conversation
 - `/export` — export conversation
-- `/cache` — show cached project knowledge
 - `/plan` — show current task plan status
 - `/plan list` — list all plans (including history)
 - `/plan abandon` — abandon the current plan
@@ -180,11 +205,21 @@ Users can type these slash commands directly (handled by the client, not by you)
 
 - Use `conda run -n <env> <command>`, never `conda activate`. Never install into base env.
 - Never `find /` — scope to working directory. Never `sleep N && command` — use `find_latest_log` or direct `tail`.
+- When grep/awk returns empty on first try, check the actual file format (head -5) before retrying with a different pattern. Don't blindly guess patterns.
+- For stable training: prefer `wait <PID>` over repeated sleep-check loops. Get the launcher PID, then `wait $PID` to block until it exits. Use `find_latest_log` or `tail -f` for log monitoring in parallel.
 - To stop FlagScale training: `flagscale train <model> --config <config> stop`. Never broad `ps | grep | kill`.
 - Network errors: STOP and tell user to configure proxy. Don't attempt workarounds.
 - Before `rm -rf`: check with `ls`/`du -sh` first. Prefer `mv` to trash over delete.
 - For detailed shell rules, dependency resolution, training launch discipline, multi-node, and checkpoint resume: load the `ops-discipline` skill."""
 
+
+def _is_tool_result_msg(msg):
+    if msg.get("role") == "tool":
+        return True
+    content = msg.get("content")
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    return False
 
 
 class ReactAgent:
@@ -211,12 +246,9 @@ class ReactAgent:
         self.tool_registry.register(LoadSkillTool(self.skill_manager))
         self.tool_registry.register(WebFetchTool(proxies=self._build_proxies()))
         self.tool_registry.register(FindLatestLogTool())
+        self.tool_registry.register(ParseTrainingMetricsTool())
+        self.tool_registry.register(WorkspaceStateTool())
         self._load_plugin_tools()
-
-        cache_dir = os.path.join(Path.home(), ".flagscale", "agent_cache")
-        self.knowledge_cache = KnowledgeCache(cache_dir, config.cache_ttl_days)
-        self.tool_registry.register(CacheWriteTool(self.knowledge_cache))
-        self.tool_registry.register(CacheReadTool(self.knowledge_cache))
 
         memory_dir = os.path.join(Path.home(), ".flagscale", "agent_memory")
         self._session_id = uuid.uuid4().hex[:8]
@@ -237,6 +269,7 @@ class ReactAgent:
         self.provider = get_provider(config.provider, config.model, config.api_key, config.base_url, config.max_output_tokens)
 
         self.history = HistoryManager(max_context_tokens=config.max_context_tokens)
+        self.history.set_summarizer(self._summarize_for_compaction)
         self._refresh_system_prompt()
 
         self._turn_count = 0
@@ -246,6 +279,17 @@ class ReactAgent:
         self._loaded_skills = set()
         self._interrupted = False
         self._streaming_in_code_block = False
+
+    # ── Context compaction summarizer ────────────────────────────────────
+
+    def _summarize_for_compaction(self, text: str) -> str:
+        """Call LLM to summarize conversation segment being dropped during compaction."""
+        messages = [
+            {"role": "system", "content": "You are a concise summarizer. Output only the summary, no preamble."},
+            {"role": "user", "content": text},
+        ]
+        response = self.provider.chat(messages, tools=[])
+        return response.get("content", "").strip()
 
     # ── Unified command health judge ─────────────────────────────────────
 
@@ -257,22 +301,33 @@ class ReactAgent:
         "Output changed since last check: {output_changed}\n"
         "Consecutive checks with no output change: {stall_count}\n"
         "Recent output:\n{output}\n\n"
-        "Consider these scenarios:\n"
-        "- Download stuck (progress not advancing, same percentage/bytes for multiple checks)\n"
-        "- Network error (DNS failure, connection refused, timeout)\n"
-        "- Process hung (no meaningful progress)\n"
-        "- Repeated errors (same error message appearing over and over)\n"
-        "- Legitimate long operation (compiling, decompressing, GPU computation, large install)\n"
-        "- Download actively progressing (percentage/bytes increasing)\n"
-        "- No output at all (command may contain embedded sleep, or process crashed silently)\n\n"
-        "Also decide when to check next. Guidelines:\n"
-        "- Just started / no output yet: check soon (30-60s) to catch early failures\n"
-        "- Actively changing output (loading, downloading): moderate interval (60-120s)\n"
-        "- Stable long-running operation (training, large compile): longer interval (180-300s)\n"
-        "- Suspected issue (stalled, errors appearing): check soon (30-60s)\n\n"
+        "Phase-aware monitoring — adapt check frequency to the command's lifecycle stage:\n"
+        "- STARTUP (no output yet, imports loading, initializing): check frequently (10-30s). "
+        "Early failures are common.\n"
+        "- LOADING (model weights loading, data downloading, progress bars advancing): "
+        "moderate (30-60s).\n"
+        "- STABLE (training iterations running, loss printing regularly): "
+        "relaxed (120-300s).\n"
+        "- ANOMALY (errors in output, repeated failures, output stalled unexpectedly): "
+        "check soon (10-15s) or kill.\n\n"
+        "Key judgment rules:\n"
+        "- If output is actively progressing (new lines, advancing percentages): healthy, "
+        "adjust interval to phase.\n"
+        "- If output has stalled but the operation is known to be slow (large compile, "
+        "decompression): allow more time.\n"
+        "- If the command contains embedded sleep/wait and produces no output: you CANNOT "
+        "verify whether the process being waited for is still alive. After a reasonable "
+        "initial wait, KILL the command so the agent can check external state (process "
+        "liveness, GPU status, logs) with its full tool set, then decide whether to retry.\n"
+        "- If you see repeated errors, network failures, or crash signatures: kill immediately.\n"
+        "- Do NOT let a silent command run indefinitely just because 'it might be working.' "
+        "When in doubt, kill early — the agent can always re-check and retry.\n\n"
         "Reply with ONLY a JSON object: "
-        "{{\"kill\": true/false, \"reason\": \"one-line explanation\", "
-        "\"next_check_seconds\": <integer 30-300>}}"
+        "{{\"kill\": true/false, \"reason\": \"...\" or \"\", "
+        "\"next_check_seconds\": <integer 10-300>}}\n\n"
+        "If everything looks normal and healthy, set reason to empty string. "
+        "Only provide a reason when there is something noteworthy — an issue, "
+        "a phase transition, or a kill decision."
     )
 
     def _health_judge(self, command: str, recent_output: str, elapsed: str,
@@ -489,13 +544,17 @@ class ReactAgent:
 
     # ── System prompt ────────────────────────────────────────────────────
 
-    def _refresh_system_prompt(self, cache_context="", memory_context="", plan_context=""):
+    def _refresh_system_prompt(self, memory_context="", plan_context="", workspace_context=""):
         skills = self.skill_manager.list_skills()
         skills_text = (
             "\n".join(f"- {s['name']}: {s['description']}" for s in skills)
             if skills else "(no skills available)"
         )
-        prompt = SYSTEM_PROMPT.format(skills=skills_text, cwd=os.getcwd(), cache_context=cache_context, memory_context=memory_context, plan_context=plan_context)
+        prompt = SYSTEM_PROMPT.format(
+            skills=skills_text, cwd=os.getcwd(),
+            memory_context=memory_context, plan_context=plan_context,
+            workspace_context=workspace_context,
+        )
 
         msgs = self.history.messages
         if msgs and msgs[0].get("role") == "system":
@@ -531,23 +590,28 @@ class ReactAgent:
             lines.append(f'[{n.get("type", "?")}] {n.get("content", "")}')
         return "<session-memory>\n" + "\n".join(lines) + "\n</session-memory>"
 
-    def _inject_context(self, user_input):
-        """Auto-inject cached knowledge, session memory, and plan context into the system prompt."""
-        memory_context = self._build_memory_context()
+    def _build_workspace_context(self):
+        """Load workspace state file if it exists."""
+        state_path = os.path.join(os.getcwd(), ".flagscale", "workspace_state.md")
+        if not os.path.isfile(state_path):
+            return ""
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content:
+                return f"<workspace-state>\n{content[:2000]}\n</workspace-state>"
+        except Exception:
+            pass
+        return ""
 
-        entries = self.knowledge_cache.query(user_input)
-        cache_context = ""
-        if entries:
-            hints = []
-            for e in entries[:3]:
-                hints.append(
-                    f'<project-knowledge key="{e["key"]}">\n{e["content"]}\n</project-knowledge>'
-                )
-            cache_context = "\n\n".join(hints)
+    def _inject_context(self, user_input):
+        """Auto-inject session memory, plan, and workspace context into the system prompt."""
+        memory_context = self._build_memory_context()
 
         plan_context = self.task_plan.context_for_prompt()
 
-        # Complexity judge: suggest planning for complex tasks
+        workspace_context = self._build_workspace_context()
+
         complexity_hint = ""
         if not plan_context and self.config.auto_plan:
             judge_result = self._complexity_judge(user_input)
@@ -560,36 +624,7 @@ class ReactAgent:
 
         plan_context = plan_context + complexity_hint if complexity_hint else plan_context
 
-        self._refresh_system_prompt(cache_context=cache_context, memory_context=memory_context, plan_context=plan_context)
-
-    def _handle_cache_command(self, user_input):
-        parts = user_input.split()
-        if len(parts) < 2:
-            print("Usage: /cache list | /cache clear | /cache delete <key>")
-            return
-        sub = parts[1]
-        if sub == "list":
-            entries = self.knowledge_cache.list_entries()
-            if not entries:
-                print("No cache entries.")
-                return
-            for e in entries:
-                status = display.green("valid") if e["valid"] else display.yellow("stale")
-                print(f"  {e['key']}: {e['description']} [{status}, {e['sources']} sources]")
-        elif sub == "clear":
-            count = self.knowledge_cache.clear()
-            print(f"Cleared {count} cache entries.")
-        elif sub == "delete":
-            if len(parts) < 3:
-                print("Usage: /cache delete <key>")
-                return
-            key = parts[2]
-            if self.knowledge_cache.delete(key):
-                print(f"Deleted cache entry '{key}'.")
-            else:
-                print(f"No cache entry '{key}' found.")
-        else:
-            print("Usage: /cache list | /cache clear | /cache delete <key>")
+        self._refresh_system_prompt(memory_context=memory_context, plan_context=plan_context, workspace_context=workspace_context)
 
     def _handle_memory_command(self, user_input):
         parts = user_input.split()
@@ -766,7 +801,7 @@ class ReactAgent:
             print("  Proxy may be unreachable. You can reconfigure with /reload.")
 
     def _startup_hints(self):
-        """Build extra banner lines showing available memory/cache summaries."""
+        """Build extra banner lines showing available memory summaries."""
         hints = []
         mem_entries = self.session_memory.list_entries()
         if mem_entries:
@@ -778,17 +813,6 @@ class ReactAgent:
                 hints.append(f"  [{e.get('type', '?')}] {content}")
             if len(mem_entries) > 3:
                 hints.append(f"  ... and {len(mem_entries) - 3} more")
-        cache_entries = self.knowledge_cache.list_entries()
-        if cache_entries:
-            hints.append(f"Cache: {len(cache_entries)} entries (/cache list)")
-            for e in cache_entries[:3]:
-                key = e.get("key", "?")
-                desc = e.get("description", "")
-                if len(desc) > 50:
-                    desc = desc[:47] + "..."
-                hints.append(f"  {key}: {desc}" if desc else f"  {key}")
-            if len(cache_entries) > 3:
-                hints.append(f"  ... and {len(cache_entries) - 3} more")
         active_plan = self.task_plan.get_active()
         if active_plan:
             steps = active_plan.get("steps", [])
@@ -811,7 +835,7 @@ class ReactAgent:
         history_file = os.path.join(os.path.expanduser("~"), ".flagscale", "input_history")
         os.makedirs(os.path.dirname(history_file), exist_ok=True)
         completer = WordCompleter(
-            ["/quit", "/reload", "/skill", "/file", "/save", "/load", "/export", "/cache", "/memory", "/mode", "/plan"],
+            ["/quit", "/reload", "/skill", "/file", "/save", "/load", "/export", "/memory", "/mode", "/plan"],
             sentence=True,
         )
         session = PromptSession(
@@ -857,9 +881,6 @@ class ReactAgent:
             elif cmd == "/export":
                 self._handle_export_command(user_input)
                 continue
-            elif cmd == "/cache":
-                self._handle_cache_command(user_input)
-                continue
             elif cmd == "/memory":
                 self._handle_memory_command(user_input)
                 continue
@@ -886,6 +907,7 @@ class ReactAgent:
 
     def _exit(self):
         self._ensure_memory_written()
+        self._auto_update_workspace_state()
         self._archive_session()
         self._clear_autosave()
         session_elapsed = time.time() - self._session_start
@@ -934,7 +956,7 @@ class ReactAgent:
         if total_len < 20:
             return
         recap_parts = []
-        for msg in user_msgs[:5]:
+        for msg in user_msgs[-5:]:
             line = msg.strip().replace("\n", " ")
             if len(line) > 120:
                 line = line[:117] + "..."
@@ -989,11 +1011,48 @@ class ReactAgent:
         except Exception as e:
             logger.debug("Memory judge skipped: %s", e)
 
+    _WORKSPACE_STATE_PROMPT = (
+        "Summarize the current workspace state based on this session.\n"
+        "Focus on: what was worked on, key outcomes, and what's next.\n"
+        "Keep it under 500 chars. Use markdown sections: ## Current Task, ## Status, ## Next Steps.\n"
+        "If nothing meaningful happened, reply with exactly: SKIP\n\n"
+        "Session:\n{summary}"
+    )
+
+    def _auto_update_workspace_state(self):
+        """Auto-update workspace state at session end."""
+        if self._turn_count < 2:
+            return
+        user_msgs = [
+            m["content"] for m in self.history.messages
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        ]
+        if not user_msgs:
+            return
+        recap_parts = []
+        for msg in user_msgs[-5:]:
+            line = msg.strip().replace("\n", " ")
+            if len(line) > 120:
+                line = line[:117] + "..."
+            recap_parts.append(line)
+        summary = " | ".join(recap_parts)
+        try:
+            prompt = self._WORKSPACE_STATE_PROMPT.format(summary=summary)
+            messages = [{"role": "user", "content": prompt}]
+            response = self.provider.chat(messages, tools=[])
+            text = (response.get("content") or "").strip()
+            if text == "SKIP" or len(text) < 10:
+                return
+            ws_tool = self.tool_registry.get("workspace_state")
+            if ws_tool:
+                ws_tool.execute(action="write", content=text)
+        except Exception as e:
+            logger.debug("Workspace state auto-update skipped: %s", e)
+
     def _archive_session(self):
         """Archive the current session to disk (no LLM call)."""
-        msgs = [m for m in self.history.messages if m.get("role") != "system"]
-        if not msgs or self._turn_count == 0:
-            return
+        msgs = [m for m in self.history.full_log if m.get("role") != "system"]
+        if not msgs or self._turn_count == 0:            return
         try:
             metadata = {
                 "provider": self.config.provider,
@@ -1026,6 +1085,7 @@ class ReactAgent:
                     compact_msgs.append(_truncate_message(m))
                 else:
                     compact_msgs.append(m)
+            full_log = [m for m in self.history.full_log if m.get("role") != "system"]
             metadata = {
                 "provider": self.config.provider,
                 "model": self.config.model,
@@ -1041,6 +1101,7 @@ class ReactAgent:
                 "timestamp": time.time(),
                 "metadata": metadata,
                 "messages": compact_msgs,
+                "full_log": full_log,
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1093,6 +1154,12 @@ class ReactAgent:
         sys_msg = self.history.messages[0] if self.history.messages and self.history.messages[0].get("role") == "system" else None
         self.history._messages = [sys_msg] if sys_msg else []
         self.history._messages.extend(_validate_tool_pairs(msgs))
+        full_log = data.get("full_log", [])
+        if full_log:
+            self.history._full_log = [sys_msg] if sys_msg else []
+            self.history._full_log.extend(full_log)
+        else:
+            self.history._full_log = list(self.history._messages)
         self._turn_count = turn_count
         self._loaded_skills = set(meta.get("loaded_skills", []))
         self._session_input_tokens = meta.get("input_tokens", 0)
@@ -1115,20 +1182,18 @@ class ReactAgent:
             if self._interrupted:
                 break
 
-            remaining = max_iter - iteration
-            if remaining == 2:
-                self.history.append({
-                    "role": "user",
-                    "content": (
-                        "[SYSTEM: You have 2 iterations left before the limit. "
-                        "Wrap up your current task — summarize progress and "
-                        "remaining steps so work is not lost.]"
-                    ),
-                })
-
-            display.thinking()
             t0 = time.time()
             messages = self.history.get_messages()
+
+            if self.history._last_compacted_from:
+                display.context_compacted(
+                    self.history._last_compacted_from,
+                    self.history._last_compacted_to,
+                    compaction_num=self.history.compaction_count,
+                    ratio=self.history.last_compaction_ratio,
+                )
+
+            display.thinking()
 
             try:
                 response, usage = self._call_llm_stream(messages, schemas)
@@ -1149,6 +1214,7 @@ class ReactAgent:
             if input_tok:
                 turn_input_tokens += input_tok
                 self._session_input_tokens += input_tok
+                self.history.report_actual_tokens(input_tok)
             if output_tok:
                 turn_output_tokens += output_tok
                 self._session_output_tokens += output_tok
@@ -1178,23 +1244,40 @@ class ReactAgent:
             iteration += 1
 
             if iteration >= max_iter and not self._interrupted:
-                print(f"\n\033[33m⚠ Reached {max_iter} iterations.\033[0m")
-                try:
-                    answer = input("   Continue? [y/N] (or enter a number to add iterations): ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    answer = "n"
-                if answer == "y":
-                    max_iter += 10
-                elif answer.isdigit() and int(answer) > 0:
-                    max_iter += int(answer)
-                else:
-                    print("   Stopping.")
+                added = self._ask_continue(iteration)
+                if added == 0:
                     break
-                print(f"   Continuing (new limit: {max_iter} iterations).")
+                max_iter += added
+                self.config.max_iterations = max_iter
 
         turn_elapsed = time.time() - turn_start
         display.turn_summary(self._turn_count, turn_elapsed, turn_input_tokens, turn_output_tokens)
         self._autosave()
+
+    def _ask_continue(self, iteration: int) -> int:
+        """Ask user whether to continue after hitting iteration limit.
+
+        Returns the number of iterations to add (0 = stop).
+        In auto mode, continues automatically without prompting.
+        """
+        if self.config.mode == "auto":
+            print(f"\n\033[33m⚠ Reached {iteration} iterations (auto mode: +50).\033[0m")
+            return 50
+        print(f"\n\033[33m⚠ Reached {iteration} iterations.\033[0m")
+        try:
+            answer = input("   Continue? [Y/n] (or enter a number to add iterations): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("   Stopping.")
+            return 0
+        lower = answer.lower()
+        if lower in ("", "y", "yes"):
+            return 50
+        if answer.isdigit() and int(answer) > 0:
+            added = int(answer)
+            print(f"   Continuing (+{added}, new limit: {iteration + added} iterations).")
+            return added
+        print("   Stopping.")
+        return 0
 
     # ── LLM streaming with error recovery (P0-3) ────────────────────────
 
@@ -1211,10 +1294,13 @@ class ReactAgent:
             max_retries=3,
         )
 
-        display.thinking_clear()
+        thinking_cleared = False
 
         try:
             for event in stream:
+                if not thinking_cleared:
+                    display.thinking_done()
+                    thinking_cleared = True
                 if event["type"] == "text":
                     text = event["content"]
                     if display._use_color():
@@ -1251,8 +1337,12 @@ class ReactAgent:
                 elif event["type"] == "done":
                     break
         except KeyboardInterrupt:
+            if not thinking_cleared:
+                display.thinking_clear()
             raise
         except Exception as e:
+            if not thinking_cleared:
+                display.thinking_clear()
             logger.warning("Stream interrupted: %s", e)
             if not content_parts and not tool_calls:
                 raise
@@ -1368,7 +1458,8 @@ class ReactAgent:
             try:
                 if tool_name == "shell":
                     result = self.tool_registry.execute(
-                        tool_name, _skip_confirm=True, **arguments)
+                        tool_name, _skip_confirm=True,
+                        _parallel_index=idx_to_line[idx], **arguments)
                 else:
                     result = self.tool_registry.execute(tool_name, **arguments)
             except Exception as e:
@@ -1417,6 +1508,8 @@ class ReactAgent:
                 return f'{k}="{s}"'
             return f'{k}={s}'
 
+        t0 = time.time()
+
         # For shell commands, show a clean one-line summary instead of the full command
         if tool_name == "shell":
             cmd = arguments.get("command", "")
@@ -1428,7 +1521,6 @@ class ReactAgent:
             )
             display.tool_start(tool_name, args_summary)
 
-        t0 = time.time()
         try:
             if skip_confirm and tool_name == "shell":
                 result = self.tool_registry.execute(
@@ -1545,7 +1637,7 @@ class ReactAgent:
     def _handle_save_command(self, user_input):
         parts = user_input.split(maxsplit=1)
         sid = parts[1].strip() if len(parts) > 1 else None
-        msgs = [m for m in self.history.messages if m.get("role") != "system"]
+        msgs = [m for m in self.history.full_log if m.get("role") != "system"]
         metadata = {
             "provider": self.config.provider,
             "model": self.config.model,
@@ -1589,46 +1681,64 @@ class ReactAgent:
 
     def _handle_export_command(self, user_input):
         parts = user_input.split(maxsplit=1)
-        path = parts[1].strip() if len(parts) > 1 else f"session_{int(time.time())}.md"
-        path = os.path.expanduser(path)
+        if len(parts) > 1:
+            path = os.path.expanduser(parts[1].strip())
+        else:
+            d = self.config.session_dir or os.path.join(Path.home(), ".flagscale", "sessions")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, f"session_{self._session_id}.md")
 
         lines = [f"# FlagScale Agent Session Export\n"]
-        lines.append(f"Provider: {self.config.provider} | Model: {self.config.model}\n")
+        lines.append(f"Provider: {self.config.provider} | Model: {self.config.model}")
         lines.append(f"Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n")
 
-        for msg in self.history.messages:
+        messages = self.history.full_log
+        turn_num = 0
+
+        for i, msg in enumerate(messages):
             role = msg.get("role", "unknown")
             if role == "system":
                 continue
             content = msg.get("content", "")
+
+            # Detect new turn: user message that is not a tool result
+            if role == "user" and not _is_tool_result_msg(msg):
+                turn_num += 1
+                lines.append(f"\n---\n\n## Turn {turn_num}\n")
+
             if isinstance(content, list):
                 parts_text = []
                 for block in content:
                     if isinstance(block, dict):
-                        if block.get("type") == "text":
+                        btype = block.get("type", "")
+                        if btype == "text":
                             parts_text.append(block.get("text", ""))
-                        elif block.get("type") == "tool_use":
-                            parts_text.append(f"[Tool: {block.get('name', '')}]")
-                        elif block.get("type") == "tool_result":
+                        elif btype == "tool_use":
+                            name = block.get("name", "")
+                            inp = block.get("input", {})
+                            inp_str = json.dumps(inp, ensure_ascii=False, indent=2)
+                            parts_text.append(f"[Tool: {name}]\n```json\n{inp_str}\n```")
+                        elif btype == "tool_result":
                             inner = block.get("content", "")
-                            if len(inner) > 200:
-                                inner = inner[:200] + "..."
-                            parts_text.append(f"[Result: {inner}]")
-                content = "\n".join(parts_text)
+                            parts_text.append(f"[Result]\n```\n{inner}\n```")
+                    elif isinstance(block, str):
+                        parts_text.append(block)
+                content = "\n\n".join(parts_text)
 
             if role == "user":
-                lines.append(f"\n## User\n\n{content}\n")
+                if _is_tool_result_msg(msg):
+                    lines.append(f"\n**Tool Result:**\n\n{content}\n")
+                else:
+                    lines.append(f"\n### User\n\n{content}\n")
             elif role == "assistant":
-                lines.append(f"\n## Assistant\n\n{content}\n")
+                lines.append(f"\n### Assistant\n\n{content}\n")
             elif role == "tool":
-                if len(content) > 200:
-                    content = content[:200] + "..."
-                lines.append(f"\n> Tool result: {content}\n")
+                lines.append(f"\n**Tool Result:**\n\n```\n{content}\n```\n")
 
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
-            print(display.green(f"✓ Exported to {path}"))
+            print(display.green(f"✓ Exported to {path} ({len(messages)} messages)"))
         except Exception as e:
             print(f"Error exporting: {e}")
 

@@ -2,7 +2,7 @@
 
 from flagscale.agent.react.history import (
     HistoryManager, _estimate_tokens, _message_tokens,
-    _is_tool_result, _has_tool_use, _drop_old_pairs,
+    _is_tool_result, _has_tool_use, _collect_droppable,
 )
 
 
@@ -79,87 +79,96 @@ class TestHistoryManager:
         assert len(msgs) == 2
         assert msgs[0]["role"] == "system"
 
-    def test_no_truncation_under_limit(self):
+    def test_full_log_preserved(self):
         hm = HistoryManager(max_context_tokens=100000)
         hm.append({"role": "system", "content": "sys"})
-        hm.append({"role": "user", "content": "hello"})
-        hm.append({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "shell", "input": {}}]})
-        hm.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "short result"}]})
-        msgs = hm.get_messages()
-        tool_msg = [m for m in msgs if m.get("role") == "user" and isinstance(m.get("content"), list) and any(b.get("type") == "tool_result" for b in m["content"])][0]
-        assert tool_msg["content"][0]["content"] == "short result"
+        hm.append({"role": "user", "content": "hi"})
+        assert len(hm.full_log) == 2
 
-    def test_truncation_over_limit(self):
-        # keep_recent = min(10, max(len-2, 1)); need len>=13 so tool_result at i=2 is not recent
-        hm = HistoryManager(max_context_tokens=500)
-        hm.append({"role": "system", "content": "sys"})
-        hm.append({"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "shell", "input": {}}]})
-        hm.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x" * 10000}]})
-        for i in range(11):
-            hm.append({"role": "user", "content": f"msg {i}"})
-        msgs = hm.get_messages()
-        tool_msgs = [m for m in msgs if isinstance(m.get("content"), list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"])]
-        assert tool_msgs and "truncated" in tool_msgs[0]["content"][0]["content"]
-
-    def test_recent_messages_preserved(self):
+    def test_truncation_on_budget(self):
         hm = HistoryManager(max_context_tokens=100)
         hm.append({"role": "system", "content": "sys"})
-        for i in range(5):
-            hm.append({"role": "user", "content": f"msg {i}"})
+        hm.append({"role": "assistant", "tool_calls": [{"id": "1", "name": "shell"}], "content": ""})
+        hm.append({"role": "tool", "tool_call_id": "1", "content": "x" * 5000})
+        hm.append({"role": "user", "content": "recent"})
         msgs = hm.get_messages()
-        assert msgs[-1]["content"] == "msg 4"
+        assert any(m["role"] == "user" and m["content"] == "recent" for m in msgs)
 
-    def test_clear(self):
-        hm = HistoryManager()
-        hm.append({"role": "user", "content": "hi"})
-        hm.clear()
-        assert len(hm.messages) == 0
-
-    def test_anthropic_tool_result_truncation(self):
-        hm = HistoryManager(max_context_tokens=500)
+    def test_compaction_flag(self):
+        hm = HistoryManager(max_context_tokens=100)
         hm.append({"role": "system", "content": "sys"})
-        hm.append({"role": "assistant", "content": [{"type": "tool_use", "id": "123", "name": "shell", "input": {}}]})
-        hm.append({
-            "role": "user",
-            "content": [
-                {"type": "tool_result", "tool_use_id": "123", "content": "y" * 10000}
-            ],
-        })
-        for i in range(11):
-            hm.append({"role": "user", "content": f"msg {i}"})
+        hm.append({"role": "user", "content": "x" * 5000})
+        hm.get_messages()
+        assert hm.compaction_happened
+
+    def test_no_compaction_under_budget(self):
+        hm = HistoryManager(max_context_tokens=100000)
+        hm.append({"role": "system", "content": "sys"})
+        hm.append({"role": "user", "content": "hi"})
+        hm.get_messages()
+        assert not hm.compaction_happened
+
+    def test_summarizer_called_on_compaction(self):
+        called = []
+        def fake_summarizer(text):
+            called.append(text)
+            return "Summary: stuff happened"
+
+        hm = HistoryManager(max_context_tokens=100)
+        hm.set_summarizer(fake_summarizer)
+        hm.append({"role": "system", "content": "sys"})
+        hm.append({"role": "assistant", "tool_calls": [{"id": "1", "name": "shell"}], "content": ""})
+        hm.append({"role": "tool", "tool_call_id": "1", "content": "x" * 5000})
+        hm.append({"role": "user", "content": "recent"})
         msgs = hm.get_messages()
-        tool_msgs = [m for m in msgs if isinstance(m.get("content"), list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"])]
-        assert tool_msgs and "truncated" in tool_msgs[0]["content"][0]["content"]
+        assert len(called) > 0
+        # Summary should be injected
+        summary_msgs = [m for m in msgs if isinstance(m.get("content", ""), str) and "<context-summary>" in m["content"]]
+        assert len(summary_msgs) == 1
+
+    def test_orphaned_tool_result_removed(self):
+        hm = HistoryManager(max_context_tokens=100000)
+        hm.append({"role": "system", "content": "sys"})
+        hm.append({"role": "tool", "tool_call_id": "1", "content": "orphan"})
+        hm.append({"role": "user", "content": "hi"})
+        msgs = hm.get_messages()
+        assert not any(m.get("role") == "tool" for m in msgs)
+
+    def test_anthropic_tool_pair_preserved(self):
+        hm = HistoryManager(max_context_tokens=100000)
+        hm.append({"role": "system", "content": "sys"})
+        hm.append({"role": "assistant", "content": [{"type": "tool_use", "id": "1", "name": "shell", "input": {}}]})
+        hm.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "ok"}]})
+        hm.append({"role": "user", "content": "recent"})
+        msgs = hm.get_messages()
+        assert len(msgs) == 4
+
+    def test_anthropic_orphan_removed(self):
+        hm = HistoryManager(max_context_tokens=100000)
+        hm.append({"role": "system", "content": "sys"})
+        hm.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "orphan"}]})
+        hm.append({"role": "user", "content": "recent"})
+        msgs = hm.get_messages()
+        assert len(msgs) == 2
 
 
-class TestDropOldPairs:
-    def test_drops_assistant_tool_result_pair(self):
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "1", "name": "shell", "input": {}}]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "ok"}]},
-            {"role": "user", "content": "recent"},
-        ]
-        result = _drop_old_pairs(messages, budget=10)
-        roles = [m["role"] for m in result]
-        assert "system" in roles
-        assert result[-1]["content"] == "recent"
-
+class TestCollectDroppable:
     def test_preserves_system(self):
         messages = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "x" * 10000},
         ]
-        result = _drop_old_pairs(messages, budget=10)
-        assert result[0]["role"] == "system"
+        _, kept = _collect_droppable(messages, budget=10)
+        assert kept[0]["role"] == "system"
 
     def test_under_budget_no_change(self):
         messages = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "hi"},
         ]
-        result = _drop_old_pairs(messages, budget=100000)
-        assert len(result) == 2
+        dropped, kept = _collect_droppable(messages, budget=100000)
+        assert len(kept) == 2
+        assert len(dropped) == 0
 
     def test_drops_openai_tool_pair(self):
         messages = [
@@ -168,9 +177,9 @@ class TestDropOldPairs:
             {"role": "tool", "tool_call_id": "1", "content": "x" * 5000},
             {"role": "user", "content": "recent"},
         ]
-        result = _drop_old_pairs(messages, budget=10)
-        assert result[-1]["content"] == "recent"
-        assert not any(m.get("role") == "tool" for m in result)
+        dropped, kept = _collect_droppable(messages, budget=10)
+        assert kept[-1]["content"] == "recent"
+        assert not any(m.get("role") == "tool" for m in kept)
 
     def test_fallback_drops_when_still_over(self):
         """Even after truncation, if still over budget, drop old pairs."""

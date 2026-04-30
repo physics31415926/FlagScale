@@ -22,12 +22,14 @@ class TestReadFileTool:
         f = tmp_path / "hello.txt"
         f.write_text("hello world")
         tool = ReadFileTool()
-        assert tool.execute(path=str(f)) == "hello world"
+        result = tool.execute(path=str(f))
+        assert "hello world" in result
+        assert "lines 1-1 of 1" in result
 
     def test_read_missing_file(self):
         tool = ReadFileTool()
         result = tool.execute(path="/nonexistent/path/file.txt")
-        assert result.startswith("ERROR:")
+        assert "ERROR" in result
 
     def test_schema_openai(self):
         tool = ReadFileTool()
@@ -553,14 +555,14 @@ class TestFindLatestLogTool:
         log_dir = tmp_path / "exp1" / "logs" / "details" / "host_0" / "run1" / "default_x" / "attempt_0" / "0"
         log_dir.mkdir(parents=True)
         (log_dir / "stdout.log").write_text("training started\n")
-        (log_dir / "stderr.log").write_text("WARNING: something\n")
+        (log_dir / "stderr.log").write_text("ERROR: something went wrong\n")
 
         tool = FindLatestLogTool(outputs_dir=str(tmp_path))
         result = tool.execute(experiment="exp1", log_type="both")
         assert "stdout.log" in result
-        assert "stderr.log" in result
+        assert "stderr" in result.lower()
         assert "training started" in result
-        assert "WARNING: something" in result
+        assert "something went wrong" in result
 
     def test_stderr_only(self, tmp_path):
         from flagscale.agent.react.tools.find_log import FindLatestLogTool
@@ -571,11 +573,11 @@ class TestFindLatestLogTool:
 
         tool = FindLatestLogTool(outputs_dir=str(tmp_path))
         result = tool.execute(experiment="exp2", log_type="stderr")
-        assert "stderr.log" in result
+        assert "stderr" in result.lower()
         assert "ImportError" in result
-        assert "stdout.log" not in result
+        assert "Loss rank" not in result
 
-    def test_shows_timestamp_and_path(self, tmp_path):
+    def test_shows_path(self, tmp_path):
         from flagscale.agent.react.tools.find_log import FindLatestLogTool
         log_dir = tmp_path / "exp3" / "logs" / "details" / "host_0" / "run1" / "default_x" / "attempt_0" / "0"
         log_dir.mkdir(parents=True)
@@ -583,7 +585,6 @@ class TestFindLatestLogTool:
 
         tool = FindLatestLogTool(outputs_dir=str(tmp_path))
         result = tool.execute(experiment="exp3", log_type="stdout")
-        assert "modified:" in result
         assert "Path:" in result
 
 

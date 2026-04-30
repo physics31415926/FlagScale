@@ -1,6 +1,6 @@
 ---
 name: ops-discipline
-description: Operational discipline rules for FlagScale infrastructure work. Shell command safety, dependency resolution (3-phase constraint solving), training launch discipline, multi-node awareness, checkpoint resume, active monitoring, destructive operation safety, and one-shot diagnosis patterns.
+description: Operational discipline rules for FlagScale infrastructure work. Covers understand-before-act, reading strategy, tool-first principle, decision discipline, shell safety, dependency resolution, training launch, monitoring, checkpoint resume, multi-node, and diagnosis patterns.
 keywords:
   - shell
   - install
@@ -16,11 +16,74 @@ keywords:
   - diagnosis
   - resume
   - safety
+  - reading
+  - planning
 ---
 
 # Operational Discipline
 
 These rules govern how you execute infrastructure operations. Follow them strictly.
+
+---
+
+## Understand before act — the #1 rule
+
+This is the most important rule. Violating it causes cascading waste.
+
+- **Complex tasks (model porting, architecture changes, multi-file refactors)**: spend at least 30% of your effort on reading and understanding BEFORE writing any code. Build a mental model first.
+- **Read complete files, not fragments.** Using `sed -n '200,250p'` to peek at 50-line slices forces you to re-read the same file many times. Use `read_file` tool to read the full file (or large ranges). One complete read beats ten partial reads.
+- **Never declare "I understand" after reading one file.** Complex systems have hidden dependencies. Read ALL related files before forming conclusions.
+- **Never make strong assertions from a single data point.** "X is completely broken!" based on one observation → investigate → "actually X is fine" is a waste pattern. Instead: observe → hypothesize → verify → conclude.
+- **Before implementing, list what you DON'T know.** If the list is long, keep reading. If it's short and bounded, start implementing.
+
+### Anti-patterns to avoid
+- Reading a file 40 times in fragments instead of once completely
+- "关键发现！" → "但等等——" loops (premature conclusions that get reversed)
+- Starting implementation after reading 20% of the relevant code, then doing 80% of reading during debugging
+
+---
+
+## Reading strategy — minimize re-reads
+
+- **Use `read_file` tool with line ranges**, not `sed`/`cat`/`head`/`tail` through shell. The tool adds line numbers for reference.
+- **First read: full file.** Get the complete picture. Note key line numbers.
+- **Subsequent reads: targeted ranges.** Use line numbers from the first read.
+- **Record key findings in workspace_state** so they survive context compaction. If you discovered that `attn_mask_type="causal"` ignores custom masks, write it down immediately.
+- **Never re-read a file you read in the last 5 turns** unless it was modified. Check `<context-summary>` tags first — they contain conclusions from compacted context.
+
+---
+
+## Tool-first principle — use specialized tools over shell
+
+- **`find_latest_log`** for locating training logs — don't manually construct `find` commands with timestamp patterns
+- **`parse_training_metrics`** for extracting loss/grad/throughput — don't grep and awk through log files
+- **`read_file`** for reading code — don't `cat` or `sed -n`
+- **`workspace_state`** for persisting findings — don't rely on memory alone
+- **`plan_create` / `plan_update`** for complex tasks — don't keep the plan only in your head
+
+If you find yourself writing a 3-line shell pipeline to extract information, check if a tool already does it.
+
+---
+
+## Decision discipline — no flip-flopping
+
+- **Before choosing between approaches, LIST ALL CONSTRAINTS.** What does the framework support? What are the limits? What has been tried?
+- **Evaluate each approach against ALL constraints before picking one.**
+- **Once you pick an approach, commit to it.** Run it to completion or to a clear failure signal. Don't abandon at the first difficulty.
+- **If an approach fails, record WHY it failed** (in workspace_state or plan notes) before trying the next one. This prevents revisiting failed approaches.
+- **Never flip between approaches more than twice.** If you've tried A→B→A, stop and ask the user for guidance.
+
+### The "solve one problem at a time" rule
+When debugging, isolate ONE variable at a time:
+1. Form a hypothesis about the root cause
+2. Design a verification experiment that tests ONLY that hypothesis
+3. Run it and interpret the result
+4. If confirmed: fix it and verify the fix
+5. If refuted: record "not this" and move to the next hypothesis
+
+Do NOT: change three things at once, then wonder which one helped.
+
+---
 
 ## Shell command rules
 
@@ -44,7 +107,7 @@ These rules govern how you execute infrastructure operations. Follow them strict
 
 ## Environment awareness
 
-- FIRST thing on any new server: `nvidia-smi`, `cat /etc/os-release`, `which conda`, `echo $CUDA_HOME`. Cache results.
+- FIRST thing on any new server: `nvidia-smi`, `cat /etc/os-release`, `which conda`, `echo $CUDA_HOME`. Save to workspace_state.
 - Check disk space (`df -h`) before large downloads or builds.
 - Check GPU memory (`nvidia-smi`) before launching training.
 - If the user mentions a conda env, verify it exists (`conda env list`) before using it.

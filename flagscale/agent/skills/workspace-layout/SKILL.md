@@ -67,8 +67,8 @@ Before proceeding, present the detected root and layout to the user:
 
 ### 1d. Record
 
-Save the chosen root to memory:
-- memory_write key=`workspace_root`, value=`<chosen_path>` (e.g., `/mnt/shared`)
+Save the chosen root to workspace state:
+- `workspace_state(action="write", section="Workspace", content="root: <chosen_path>")`
 
 ---
 
@@ -114,7 +114,7 @@ All artifacts go under `<root>` (the detected storage root):
 - **Before downloading**: check standard path, `~/.cache/huggingface/hub/`, and memory for existing copies. List what's found and what's missing.
 - **Confirm with user**: show a table — model name, estimated size, target path. Wait for approval before downloading.
 - **Download method**: `snapshot_download(repo_id, local_dir=<root>/models/<org>/<model>)` for consistent paths.
-- **After downloading**: `memory_write` the path so future sessions find it without re-downloading.
+- **After downloading**: use `workspace_state(action="append", content="model: <path>")` so future sessions find it without re-downloading.
 - **Read-only**: never modify downloaded weights in place. Checkpoint conversion outputs go to a separate path.
 
 ### 3b. Datasets

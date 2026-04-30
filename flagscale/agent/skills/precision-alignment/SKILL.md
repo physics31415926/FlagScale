@@ -104,6 +104,67 @@ FlagScale @ NVIDIA    FlagScale @ new hardware
 
 ## Core Principles
 
+### Align Against the Reproduced Baseline
+
+Precision alignment MUST compare against a **reproduced baseline** — the reference implementation running on the same data, producing verified outputs. Never align against "expected" values from papers or documentation.
+
+The alignment is fundamentally about **data flow and tensor-level equivalence**:
+
+1. **Data flow alignment**: Trace the exact path of data through both systems. At each stage (tokenization → embedding → attention → FFN → loss), the tensors entering and leaving must match. If they diverge at stage N, all stages after N are meaningless to compare.
+
+2. **Tensor-level verification**: Don't just compare final loss. Compare intermediate tensors — embeddings, attention outputs, MLP outputs, logits. A matching loss can hide compensating errors; matching intermediate tensors cannot.
+
+3. **Reproduce first, then align**: Before any alignment work, run the reference implementation end-to-end and capture its outputs. This is your ground truth. If you can't reproduce the reference, you have nothing to align against.
+
+The `reproduce` skill establishes this baseline. Use it before starting alignment.
+
+### Understand Both Sides Before Aligning
+
+Before writing any alignment code or running comparison experiments, you MUST understand:
+
+**1. The native (baseline) implementation in depth:**
+- Read the complete model forward pass — not fragments, the entire flow
+- Understand the attention mechanism: what mask patterns, what kernel, what precision
+- Understand the loss computation: what reduction, what normalization, any auxiliary losses
+- Understand the data pipeline: how data is batched, padded, shuffled, distributed across ranks
+- Run it and capture actual tensor values at key points — don't assume behavior from reading code alone
+
+**2. What FlagScale/Megatron supports and what it doesn't:**
+- Check Megatron-LM-FL's actual source code for supported attention types, activation functions, normalization layers
+- Check TransformerEngine-FL's actual capabilities — what mask types it supports, what falls back to unfused paths
+- Check what parallelism strategies are compatible with the model's architecture
+- Identify the gaps: components the native implementation uses that FlagScale doesn't natively support
+
+**3. The gap analysis determines your alignment strategy:**
+- If FlagScale supports everything → alignment should be strict, differences are bugs
+- If FlagScale lacks a component → you need an adaptation, and the adaptation's impact on precision must be quantified
+- If FlagScale has an equivalent but different implementation (e.g., different FA version) → numerical differences are expected, define tolerance
+
+Without this understanding, you'll waste cycles: "fixing" things that aren't bugs, missing things that are, or choosing approaches that the framework can't support.
+
+### DEBUG-First Principle
+
+Add diagnostic prints and tensor captures BEFORE launching training, not after failure. Each failed launch wastes minutes (model loading, data loading, NCCL init). Adding debug instrumentation proactively saves full launch cycles.
+
+**Before every alignment training run:**
+1. Add `print()` or `torch.save()` at key checkpoints in the forward pass (embedding output, attention output, loss input)
+2. Add shape/dtype assertions at layer boundaries
+3. Enable `TORCH_DISTRIBUTED_DEBUG=DETAIL` for distributed issues
+4. For attention mechanisms: print `attn_mask_type`, mask shape, and a few mask values to confirm the mask is actually being applied
+
+**Example proactive instrumentation:**
+```python
+# Add BEFORE launching, not after failure
+# In the forward pass of the model being aligned:
+if step < 3 and rank == 0:
+    print(f"[DEBUG] step={step} embed_out: shape={h.shape}, sum={h.float().sum():.6f}, norm={h.float().norm():.6f}")
+    print(f"[DEBUG] step={step} attn_out: shape={attn_out.shape}, sum={attn_out.float().sum():.6f}")
+    print(f"[DEBUG] step={step} logits: shape={logits.shape}, sum={logits.float().sum():.6f}")
+    print(f"[DEBUG] step={step} loss: {loss.item():.6f}")
+```
+
+This costs nothing (only runs for first 3 steps on rank 0) but immediately reveals where data flow diverges. Without it, a failed alignment requires: stop training → add prints → relaunch → wait for init → finally see the problem. That's 5-10 minutes wasted per cycle.
+
 ### Use Shared Storage for Multi-Node
 
 All paths (data, checkpoints, logs, experiment outputs, captured tensors) must be on shared storage accessible from all nodes. Local paths like `/tmp/` or `./` will break in multi-node scenarios — node1 cannot see node0's local filesystem. If shared storage is not available, ask the user where to place artifacts before starting experiments.

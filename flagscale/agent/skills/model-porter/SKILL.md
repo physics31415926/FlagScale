@@ -47,6 +47,47 @@ Port models to Megatron-LM-FL / FlagScale for distributed pre-training.
 - **Auto-fetch FL dependencies**: When you need to analyze or compile Megatron-LM-FL or TransformerEngine-FL source code and it's not available locally, pull the latest automatically — don't ask the user. Use the repos from env-setup skill (github.com/flagos-ai/Megatron-LM-FL, github.com/flagos-ai/TransformerEngine-FL).
 - **Model size selection**: When a model family has multiple size variants (e.g., 0.6B/1.8B/7B/70B) or multiple training configs (e.g., e6_d6_size256 vs e18_d18_size1024) and the user did not specify a size, list the available options with their parameter counts and ask the user to choose. Recommend the smallest variant for initial porting/verification, but let the user decide.
 
+## Porting Discipline — lessons from real failures
+
+### Read COMPLETELY before writing ANY code
+
+Model porting is the task most prone to "understand 20%, implement, then debug for 80%". This wastes enormous effort.
+
+**Before writing a single line of porting code:**
+1. Read the COMPLETE source model code (modeling_*.py, config.json, tokenizer_config.json)
+2. Read the COMPLETE target Megatron model code (the relevant model_provider, builder, and spec)
+3. Read at least ONE existing porting example in `tools/checkpoint/` that handles a similar architecture
+4. Build a complete mapping table: source layer name → target layer name, with shape transformations
+5. Identify ALL non-standard components (custom attention, custom FFN, MoE routing, etc.)
+6. Save this analysis to workspace_state before proceeding
+
+**The mapping table is your contract.** Don't start coding without it.
+
+### No approach flip-flopping
+
+When porting, you'll face choices (e.g., use TE attention vs custom attention, THD format vs standard padding). The rule:
+1. List ALL constraints before choosing
+2. Pick one approach and commit
+3. If it fails, record WHY it failed before trying the next approach
+4. Never flip between approaches more than twice — if A→B→A happens, stop and ask the user
+
+### Verify fundamentals first
+
+After the first successful training launch, check these IN ORDER before celebrating:
+1. **Loss sanity**: is `ce_loss` close to `ln(vocab_size)`? If yes → model outputs random, something is fundamentally broken
+2. **Gradient flow**: is `num_zeros` / total_params < 50%? If not → gradients not flowing
+3. **Weight loading**: did `params_norm` start at a reasonable value (not 0, not identical to random init)?
+4. **Loss trend**: does loss decrease over 50 iterations?
+
+Only after ALL four pass should you proceed to precision alignment or scaling.
+
+### TransformerEngine attention mask gotcha
+
+TE's `DotProductAttention` with `attn_mask_type="causal"` IGNORES any custom attention mask you pass. If your model needs a non-standard mask (e.g., per-sample causal for packed sequences), you must either:
+- Use `attn_mask_type="arbitrary"` (slower but respects your mask)
+- Use THD format with `cu_seqlens` (efficient, but requires careful setup)
+- Verify the mask is actually being used by checking intermediate attention outputs, not just loss
+
 ## Overview
 
 FlagScale supports models in two modes:

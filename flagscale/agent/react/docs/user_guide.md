@@ -114,7 +114,7 @@ model: claude-sonnet-4-20250514
 # base_url: https://...      # 自定义 API 地址
 
 # 行为控制
-max_iterations: 50            # 单轮最大工具调用次数
+max_iterations: 200           # 单轮最大工具调用次数
 max_context_tokens: 100000    # 上下文窗口大小
 shell_timeout: 120            # Shell 命令超时（秒）
 dangerous_commands_check: true # 拦截危险命令

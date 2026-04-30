@@ -64,7 +64,18 @@ Key facts:
 
 ## Step 1: Locate Latest Logs
 
-**ALWAYS run these commands first.** Never guess log paths.
+**Preferred: use the `find_latest_log` tool.** It auto-scans all ranks, finds the loss rank, and checks for errors.
+
+```
+find_latest_log(experiment="<exp_name>", vocab_size=<vocab_size>)
+```
+
+For deeper metric analysis, use `parse_training_metrics`:
+```
+parse_training_metrics(log_path="<stdout.log path>", vocab_size=<vocab_size>)
+```
+
+**Manual fallback** (if tools unavailable):
 
 ```bash
 EXP_DIR=<exp_dir from train.yaml>
@@ -117,6 +128,32 @@ cat ${EXP_DIR}/logs/pids/*.pid 2>/dev/null | xargs -I{} ps -p {} -o pid,stat,eti
 ```
 
 If no processes found, training has stopped. Check stderr for the reason.
+
+### Loss Sanity Check — CRITICAL
+
+**This is the most important check. Do it EVERY time you look at training output.**
+
+The `parse_training_metrics` and `find_latest_log` tools do this automatically. If checking manually:
+
+1. **Random output check**: `ce_loss ≈ ln(vocab_size)` means the model is outputting random probabilities.
+   - For vocab_size=32000: random loss ≈ 10.37
+   - For vocab_size=38016: random loss ≈ 10.55
+   - For vocab_size=128256: random loss ≈ 11.76
+   - If loss is within 10% of ln(vocab_size) after >10 iterations, something is fundamentally wrong (weights not loaded, forward pass broken, attention mask not applied).
+
+2. **Zero gradient check**: if `num_zeros` / total_params > 90%, gradients are not flowing. The model is not learning.
+
+3. **Params norm check**: if `params_norm` doesn't change across iterations, weights are frozen or not being updated.
+
+4. **Loss trend check**: loss should decrease over the first 50-100 iterations. If it's flat or increasing, investigate immediately.
+
+**When any of these checks fail, STOP and diagnose before continuing.** Do NOT celebrate a "successful" training run that has random-output loss. Do NOT proceed to the next task. The training is broken.
+
+### Dummy data vs real data
+
+- Dummy/mock data: loss near ln(vocab_size) is EXPECTED. The data is random.
+- Real data: loss near ln(vocab_size) is a CRITICAL BUG. Investigate immediately.
+- Always know which data you're using. Check the config's `data_path` field.
 
 ### Training Progress
 

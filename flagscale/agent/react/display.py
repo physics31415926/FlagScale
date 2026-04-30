@@ -154,6 +154,14 @@ class _Spinner:
         self._prefix = prefix
         self._stop = threading.Event()
         self._thread = None
+        self._hint = ""
+        self._hint_lock = threading.Lock()
+        self._t0 = time.time()
+
+    def set_hint(self, hint):
+        """Update the hint text shown alongside the spinner."""
+        with self._hint_lock:
+            self._hint = hint
 
     def start(self):
         if not _use_color():
@@ -164,13 +172,20 @@ class _Spinner:
 
     def _spin(self):
         i = 0
-        t0 = time.time()
         while not self._stop.is_set():
-            elapsed = time.time() - t0
+            elapsed = time.time() - self._t0
             frame = self._FRAMES[i % len(self._FRAMES)]
-            line = f"\r  {dim(frame)} {dim(self._prefix)} {dim(f'{elapsed:.0f}s')}"
+            with self._hint_lock:
+                hint = self._hint
+            parts = [f"  {dim(frame)}"]
+            if self._prefix:
+                parts.append(f" {dim(self._prefix)}")
+            parts.append(f" {dim(f'{elapsed:.0f}s')}")
+            if hint:
+                parts.append(f" {dim(hint)}")
+            line = _truncate_to_width("".join(parts), _term_width())
             with _stdout_lock:
-                sys.stdout.write(line)
+                sys.stdout.write(f"\r\033[K{line}")
                 sys.stdout.flush()
             i += 1
             self._stop.wait(0.1)
@@ -204,7 +219,7 @@ def banner(provider, model, mode=None, extra_lines=None):
     title = f"FlagScale Agent v{__version__}"
     mode_str = f" | Mode: {mode}" if mode else ""
     info = f"Provider: {provider} | Model: {model}{mode_str}"
-    cmds = "Commands: /skill  /file  /plan  /save  /load  /export  /cache  /memory  /mode  /reload  /quit"
+    cmds = "Commands: /skill  /file  /plan  /save  /load  /export  /memory  /mode  /reload  /quit"
     lines = [info, cmds]
     if extra_lines:
         lines.extend(extra_lines)
@@ -218,20 +233,89 @@ def banner(provider, model, mode=None, extra_lines=None):
 
 # ── Thinking ────────────────────────────────────────────────────────────
 
+_thinking_anim = None
+
+
+class _ThinkingAnim:
+    """Animated '⏳ Thinking...' indicator with cycling dots."""
+    _DOTS = [".", "..", "..."]
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self._timestamp = time.strftime("%H:%M:%S")
+
+    def start(self):
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def _animate(self):
+        i = 0
+        while not self._stop.is_set():
+            dots = self._DOTS[i % len(self._DOTS)]
+            line = f"[{self._timestamp}] ⏳ Thinking{dots}"
+            with _stdout_lock:
+                sys.stdout.write(f"\r\033[K{dim(line)}")
+                sys.stdout.flush()
+            i += 1
+            self._stop.wait(0.4)
+
+    def done(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        line = f"[{self._timestamp}] ⏳ Thinking ✓"
+        with _stdout_lock:
+            sys.stdout.write(f"\r\033[K{dim(line)}\n")
+            sys.stdout.flush()
+
+    def cancel(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        with _stdout_lock:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+
 def thinking():
+    global _thinking_anim
     _stop_all_spinners()
-    _write(dim("⏳ Thinking..."))
+    _thinking_anim = _ThinkingAnim()
+    _thinking_anim.start()
+
+
+def thinking_done():
+    """Mark thinking as done — clear the line (info merged into llm_done)."""
+    global _thinking_anim
+    _stop_all_spinners()
+    if _thinking_anim:
+        _thinking_anim.cancel()
+        _thinking_anim = None
 
 
 def thinking_clear():
-    _stop_all_spinners()
-    _write("\r\033[K")
+    """Cancel thinking — removes the line entirely. Alias for thinking_done."""
+    thinking_done()
+
+
+# ── Context compaction ─────────────────────────────────────────────────
+
+
+def context_compacted(from_tokens, to_tokens, compaction_num=None, ratio=None):
+    from_k = from_tokens // 1000
+    to_k = to_tokens // 1000
+    detail = f"{from_k}k → {to_k}k"
+    if compaction_num is not None and ratio is not None:
+        detail += f" (#{compaction_num}, target {int(ratio * 100)}%)"
+    _print(dim(f"📦 Context compacted: {detail}"))
 
 
 # ── LLM done ────────────────────────────────────────────────────────────
 
 def llm_done(elapsed, input_tokens=None, output_tokens=None):
-    parts = [green("✓"), f"{elapsed:.1f}s"]
+    ts = time.strftime("%H:%M:%S")
+    parts = [f"[{ts}]", green("✓"), f"{elapsed:.1f}s"]
     if input_tokens is not None:
         parts.append(f"↑{_fmt_tokens(input_tokens)}")
     if output_tokens is not None:
@@ -300,6 +384,7 @@ class _ParallelDisplay:
         self._tools = tool_summaries
         self._n = len(tool_summaries)
         self._results = {}  # index -> (elapsed, error)
+        self._hints = {}    # index -> hint text for running tools
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -339,6 +424,11 @@ class _ParallelDisplay:
         with self._lock:
             self._results[index] = (elapsed, error, detail)
 
+    def update_hint(self, index, hint):
+        """Update a running tool's hint text (e.g. health check status)."""
+        with self._lock:
+            self._hints[index] = hint
+
     def _animate(self):
         while not self._stop.is_set():
             self._redraw()
@@ -348,6 +438,7 @@ class _ParallelDisplay:
     def _redraw(self):
         with self._lock:
             results = dict(self._results)
+            hints = dict(self._hints)
             extra = self._extra_lines
         tw = _term_width()
         with _stdout_lock:
@@ -373,7 +464,11 @@ class _ParallelDisplay:
                         line += f" {dim(detail)}"
                 else:
                     frame = self._FRAMES[self._frame % len(self._FRAMES)]
-                    line = f"  {dim(label)} {dim(frame)}"
+                    hint = hints.get(i, "")
+                    if hint:
+                        line = f"  {dim(label)} {dim(frame)} {dim('🩺 ' + hint)}"
+                    else:
+                        line = f"  {dim(label)} {dim(frame)}"
                 sys.stdout.write(f"\r\033[K{_truncate_to_width(line, tw)}\n")
             if extra > 0:
                 sys.stdout.write(f"\033[{extra}B")
@@ -415,6 +510,12 @@ def parallel_tool_update(index, elapsed, error=False, detail=""):
         _parallel_display.mark_done(index, elapsed, error, detail)
 
 
+def parallel_tool_hint(index, hint):
+    """Update a running tool's hint (e.g. health check diagnosis)."""
+    if _parallel_display and not _parallel_display._stop.is_set():
+        _parallel_display.update_hint(index, hint)
+
+
 def parallel_extra_lines(count):
     """Notify parallel display that external code printed extra lines below it."""
     if _parallel_display and not _parallel_display._stop.is_set():
@@ -433,6 +534,7 @@ def parallel_tools_finish():
 
 def turn_summary(turn_num, elapsed, input_tokens, output_tokens):
     _stop_all_spinners()
+    _print()
     parts = [f"Turn {turn_num}", f"{elapsed:.1f}s",
              f"↑{_fmt_tokens(input_tokens)} ↓{_fmt_tokens(output_tokens)}"]
     _print(dim(f"── {' | '.join(parts)} ──"))

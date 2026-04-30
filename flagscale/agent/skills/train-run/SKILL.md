@@ -156,11 +156,13 @@ If dry run fails, report the error. Do NOT proceed to actual training.
 
 ## Step 4: Start / Stop Training
 
+**IMPORTANT**: Always set `PYTHONUNBUFFERED=1` before launching training. Without it, Python buffers stdout and training logs appear delayed or empty, making health monitoring unreliable.
+
 ```bash
 # Start (CLI)
-flagscale train <model>
+PYTHONUNBUFFERED=1 flagscale train <model>
 # Start (legacy)
-python run.py --config-path ./examples/<model>/conf --config-name train action=run
+PYTHONUNBUFFERED=1 python run.py --config-path ./examples/<model>/conf --config-name train action=run
 
 # Stop (CLI)
 flagscale train <model> --stop
@@ -170,6 +172,30 @@ python run.py --config-path ./examples/<model>/conf --config-name train action=s
 # Dry run (validate config only)
 flagscale train <model> --dryrun
 ```
+
+### Post-Launch Protocol (MANDATORY)
+
+After launching training, follow this sequence EVERY time. Do NOT skip steps.
+
+**Within 30 seconds of launch:**
+1. Use `find_latest_log` to locate the new log directory
+2. Check stderr on rank 0 for import errors or early crashes
+3. If stderr has errors → training failed at startup. Fix and retry.
+
+**After first metrics appear (usually 1-3 minutes):**
+4. Use `parse_training_metrics` with `vocab_size` to check health
+5. Verify loss is NOT near `ln(vocab_size)` — if it is, model outputs are random (see train-monitor skill)
+6. Verify gradients are flowing (`num_zeros` / total_params < 50%)
+7. Report the first metrics to the user with health assessment
+
+**If health judge killed a long-running command:**
+When the agent's health judge kills a `sleep` or `tail -f` command, do NOT blindly retry with another sleep. Instead:
+1. Check if the training process is still alive: `kill -0 <pid>` or check PID file
+2. Check GPU utilization: `nvidia-smi`
+3. Check the latest log lines directly (no sleep)
+4. Then decide: wait more, or investigate a problem
+
+**Never declare training "successful" based only on "it didn't crash".** A training run that produces random output is worse than a crash — it wastes GPU hours silently.
 
 ---
 

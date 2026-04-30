@@ -14,8 +14,8 @@ class PlanUpdateTool(Tool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["step_done", "step_doing", "step_skip", "add_steps", "complete", "abandon"],
-                "description": "What to do: step_done/step_doing/step_skip (update a step), add_steps (insert new steps), complete/abandon (finish the plan).",
+                "enum": ["step_done", "step_doing", "step_skip", "add_steps", "complete", "abandon", "batch"],
+                "description": "What to do: step_done/step_doing/step_skip (update a step), add_steps (insert new steps), complete/abandon (finish the plan), batch (update multiple steps at once).",
             },
             "step_id": {
                 "type": "integer",
@@ -33,6 +33,19 @@ class PlanUpdateTool(Tool):
             "after_step_id": {
                 "type": "integer",
                 "description": "Insert new steps after this step (for add_steps). Omit to append at end.",
+            },
+            "updates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step_id": {"type": "integer"},
+                        "status": {"type": "string", "enum": ["done", "doing", "skipped"]},
+                        "notes": {"type": "string"},
+                    },
+                    "required": ["step_id", "status"],
+                },
+                "description": "For batch action: list of step updates to apply at once.",
             },
         },
         "required": ["action"],
@@ -68,6 +81,20 @@ class PlanUpdateTool(Tool):
                 self._plan.complete()
             elif action == "abandon":
                 self._plan.abandon(kwargs.get("notes", ""))
+            elif action == "batch":
+                updates = kwargs.get("updates", [])
+                if not updates:
+                    return "ERROR: updates required for batch action."
+                status_map = {"done": "done", "doing": "doing", "skipped": "skipped"}
+                for u in updates:
+                    sid = u.get("step_id")
+                    status = u.get("status", "")
+                    if not sid or status not in status_map:
+                        continue
+                    if status == "skipped":
+                        self._plan.skip_step(sid, u.get("notes", ""))
+                    else:
+                        self._plan.update_step(sid, status_map[status], u.get("notes", ""))
             else:
                 return f"ERROR: Unknown action '{action}'."
             return self._plan.summary()

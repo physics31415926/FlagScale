@@ -22,7 +22,7 @@ FATAL_PATTERNS = [
 
 CONFIRM_PATTERNS = [
     r"\brm\s+",
-    r"\bkill\b",
+    r"\bkill\b(?!\s+-(0|s\s+0)\b)",
     r"\bkillall\b",
     r"\bpkill\b",
     r"\breboot\b",
@@ -31,7 +31,8 @@ CONFIRM_PATTERNS = [
     r"\bgit\s+push\b",
     r"\bgit\s+reset\s+--hard",
     r"\bgit\s+clean\s+-[^\s]*f",
-    r"\bchmod\b",
+    r"\bchmod\s+(-[^\s]*\s+)*[0-7]{3,4}\b",
+    r"\bchmod\s+-[^\s]*R",
     r"\bchown\b",
     r"\bmv\s+/",
     r"\bcp\s+.*\s+/",
@@ -44,6 +45,32 @@ CONFIRM_PATTERNS = [
     r"\bcurl\s+.*\|\s*(ba)?sh",
     r"\bwget\s+.*\|\s*(ba)?sh",
 ]
+
+_CONFIRM_REASONS = {
+    r"\brm\s+": "delete files",
+    r"\bkill\b(?!\s+-(0|s\s+0)\b)": "kill process",
+    r"\bkillall\b": "kill processes",
+    r"\bpkill\b": "kill processes",
+    r"\breboot\b": "reboot system",
+    r"\bshutdown\b": "shutdown system",
+    r"\bsystemctl\s+(stop|restart|disable)": "modify system service",
+    r"\bgit\s+push\b": "push to remote",
+    r"\bgit\s+reset\s+--hard": "discard commits",
+    r"\bgit\s+clean\s+-[^\s]*f": "delete untracked files",
+    r"\bchmod\s+(-[^\s]*\s+)*[0-7]{3,4}\b": "change file permissions",
+    r"\bchmod\s+-[^\s]*R": "recursive permission change",
+    r"\bchown\b": "change file ownership",
+    r"\bmv\s+/": "move system files",
+    r"\bcp\s+.*\s+/": "copy to system path",
+    r"\bpip\s+install\b": "install Python packages",
+    r"\bpip\s+uninstall\b": "uninstall Python packages",
+    r"\bconda\s+install\b": "install conda packages",
+    r"\bconda\s+remove\b": "remove conda packages",
+    r"\bapt\s+(install|remove|purge)": "modify system packages",
+    r"\byum\s+(install|remove|erase)": "modify system packages",
+    r"\bcurl\s+.*\|\s*(ba)?sh": "pipe remote script to shell",
+    r"\bwget\s+.*\|\s*(ba)?sh": "pipe remote script to shell",
+}
 
 _FATAL_RE = re.compile("|".join(FATAL_PATTERNS))
 _CONFIRM_RE = re.compile("|".join(CONFIRM_PATTERNS))
@@ -85,13 +112,67 @@ def _strip_grep_patterns(command: str) -> str:
     return _GREP_PATTERN_RE.sub("grep __PATTERN__", command)
 
 
-def _default_confirm(command: str) -> bool:
+def _strip_heredoc_bodies(command: str) -> str:
+    """Replace heredoc bodies with a placeholder so their content doesn't
+    trigger confirm patterns.  Handles both quoted and unquoted delimiters."""
+    import re
+    return re.sub(
+        r"<<-?\s*['\"]?(\w+)['\"]?.*?\n.*?\n\1\b",
+        "<<HEREDOC_STRIPPED",
+        command,
+        flags=re.DOTALL,
+    )
+
+
+def _summarize_for_confirm(command: str) -> str:
+    """Produce a short display string for the confirmation prompt.
+
+    For short commands (≤3 lines) show as-is.
+    For long commands, show the first meaningful line, an ellipsis with the
+    total line count, and every line that actually triggered a CONFIRM_PATTERN.
+    """
+    lines = command.split("\n")
+    if len(lines) <= 3:
+        return command
+
+    # Match against the command with heredoc bodies stripped so that
+    # file content inside heredocs doesn't produce false trigger lines.
+    stripped_cmd = _strip_heredoc_bodies(command)
+    stripped_lines = stripped_cmd.split("\n")
+
+    trigger_lines = []
+    for line in stripped_lines:
+        s = line.strip()
+        if not s:
+            continue
+        cleaned_line = _strip_grep_patterns(s)
+        if _CONFIRM_RE.search(cleaned_line):
+            trigger_lines.append(s)
+
+    first = next((l.strip() for l in lines if l.strip()), lines[0])
+    parts = [first, f"  ... ({len(lines)} lines total)"]
+    for tl in trigger_lines:
+        if tl != first:
+            parts.append(f"  \033[33m→ {tl}\033[0m")
+    return "\n".join(parts)
+
+
+def _default_confirm(command: str, matched_patterns: list = None) -> bool:
     """Ask user to confirm a potentially risky command."""
     from flagscale.agent.react import display
     if display._active_spinner:
         display._active_spinner.stop()
         display._active_spinner = None
-    print(f"\n\033[33m⚠  Risky command:\033[0m {command}")
+    summary = _summarize_for_confirm(command)
+    # Build reason string from matched patterns
+    reasons = []
+    if matched_patterns:
+        for p in matched_patterns:
+            r = _CONFIRM_REASONS.get(p)
+            if r and r not in reasons:
+                reasons.append(r)
+    reason_str = f" ({', '.join(reasons)})" if reasons else ""
+    print(f"\n\033[33m⚠  Confirm{reason_str}:\033[0m\n{summary}")
     try:
         answer = input("\033[33m   Allow? [y/N/a(llow all similar)]: \033[0m").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -206,19 +287,26 @@ class ShellTool(Tool):
 
     def _match_confirm_patterns(self, command: str):
         """Return the list of CONFIRM_PATTERNS that match this command."""
-        cleaned = _strip_grep_patterns(command)
+        cleaned = _strip_heredoc_bodies(_strip_grep_patterns(command))
         return [p for p in CONFIRM_PATTERNS if re.search(p, cleaned)]
 
     def needs_confirm(self, command: str) -> bool:
         """Check if a command would require user confirmation (without prompting)."""
         if not self._require_confirm:
             return False
-        cleaned = _strip_grep_patterns(command)
+        cleaned = _strip_heredoc_bodies(_strip_grep_patterns(command))
         if not _CONFIRM_RE.search(cleaned):
             return False
         matched = self._match_confirm_patterns(command)
         unapproved = [p for p in matched if p not in self._approved_patterns]
         return bool(unapproved)
+
+    def _call_confirm(self, command: str, matched_patterns: list):
+        """Call confirm function, falling back to single-arg for custom fns."""
+        try:
+            return self._confirm_fn(command, matched_patterns)
+        except TypeError:
+            return self._confirm_fn(command)
 
     def pre_confirm(self, command: str) -> bool:
         """Run the confirmation prompt for a command. Returns True if approved."""
@@ -226,7 +314,7 @@ class ShellTool(Tool):
         unapproved = [p for p in matched if p not in self._approved_patterns]
         if not unapproved:
             return True
-        result = self._confirm_fn(command)
+        result = self._call_confirm(command, unapproved)
         if result == "allow_pattern":
             self._approved_patterns.update(matched)
             return True
@@ -235,18 +323,19 @@ class ShellTool(Tool):
     def execute(self, **kwargs) -> str:
         command = kwargs["command"]
         skip_confirm = kwargs.pop("_skip_confirm", False)
-        self._quiet = skip_confirm  # suppress dots/progress in parallel mode
+        parallel_index = kwargs.pop("_parallel_index", None)
+        quiet = skip_confirm  # suppress dots/progress in parallel mode
 
         if self._check_dangerous and _FATAL_RE.search(command):
             return f"FATAL: Refused to execute potentially dangerous command: {command}"
 
         if not skip_confirm:
-            cleaned = _strip_grep_patterns(command)
+            cleaned = _strip_heredoc_bodies(_strip_grep_patterns(command))
             if self._require_confirm and _CONFIRM_RE.search(cleaned):
                 matched = self._match_confirm_patterns(command)
                 unapproved = [p for p in matched if p not in self._approved_patterns]
                 if unapproved:
-                    result = self._confirm_fn(command)
+                    result = self._call_confirm(command, unapproved)
                     if result == "allow_pattern":
                         self._approved_patterns.update(matched)
                     elif not result:
@@ -296,15 +385,14 @@ class ShellTool(Tool):
 
             # Show wait hint for commands with embedded sleep or known long-running patterns
             _sleep_m = re.search(r"\bsleep\s+(\d+)", command)
-            if _sleep_m:
+            if _sleep_m and not quiet:
                 secs = _sleep_m.group(1)
                 from flagscale.agent.react import display
-                with display._stdout_lock:
-                    sys.stdout.write(f"\033[2m   ⏳ Waiting {secs}s (health checks active during wait)...\033[0m\n")
-                    sys.stdout.flush()
+                if display._active_spinner:
+                    display._active_spinner.set_hint(f"⏳ Waiting {secs}s")
 
             start = time.time()
-            next_check = min(30, self._remind_interval)
+            next_check = min(15, self._remind_interval)
             long_run_approved = True
             last_output_snapshot = ""
             stall_count = 0
@@ -347,16 +435,21 @@ class ShellTool(Tool):
                         else:
                             reason = decision.get("reason", "")
                             if reason:
-                                from flagscale.agent.react import display
-                                msg = f"\n\033[2m   🩺 [{time_str}] {reason}\033[0m\n"
-                                with display._stdout_lock:
-                                    sys.stdout.write(msg)
-                                    sys.stdout.flush()
-                                    if display._parallel_display and not display._parallel_display._stop.is_set():
-                                        display._parallel_display.add_extra_lines(2)
+                                if quiet and parallel_index is not None:
+                                    from flagscale.agent.react import display
+                                    display.parallel_tool_hint(parallel_index, reason)
+                                elif not quiet:
+                                    from flagscale.agent.react import display
+                                    if display._active_spinner:
+                                        display._active_spinner.set_hint(f"🩺 {reason}")
+                            else:
+                                if not quiet:
+                                    from flagscale.agent.react import display
+                                    if display._active_spinner:
+                                        display._active_spinner.set_hint("")
                             # LLM decides next check interval
                             ncs = decision.get("next_check_seconds")
-                            if isinstance(ncs, (int, float)) and 30 <= ncs <= 300:
+                            if isinstance(ncs, (int, float)) and 10 <= ncs <= 300:
                                 next_check = elapsed + ncs
                             else:
                                 next_check = elapsed + self._remind_interval
@@ -405,14 +498,18 @@ class ShellTool(Tool):
 
                     if long_run_approved:
                         recent = stdout_chunks[-5:] + stderr_chunks[-5:]
-                        if recent and not self._quiet:
+                        if recent and not quiet:
                             from flagscale.agent.react import display
+                            if display._active_spinner:
+                                display._active_spinner.stop()
                             lines_out = [f"\033[2m   ⏳ [{time_str}] Recent output:\033[0m"]
                             for line in recent[-5:]:
                                 lines_out.append(f"\033[2m   │ {line.rstrip()}\033[0m")
                             with display._stdout_lock:
-                                sys.stdout.write("\n" + "\n".join(lines_out) + "\n")
+                                sys.stdout.write("\n".join(lines_out) + "\n")
                                 sys.stdout.flush()
+                            if display._active_spinner:
+                                display._active_spinner.start()
                     else:
                         from flagscale.agent.react import display
                         display._stop_all_spinners()

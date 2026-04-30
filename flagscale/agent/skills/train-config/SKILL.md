@@ -128,6 +128,37 @@ find . -name "__pycache__" -path "*/conf/*" -exec rm -rf {} +
 4. `transformer_impl` mismatch: if `transformer_impl: transformer_engine` but TransformerEngine-FL is not installed, training crashes immediately. Fall back to `transformer_impl: local`
 5. `hostfile` null vs missing: for single-node, explicitly set `hostfile: null`. Omitting it may cause Hydra to use a default
 6. Modifying the wrong YAML: changes to `train.yaml` don't affect model/data params — those are in `train/<size>.yaml`
+7. `system.checkpoint.load` structure: this is a NESTED config, not a flat path. Read an existing working example before writing it. Getting the structure wrong causes silent failures (weights not loaded, loss starts at random).
+8. `vocab_size` mismatch: the training config's vocab_size MUST match the tokenizer's vocabulary. Mismatch causes shape errors or silent incorrect training.
+
+## Config Validation Before Launch
+
+Before EVERY training launch, verify these programmatically (don't eyeball):
+
+```bash
+# 1. Data path exists (without suffix)
+ls ${data_path}.bin ${data_path}.idx
+
+# 2. Model weights exist (if loading checkpoint)
+ls ${checkpoint_load_path}/
+
+# 3. GPU count matches parallelism
+# total_GPUs = TP * PP * DP * EP (DP is implicit)
+# nproc_per_node * nnodes must equal total_GPUs
+
+# 4. global_batch_size divisibility
+python3 -c "
+tp, pp, ep, cp = TP, PP, EP, CP
+total_gpus = NPROC * NNODES
+dp = total_gpus // (tp * pp * ep * cp)
+gbs = GLOBAL_BATCH_SIZE
+mbs = MICRO_BATCH_SIZE
+assert gbs % (dp * mbs) == 0, f'GBS {gbs} not divisible by DP*MBS={dp*mbs}'
+print(f'OK: DP={dp}, accumulation_steps={gbs//(dp*mbs)}')
+"
+```
+
+Do NOT skip this check. Config errors waste GPU hours.
 
 ---
 
@@ -144,14 +175,25 @@ find . -name "__pycache__" -path "*/conf/*" -exec rm -rf {} +
 | CP (Context Parallel) | `system.context_parallel_size` | Splits sequence length across GPUs |
 | VPP (Virtual Pipeline) | `system.num_layers_per_virtual_pipeline_stage` | Reduces PP bubble when PP ≥ 4 |
 
-### Guidelines
+### Guidelines — Use as Context, Not Rules
 
-- TP: keep within a single node (NVLink/NVSwitch). Cross-node TP is very slow over network
-- PP: use when model doesn't fit in GPU memory with TP alone. Introduces pipeline bubbles
-- DP: the "free" parallelism — scales linearly with more GPUs, no model changes needed
-- EP: only for MoE models. Set based on expert count and GPU count
-- CP: for very long sequences. Requires compatible attention implementation
-- VPP: set `num_layers_per_virtual_pipeline_stage` to reduce PP bubble when PP ≥ 4
+The following are general considerations for parallelism strategy. They are NOT rigid rules — the right strategy depends on the specific model, hardware, workload, and constraints. Use your judgment based on the actual situation.
+
+**General considerations:**
+- TP communication is intensive — NVLink/NVSwitch interconnects handle it well, slower interconnects may not
+- PP introduces pipeline bubbles that reduce efficiency, but enables training models that don't fit in GPU memory
+- DP scales linearly and is the simplest form of parallelism
+- EP is specific to MoE architectures
+- CP is for very long sequences and requires compatible attention implementations
+- VPP can reduce pipeline bubbles when PP is used
+
+**Things to verify, not assume:**
+- Whether the interconnect actually supports efficient TP at the desired scale — check topology data if available
+- Whether the model actually needs PP — estimate memory requirements first
+- Whether the reference config or paper specifies a parallelism strategy — prefer following proven configs over theoretical optimization
+- Whether the specific model architecture has constraints (e.g., num_layers must be divisible by PP)
+
+Don't hardcode parallelism choices based on generic rules. The optimal strategy depends on factors that vary per deployment: GPU memory, interconnect bandwidth, model size, sequence length, batch size requirements, and more. When in doubt, start with the simplest config (TP=1, PP=1, maximize DP) and scale up parallelism only as needed.
 
 ### Constraint Validation
 
@@ -166,25 +208,23 @@ If VPP: num_layers / PP must be divisible by num_layers_per_virtual_pipeline_sta
 
 ### Topology-Aware Defaults
 
-Before generating a training config, check memory for topology data (written by topo-detect skill). Read keys: `topo_compute`, `topo_comm`, `topo_storage`. If any exist, use them to set smarter defaults:
+Before generating a training config, check memory for topology data (written by topo-detect skill). Read keys: `topo_compute`, `topo_comm`, `topo_storage`. If any exist, use them as context for making parallelism decisions — but treat them as inputs to your reasoning, not as deterministic rules.
 
-**Parallelism from topo_compute:**
-- Parse `gpu_count`, `mem_gb`, `interconnect` from the memory value
-- NVSwitch/NVLink interconnect → TP can use up to `gpu_count` per node efficiently
-- PCIe-only interconnect → keep TP ≤ 2, prefer PP/DP instead
-- `mem_gb` helps estimate if model fits: rough rule — each billion parameters needs ~2GB in bf16, ~4GB with optimizer states. If model params × 4 > mem_gb × gpu_count, need PP
+**Compute topology context:**
+- `gpu_count`, `mem_gb`, `interconnect` inform what's feasible, not what's optimal
+- High-bandwidth interconnect (NVSwitch/NVLink) makes larger TP feasible but doesn't mean you must use it
+- Memory capacity helps estimate whether PP is needed: rough guide — each billion parameters needs ~2GB in bf16, ~4GB with optimizer states
 
-**Communication from topo_comm:**
-- `gdrdma=yes` → set `NCCL_NET_GDR_LEVEL=5` in environment
-- `rdma=no` → warn user that inter-node training will be slow over TCP
-- High NIC count (≥ 4) → multi-rail NCCL should work well for large-scale DP
+**Communication topology context:**
+- RDMA/GDR availability affects inter-node communication efficiency
+- NIC count affects multi-rail NCCL performance for large-scale DP
+- These are factors to consider, not automatic configuration switches
 
-**Storage from topo_storage:**
-- If shared storage mount is detected, suggest it for `data_path` and checkpoint dir
-- If `seq_write_mbps` < 500, warn about potential checkpoint IO bottleneck
-- If local NVMe is available, suggest staging data there for faster loading
+**Storage topology context:**
+- Shared storage availability affects where to place data and checkpoints
+- Sequential write speed affects checkpoint IO — slow storage may need async checkpointing
 
-**If no topology data in memory:** Use the static guidelines above and suggest running `/skill topo-detect` for better defaults.
+**If no topology data in memory:** Use the general considerations above and suggest running `/skill topo-detect` for better context.
 
 ---
 

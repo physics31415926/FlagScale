@@ -21,7 +21,7 @@ class AgentConfig:
     model: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
-    max_iterations: int = 50
+    max_iterations: int = 200
     max_context_tokens: int = 200000
     shell_remind_interval: int = 120
     dangerous_commands_check: bool = True
@@ -34,7 +34,6 @@ class AgentConfig:
     plugin_tool_dirs: List[str] = field(default_factory=list)
     skill_dirs: List[str] = field(default_factory=list)
     shell_env: Dict[str, str] = field(default_factory=dict)
-    cache_ttl_days: int = 7
     memory_ttl_days: int = 7
     _config_path: Optional[str] = field(default=None, repr=False)
 
@@ -76,6 +75,7 @@ class AgentConfig:
             self.mode = "confirm"
         if self.mode == "auto":
             self.confirm_commands = False
+            self.max_iterations = 2**31 - 1
 
     @classmethod
     def from_yaml(cls, path: str) -> "AgentConfig":
@@ -128,6 +128,7 @@ class AgentConfig:
             self.mode = "confirm"
         if self.mode == "auto":
             self.confirm_commands = False
+            self.max_iterations = 2**31 - 1
         else:
             self.confirm_commands = True
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):

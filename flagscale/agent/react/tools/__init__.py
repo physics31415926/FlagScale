@@ -23,12 +23,12 @@ class ToolRegistry:
             raise KeyError(f"Tool not found: {name}")
         return self._tools[name]
 
-    def execute(self, name: str, **kwargs) -> str:
+    def execute(self, tool_name: str, **kwargs) -> str:
         """Execute a tool by name, with unified result truncation."""
-        tool = self.get(name)
+        tool = self.get(tool_name)
         result = tool.execute(**kwargs)
         if len(result) > tool.max_result_size:
-            logger.info("Truncating %s result: %d -> %d chars", name, len(result), tool.max_result_size)
+            logger.info("Truncating %s result: %d -> %d chars", tool_name, len(result), tool.max_result_size)
             result = result[:tool.max_result_size] + f"\n... [truncated, total {len(result)} chars]"
         return result
 
