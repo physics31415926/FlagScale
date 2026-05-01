@@ -91,6 +91,88 @@ _WGET_NO_CONTINUE_RE = re.compile(r'\bwget\b(?!.*\s-c\b)(?!.*--continue\b)')
 # Download commands for result annotation
 _DOWNLOAD_CMD_RE = re.compile(r'\b(wget|curl)\b')
 
+# Training-specific guardrail patterns
+_RAW_TORCHRUN_RE = re.compile(
+    r'\btorchrun\b|\bpython\s+-m\s+torch\.distributed\.launch\b'
+)
+_FLAGSCALE_TRAIN_RE = re.compile(r'\bflagscale\s+train\b')
+_PIP_NO_DEPS_RISKY_RE = re.compile(
+    r'\bpip\s+install\b(?!.*--no-deps).*\b(flash.attn|deepspeed|apex)\b'
+)
+_UNFILTERED_FIND_RE = re.compile(
+    r'\bfind\s+(/workspace|/home|\.\s)'
+    r'(?!.*-not\s+-path)(?!.*--exclude)(?!.*-prune)'
+    r'.*-name\s+["\']?\*\.py'
+)
+
+
+def _training_guardrails(command: str) -> list:
+    """Return warning strings for training-specific anti-patterns."""
+    warnings = []
+    cleaned = _strip_grep_patterns(command)
+
+    if _RAW_TORCHRUN_RE.search(cleaned) and not _FLAGSCALE_TRAIN_RE.search(cleaned):
+        warnings.append(
+            "[GUARDRAIL] Using raw torchrun instead of FlagScale Launcher. "
+            "This loses per-rank logs, experiment directory structure, config validation, "
+            "and clean shutdown. Use `flagscale train <model> --config <config>` instead."
+        )
+
+    if _PIP_NO_DEPS_RISKY_RE.search(cleaned):
+        warnings.append(
+            "[GUARDRAIL] Installing flash-attn/deepspeed/apex without --no-deps. "
+            "This may silently upgrade PyTorch and break CUDA compatibility. "
+            "Use `pip install --no-deps <package>`."
+        )
+
+    if _UNFILTERED_FIND_RE.search(cleaned):
+        warnings.append(
+            "[GUARDRAIL] find for *.py without excluding envs/site-packages. "
+            "Add: -not -path '*/envs/*' -not -path '*site-packages*'"
+        )
+
+    # GPU pre-check for training launches
+    if _FLAGSCALE_TRAIN_RE.search(cleaned) and '--dryrun' not in cleaned and '--stop' not in cleaned:
+        try:
+            gpu_check = subprocess.run(
+                "nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=5,
+            )
+            if gpu_check.returncode == 0 and gpu_check.stdout.strip():
+                busy_gpus = []
+                for line in gpu_check.stdout.strip().splitlines():
+                    parts = line.strip().split(',')
+                    if len(parts) == 2:
+                        idx, mem = parts[0].strip(), int(parts[1].strip())
+                        if mem > 1000:
+                            busy_gpus.append(f"GPU {idx}: {mem}MB")
+                if busy_gpus:
+                    warnings.append(
+                        f"[GUARDRAIL] GPUs have significant memory usage before training launch: "
+                        f"{', '.join(busy_gpus)}. Old processes may still be running. "
+                        f"Check with `pgrep -fa torchrun` and kill before launching."
+                    )
+        except Exception:
+            pass
+
+    # Check for stale processes before training launch
+    if _FLAGSCALE_TRAIN_RE.search(cleaned) and '--stop' not in cleaned and '--dryrun' not in cleaned:
+        try:
+            proc_check = subprocess.run(
+                "pgrep -c -f 'torchrun|train_' 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=5,
+            )
+            count = int(proc_check.stdout.strip()) if proc_check.stdout.strip() else 0
+            if count > 0:
+                warnings.append(
+                    f"[GUARDRAIL] {count} training-related processes already running. "
+                    f"Kill them first: `pkill -9 -f 'torchrun|train_'` then wait for GPU memory release."
+                )
+        except Exception:
+            pass
+
+    return warnings
+
 
 def _inject_proxy_exports(command: str, env: dict) -> str:
     exports = []
@@ -329,6 +411,9 @@ class ShellTool(Tool):
         if self._check_dangerous and _FATAL_RE.search(command):
             return f"FATAL: Refused to execute potentially dangerous command: {command}"
 
+        # Training-specific guardrails — prepend warnings to result
+        guardrail_warnings = _training_guardrails(command)
+
         if not skip_confirm:
             cleaned = _strip_heredoc_bodies(_strip_grep_patterns(command))
             if self._require_confirm and _CONFIRM_RE.search(cleaned):
@@ -560,6 +645,8 @@ class ShellTool(Tool):
                     output += hint
                 if _DOWNLOAD_CMD_RE.search(command):
                     output += "\n[NOTICE: Download exited with non-zero status. File may be incomplete. Verify with `ls -lh` and retry with `wget -c` or `curl -C -`.]"
+            if guardrail_warnings:
+                output = "\n".join(guardrail_warnings) + "\n" + output
             return output
         except KeyboardInterrupt:
             if proc and proc.poll() is None:

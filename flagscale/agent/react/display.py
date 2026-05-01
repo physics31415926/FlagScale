@@ -203,13 +203,16 @@ _active_spinner = None
 
 
 def _stop_all_spinners():
-    global _active_spinner, _parallel_display
+    global _active_spinner, _parallel_display, _poll_anim
     if _active_spinner:
         _active_spinner.stop()
         _active_spinner = None
     if _parallel_display:
         _parallel_display.finish()
         _parallel_display = None
+    if _poll_anim:
+        _poll_anim.stop()
+        _poll_anim = None
 
 
 # ── Banner ──────────────────────────────────────────────────────────────
@@ -528,6 +531,89 @@ def parallel_tools_finish():
     if _parallel_display:
         _parallel_display.finish()
         _parallel_display = None
+
+
+# ── Poll mode display ─────────────────────────────────────────────────
+
+_poll_anim = None
+
+
+class _PollAnim:
+    """Animated inline display for poll mode checks."""
+    _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self._status = ""
+        self._lock = threading.Lock()
+
+    def set_status(self, text):
+        with self._lock:
+            self._status = text
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def _animate(self):
+        i = 0
+        while not self._stop.is_set():
+            frame = self._FRAMES[i % len(self._FRAMES)]
+            with self._lock:
+                status = self._status
+            line = f"  {dim(frame)} {dim(status)}"
+            tw = _term_width()
+            with _stdout_lock:
+                sys.stdout.write(f"\r\033[K{_truncate_to_width(line, tw)}")
+                sys.stdout.flush()
+            i += 1
+            self._stop.wait(0.1)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        with _stdout_lock:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+
+def poll_mode_start(command_summary, interval):
+    """Print poll mode activation banner."""
+    global _poll_anim
+    _stop_all_spinners()
+    _print()
+    _print(cyan(f"  🔄 Poll mode: re-running every {interval}s until output changes"))
+    _print(dim(f"     cmd: {command_summary}"))
+    _print(dim(f"     Ctrl+C to exit poll mode"))
+    _poll_anim = _PollAnim()
+    _poll_anim.start()
+
+
+def poll_check(n, elapsed, changed=False):
+    """Update poll status on the same line."""
+    global _poll_anim
+    if _poll_anim:
+        _poll_anim.set_status(f"poll #{n} — no change ({elapsed:.0f}s)")
+
+
+def poll_mode_end(reason, poll_count, total_elapsed):
+    """Print poll mode exit summary."""
+    global _poll_anim
+    if _poll_anim:
+        _poll_anim.stop()
+        _poll_anim = None
+    icon = green("✓") if reason == "changed" else yellow("⏱")
+    reasons = {
+        "changed": "output changed",
+        "timeout": "max duration reached",
+        "interrupted": "interrupted by user",
+    }
+    reason_text = reasons.get(reason, reason)
+    _print(f"  {icon} Poll ended: {reason_text} ({poll_count} checks, {total_elapsed:.0f}s)")
+    _print()
 
 
 # ── Turn / session summary ──────────────────────────────────────────────

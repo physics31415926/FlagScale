@@ -129,6 +129,9 @@ All artifacts go under `<root>` (the detected storage root):
 - Naming: use descriptive names reflecting the config (e.g., `qwen3_0.6b_tp2_pp1_bs8`). For reruns of the same config, append a timestamp (e.g., `qwen3_0.6b_tp2_pp1_bs8_20260429`).
 - When generating FlagScale `train.yaml`: set `experiment.exp_dir` to `<root>/experiments/<model>/<exp_name>/`.
 - Checkpoints, logs, and tensorboard dirs are subdirectories of the experiment — don't scatter them elsewhere.
+- **Experiment registry**: Every experiment MUST be recorded in workspace_state (section "Experiments") with structured fields: Purpose (目的), Hypothesis (假设), Config (配置), Dir (目录), Result (结果), Reflection (反思), Next (下一步). See train-run skill for the full format and lifecycle. This registry serves two purposes:
+  1. **Log discovery**: find any experiment's directory instantly without filesystem search
+  2. **Knowledge accumulation**: each experiment's Reflection feeds into the next experiment's design, creating a chain of reasoning that accelerates iteration and prevents repeating mistakes
 
 ### 3d. Conda environments
 

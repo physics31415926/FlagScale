@@ -48,6 +48,9 @@ Environment setup is a constraint satisfaction problem. Collect ALL constraints 
 4. Never modify dependency source code to work around errors — report to user
 5. After any large `pip install`, verify critical packages were not unexpectedly upgraded: `python -c "import torch; print(torch.__version__, torch.version.cuda)"`
 6. **Auto-fetch FL dependencies**: When Megatron-LM-FL or TransformerEngine-FL source code is needed (for analysis, compilation, or debugging) and is not available locally, pull the latest automatically — don't ask the user. Repos: `https://github.com/flagos-ai/Megatron-LM-FL.git`, `https://github.com/flagos-ai/TransformerEngine-FL.git` (use `--recursive` for TE-FL)
+7. **ALL FL-customized dependencies are MANDATORY.** Do NOT skip Megatron-LM-FL, TransformerEngine-FL, Apex, or Flash-Attention. These are not optional — FlagScale training will fail or produce incorrect results without them. If one is difficult to install, try the source build fallback. Only skip a dependency if the user explicitly requests it after being warned of the consequences.
+8. **If the user asks to create a new environment, create a new environment.** Do not reuse an existing one, even if it appears to have the right packages. Existing environments may have editable installs pointing to other workspaces, patched packages, or stale versions. A fresh environment is the only way to guarantee a clean, reproducible baseline. If you believe reusing is genuinely better, explain why and ask — but do not silently substitute.
+9. **NEVER copy packages between environments using `cp -r` from site-packages.** This bypasses pip's metadata tracking — pip won't know the package exists, so dependency resolution, upgrades, and uninstalls all break silently. Always install via `pip install` (from wheel, PyPI, or source build). If a prebuilt wheel isn't available, build from source — it takes longer but produces a properly registered package.
 
 ## Step 1: Constraint Collection (NO installs in this step)
 
@@ -118,7 +121,8 @@ If no valid intersection exists, STOP and tell the user why (e.g., framework req
 
 ```bash
 conda create -n {env_name} python={python_version} -y
-conda activate {env_name}
+# In non-interactive shells (agent), use: conda run -n {env_name} <command>
+# In interactive shells (user), use: conda activate {env_name}
 ```
 
 Verify:
@@ -210,12 +214,20 @@ python -c "import apex; print('Apex OK')"
 
 ### 4d. Flash-Attention 2
 
+**CRITICAL**: Always use `--no-deps` when installing flash-attn. Without it, pip may upgrade PyTorch to an incompatible version, causing cascading failures (triton mismatch, CUDA version conflicts). The PyTorch version was already pinned in Step 3 — do not let flash-attn override it.
+
 ```bash
 git clone --branch v2.8.1 --depth 1 https://github.com/Dao-AILab/flash-attention.git {deps_dir}/flash-attention
 cd {deps_dir}/flash-attention
 FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=4 \
-    pip install --no-build-isolation . -v
+    pip install --no-build-isolation --no-deps . -v
 ```
+
+After installing, verify PyTorch was NOT changed:
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+If the version differs from what was installed in Step 3, flash-attn broke the environment. Uninstall flash-attn, reinstall the correct PyTorch, and retry with `--no-deps`.
 
 Verify:
 ```bash
@@ -247,6 +259,36 @@ print(f'Flash-Attention: {flash_attn.__version__}')
 print('All dependencies ready!')
 "
 ```
+
+**Post-install verification gate — do NOT proceed to training or model porting until ALL checks pass:**
+
+| Check | Command | Pass Criteria |
+|-------|---------|---------------|
+| PyTorch CUDA | `python -c "import torch; assert torch.cuda.is_available()"` | No error |
+| PyTorch version unchanged | Compare against version from Step 3 | Exact match |
+| Megatron-LM-FL | `python -c "from megatron.plugin.platform import get_platform"` | No ImportError |
+| TransformerEngine-FL | `python -c "import transformer_engine"` | No ImportError |
+| Apex | `python -c "import apex"` | No ImportError |
+| Flash-Attention | `python -c "import flash_attn"` | No ImportError |
+
+If ANY check fails, fix it before moving on. Do not proceed with "we'll fix it later" — dependency issues compound during training and are much harder to debug.
+
+### 5b. Package provenance check
+
+Verify that each FL dependency is installed from the correct source — not from a different workspace or stale editable install:
+
+```bash
+pip show megatron-core transformer-engine apex flash-attn 2>/dev/null | grep -E "^(Name|Location|Editable)"
+```
+
+For each package:
+- If `Editable project location` is shown, verify it points to a directory within the CURRENT workspace (not a different `/workspace/X/` directory)
+- If the editable path points to a different workspace, the installed code won't match the code you'll read for debugging — reinstall from the correct source tree within your workspace
+- For non-editable installs, verify the `Location` is inside the target conda environment's `site-packages/`
+
+**Cross-workspace editable installs are NEVER acceptable.** Even if two directories are at the same git commit today, they can diverge silently. If the dependency source doesn't exist in your workspace, clone it locally first (`git clone <repo> /workspace/<your_workspace>/<dep>/`), then editable-install from the local clone.
+
+This check prevents the most insidious debugging trap: reading source code from one directory while the runtime uses code from a completely different directory.
 
 ## Step 6: Multi-Node Deployment
 
@@ -285,7 +327,7 @@ If source builds are too complex, recommend the official training Docker image:
 docker pull harbor.baai.ac.cn/flagscale/flagscale-train:dev-cu128-py3.12-20260319182856
 docker run -itd --gpus all --shm-size=500g --name <name> harbor.baai.ac.cn/flagscale/flagscale-train:dev-cu128-py3.12-20260319182856 /bin/bash
 docker exec -it <name> /bin/bash
-conda activate flagscale-train
+# In non-interactive shells (agent), use: conda run -n flagscale-train <command>
 ```
 
 This image has all dependencies pre-installed.

@@ -45,7 +45,8 @@ SSH into training server, enter Docker container, activate conda env, cd to Flag
 
 ```bash
 sudo docker exec -it <container_name> bash
-conda activate <env_name>
+# In non-interactive shells (agent), use: conda run --prefix <env_path> <command>
+# In interactive shells (user), use: conda activate <env_name>
 cd <flagscale_project_path>
 ```
 
@@ -142,7 +143,9 @@ nvidia-smi --query-gpu=index --format=csv,noheader | wc -l
 
 If GPU count or model differs from what's in memory, warn the user that topology data is stale.
 
-### 3e. Dry Run
+### 3e. Dry Run — HARD GATE
+
+**Do NOT launch real training without completing dryrun first.**
 
 ```bash
 flagscale train <model> --dryrun
@@ -150,11 +153,52 @@ flagscale train <model> --dryrun
 
 If dry run fails, report the error. Do NOT proceed to actual training.
 
-**Only after all checks pass, proceed to start training.**
+After dryrun succeeds, inspect the generated launch script:
+```bash
+cat {exp_dir}/logs/scripts/host_*_run.sh
+```
+Verify: correct GPU count (`--nproc_per_node`), correct entrypoint, all expected CLI flags, no placeholder paths (`/path/to/`, `FIXME`, `TODO`).
+
+**If you modify the config after dryrun, you MUST re-run dryrun.** Cached scripts contain hardcoded values from the previous config.
+
+### 3f. Config Arithmetic Verification
+
+Before launching, verify ALL of the following. Do not skip any item:
+- `global_batch_size % (micro_batch_size × data_parallel_size) == 0`
+- `num_attention_heads % tensor_model_parallel_size == 0`
+- `num_key_value_heads % tensor_model_parallel_size == 0` (for GQA models)
+- `num_layers % pipeline_model_parallel_size == 0` (if PP > 1)
+
+Also verify config value types match expectations. Read argparse definitions for non-obvious types (e.g., `--rotary-base` expects int, not float).
+
+### 3g. Checkpoint Compatibility Verification
+
+If loading a checkpoint (`--load`):
+1. Verify checkpoint exists and contains `latest_checkpointed_iteration.txt`
+2. Verify checkpoint TP/PP matches config TP/PP — a TP=1 checkpoint cannot be loaded with TP=4 without resharding
+3. Verify `vocab_size` matches between checkpoint and config
+4. Verify checkpoint format (`torch` vs `dist`) matches `ckpt_format` in config
+
+```bash
+ls <checkpoint_path>/latest_checkpointed_iteration.txt
+cat <checkpoint_path>/latest_checkpointed_iteration.txt
+```
+
+### 3h. Memory Budget Estimation
+
+Before launching, estimate per-GPU memory:
+```
+per_gpu_memory = model_params × 2 (bf16) + gradients × 2 + optimizer_states × (8 / DP)
+```
+If this exceeds GPU memory, do NOT launch — fix parallelism or enable activation checkpointing first.
+
+**Only after ALL checks pass (3a through 3h), proceed to start training.**
 
 ---
 
 ## Step 4: Start / Stop Training
+
+**ALWAYS use FlagScale Launcher** — never bypass it with raw `torchrun` or hand-written launch scripts. The launcher provides per-rank log separation, experiment directory structure, config validation, and clean shutdown (`--stop`). Without it, all ranks write to one stream (debug prints get lost or interleaved), there's no experiment directory structure, and you can't use `--stop`. If the launcher fails, fix the root cause — do not work around it.
 
 **IMPORTANT**: Always set `PYTHONUNBUFFERED=1` before launching training. Without it, Python buffers stdout and training logs appear delayed or empty, making health monitoring unreliable.
 
@@ -177,16 +221,74 @@ flagscale train <model> --dryrun
 
 After launching training, follow this sequence EVERY time. Do NOT skip steps.
 
+**Before launch — HARD GATE: register the experiment and create its directory:**
+
+0a. Create a DEDICATED experiment directory for this run. Never reuse a directory from a previous experiment. Naming convention: `<model>_<config>_<purpose>_v<N>` (e.g., `bagel_tp4_pp1_reproduce_v1`). If re-running after a fix, increment the version.
+
+0b. Write the experiment entry in workspace_state (section "Experiments") BEFORE launching. **If you haven't written this entry, you are NOT allowed to launch.**
+
+   ```
+   workspace_state(action="write", section="Experiments", content="""
+   ### <model>_<config>_<purpose> (running)
+   - **Purpose**: <what you are verifying and why>
+   - **Hypothesis**: <expected outcome — e.g., loss starts near ln(vocab_size) and decreases>
+   - **Config**: TP=<N> PP=<N> DP=<N>, micro_bs=<N>, seq_len=<N>, bf16, <N> steps
+   - **Dir**: <experiment_directory>
+   - **Result**: (pending)
+   - **Reflection**: (pending)
+   - **Next**: (pending)
+   """)
+   ```
+
+   Purpose and Hypothesis are the most important fields — they force you to think about WHY before acting. If you can't articulate the purpose, you're not ready to launch.
+
+0c. **Verify no old training processes are running.** Before every launch, check for leftover processes from previous runs and clean them up:
+
+   ```bash
+   # Check for existing training processes
+   pgrep -fa "torchrun|train_|flagscale" | grep -v grep
+   # If any found, kill them and wait for GPU memory to be released
+   pkill -9 -f "torchrun|train_|flagscale" 2>/dev/null; sleep 5
+   # Verify GPUs are free
+   nvidia-smi | grep -E "MiB|%"
+   ```
+
+   Launching a new training run while an old one is still alive causes port conflicts, GPU OOM, and log corruption. This check takes seconds; debugging the resulting failures takes much longer.
+
 **Within 30 seconds of launch:**
-1. Use `find_latest_log` to locate the new log directory
+1. Use `find_latest_log(experiment="<exp_dir>")` to locate the new log directory — NEVER use `find`, `ls -lt`, or shell globbing to search for logs
 2. Check stderr on rank 0 for import errors or early crashes
 3. If stderr has errors → training failed at startup. Fix and retry.
 
 **After first metrics appear (usually 1-3 minutes):**
-4. Use `parse_training_metrics` with `vocab_size` to check health
-5. Verify loss is NOT near `ln(vocab_size)` — if it is, model outputs are random (see train-monitor skill)
-6. Verify gradients are flowing (`num_zeros` / total_params < 50%)
-7. Report the first metrics to the user with health assessment
+4. **Auto-trigger `parse_training_metrics`** — do NOT use `tail -f` or `grep` to manually scan logs. The tool parses structured metrics and runs health checks automatically. Call it with `vocab_size` for the random-output check:
+   ```
+   parse_training_metrics(log_path="<log_path>", vocab_size=<vocab_size>)
+   ```
+5. Interpret the health check results:
+   - `loss ≈ ln(vocab_size)` → model outputs are random. Stop. Check: weights loaded? forward pass correct?
+   - `grad_norm = 0` or `num_zeros ≈ total_params` → gradients not flowing. Check loss computation, frozen params.
+   - `loss not decreasing after 10+ steps` → learning rate, optimizer, or data issue.
+6. Report the first metrics to the user with health assessment. Include: initial loss, loss trend, grad norm, throughput (tokens/sec or samples/sec).
+
+**After training completes or fails — close the experiment:**
+
+8. Update the experiment entry with Result, Reflection, and Next:
+
+   ```
+   workspace_state(action="write", section="Experiments", content="""
+   ### <model>_<config>_<purpose> (completed)
+   - **Purpose**: <same as above>
+   - **Hypothesis**: <same as above>
+   - **Config**: <same as above>
+   - **Dir**: <experiment_directory>
+   - **Result**: <actual outcome — steps completed, loss trajectory, key metrics, peak memory>
+   - **Reflection**: <lessons learned — what worked, what was tight, what surprised you>
+   - **Next**: <what to try next based on this result>
+   """)
+   ```
+
+   The Reflection field is critical — it captures lessons that prevent future experiments from repeating mistakes. A failed experiment with good reflection is more valuable than a successful one with no reflection.
 
 **If health judge killed a long-running command:**
 When the agent's health judge kills a `sleep` or `tail -f` command, do NOT blindly retry with another sleep. Instead:
@@ -233,7 +335,15 @@ Key points:
 
 ### Finding the Latest Logs
 
-```bash
+**Always use the dedicated tool first** — it handles the full directory traversal, rank scanning, and health checks in one call:
+
+```
+find_latest_log(experiment="<exp_dir>", vocab_size=<vocab_size>)
+```
+
+If the experiment dir is recorded in workspace_state's "Experiments" section, use that path directly. NEVER use `find`, `ls -R`, or shell globbing to search for log files.
+
+**Manual fallback** (only if the tool is unavailable):
 EXP_DIR=$(grep 'exp_dir:' examples/<model>/conf/train.yaml | awk '{print $2}')
 LATEST=$(ls -d ${EXP_DIR}/logs/details/host_0_*/[0-9]*/ 2>/dev/null | sort | tail -1)
 ATTEMPT=$(find "$LATEST" -type d -name "attempt_*" | head -1)

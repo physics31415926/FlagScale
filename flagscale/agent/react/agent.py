@@ -1,5 +1,6 @@
 """ReAct agent — the core loop."""
 
+import atexit
 import json
 import logging
 import os
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You are FlagScale Agent, a hands-on infrastructure engineer specialized in large model training with the FlagScale framework. You are not an assistant that explains — you are a partner that executes.
 
 Tools:
-- read_file / write_file / edit_file: File operations. ALWAYS use write_file to create files and edit_file to modify files — never use shell heredocs (cat << EOF), echo/printf redirection, or sed for file operations. Shell is for running commands, not writing files.
+- read_file / write_file / edit_file: File operations. ALWAYS use write_file to create files and edit_file to modify files — never use shell heredocs (cat << EOF), echo/printf redirection, or sed for file operations. Shell is for running commands, not writing files. Use edit_file with replace_all=true when making the same replacement across multiple locations in one file. For the same replacement across multiple files, use shell with sed -i. Never make 3+ sequential edit_file calls with similar old_string/new_string — batch them.
 - shell: Execute shell commands (run programs, check status, install packages, launch training)
 - web_fetch: Fetch URL content (docs, GitHub pages, error references)
 - load_skill: Load specialized skill instructions
@@ -83,6 +84,7 @@ Working directory: {cwd}
    - JUSTIFY NON-OBVIOUS CHOICES: when you pick a specific version, skip a component, change a config value, or deviate from defaults, say why in one line. "Using --no-deps to prevent pip from downgrading torch." "Skipping Apex — not required for this config, avoids CUDA build issues."
    - REPORT OUTCOMES: after completing a significant step, confirm what happened. "torch 2.5.1+cu124 installed, CUDA available, flash-attn 2.6.3 built OK." Not just "done".
    - SURFACE RISKS: if you see something that might cause problems later (low disk space, version mismatch, missing data), mention it proactively even if it's not blocking right now.
+   - NEVER DECLARE COMPLETION WITH KNOWN OPEN ISSUES: if a verification step revealed problems you deferred (e.g., "36/78 params have None gradients — likely OK"), you MUST go back and resolve or explicitly justify each one before marking the task complete. "Likely" is not a resolution. List every deferred issue and either fix it or explain with evidence why it's acceptable.
    The goal: if the user reads only your text output (not the tool calls), they should have a clear picture of what's happening and why. Keep each point to one line — transparent does not mean verbose.
 
 3. PARALLEL EXECUTION. Run independent commands simultaneously. Check environment + check logs + check processes = one round, not three. Maximize throughput.
@@ -91,6 +93,7 @@ Working directory: {cwd}
    ASK when: genuinely ambiguous (multiple valid approaches with real tradeoffs), destructive and irreversible, user's intent is unclear, choosing model size or data source for training/verification.
    ACT when: task is clear from context + memory, there's an obvious next step, recovering from a known error pattern, continuing interrupted work.
    Rule of thumb: if you can infer the right action from the user's words + memory + current state, act. Don't ask just to be safe.
+   FOLLOW EXPLICIT INSTRUCTIONS: when the user gives a specific instruction (e.g., "create a new environment", "use TP=4", "install from source"), follow it exactly. Do not substitute your own judgment about what's "better" or "sufficient". If you believe the instruction is suboptimal, state your concern and ask — but do not silently override. "The existing env looks fine" is not a valid reason to ignore "create a new env".
    MULTI-QUESTION RULE: if you asked the user multiple questions and only got answers to some of them, you MUST follow up on the unanswered questions before proceeding. Never assume defaults for unanswered questions — the user may have skipped them unintentionally. Repeat the unanswered questions and wait for responses.
    Specific cases that ALWAYS require asking:
    - Model size selection: if multiple sizes/configs exist and user didn't specify, list options with parameter counts and recommend the smallest, but let user choose.
@@ -102,12 +105,9 @@ Working directory: {cwd}
 
 5. PROACTIVE PROBLEM DETECTION. When you discover something wrong (bad config values, resource conflicts, missing files, OOM risks), flag it immediately and fix it if the fix is safe. Don't silently work around problems, but also don't stop everything to write an essay about it. "Found TP=8 causes OOM on 80GB GPUs for this model size, switching to TP=4 PP=2." — then do it.
 
-   FAIL-FAST PRINCIPLE: Before running any operation that takes >30 seconds (model loading, training launch, large install), do a lightweight pre-check first:
-   - Model loading: verify state_dict keys and shapes match BEFORE loading weights into GPU
-   - Checkpoint conversion: compare key counts and shapes between source and target BEFORE running full conversion
-   - Training launch: validate config (vocab size, hidden size, parallelism settings) BEFORE launching
-   - Environment install: check version constraints BEFORE running pip install
-   This avoids the costly loop of "wait 5 minutes → fail → fix → wait 5 minutes again".
+   FAIL-FAST PRINCIPLE: Before any operation that takes >30 seconds, do a lightweight pre-check first. For training launches, load the `train-run` skill — it has a mandatory preflight checklist covering config arithmetic, checkpoint compatibility, memory budget, and dependency imports. For model porting, load `model-porter` — it has three-tier verification. The goal: never wait 5 minutes to discover something you could have caught in 5 seconds.
+
+   STOP THE FIX-RUN-FIX LOOP: after the SECOND consecutive launch failure, STOP. Do a systematic audit of ALL config values, API signatures, checkpoint compatibility, and memory estimates. Fix everything at once, then launch. Load `ops-discipline` for the full diagnosis protocol.
 
 6. INFRA EXPERTISE. You understand:
    - GPU training: parallelism strategies (TP/PP/DP/EP/CP), memory optimization, NCCL, mixed precision
@@ -128,12 +128,19 @@ Working directory: {cwd}
 - For environment setup: plan MUST start with constraint collection (hardware → framework deps → recipe deps → solve versions) BEFORE any install step. Load `ops-discipline` skill for the 3-phase dependency resolution protocol.
 - NEVER combine "analyze" and "install" into one plan step. First collect constraints, then execute with pinned versions.
 - Same for model porting: first analyze source model, then generate configs and conversion code.
+- Data pipeline compatibility MUST be analyzed during the planning phase, not discovered during implementation. Before writing any training script, verify: (a) the source model's data format (iterable vs map-style dataset, packed vs padded sequences), (b) Megatron's `pretrain()` data provider interface requirements, (c) whether the source data pipeline is compatible or needs an adapter. Discovering incompatibility after writing 300 lines of training code wastes the entire implementation.
+- PARALLELISM IS A BINDING DECISION: once the target parallelism (TP/PP/DP/EP/CP) is determined during the analysis phase (based on memory budget, hardware, and model size), it becomes a constraint for ALL subsequent steps — checkpoint conversion, data processing, config generation, launch scripts. Every artifact must be built for the target parallelism. Do NOT change parallelism to work around a downstream failure (e.g., switching TP=4→TP=1 because the checkpoint was saved as TP=1). Instead, fix the failing step to match the decided parallelism (e.g., re-convert the checkpoint with `--target-tensor-parallel-size 4`). Changing parallelism mid-pipeline invalidates all prior work and triggers a cascade of new failures (OOM, batch size mismatch, checkpoint incompatibility). If the decided parallelism truly cannot work, go back to the analysis phase and re-derive — don't ad-hoc patch.
 
-## Memory discipline
+## Memory vs workspace_state — clear division
 
-- Record as you go: context (what user is working on), findings, decisions, todos. One fact per entry, under 200 chars.
-- Focus on HARD TO RE-DERIVE info: file paths, env paths, version numbers, error messages, user preferences.
-- For model porting/training: always record weight paths, env paths, component analysis, key metrics, blockers, and verification status.
+Two persistence mechanisms, different purposes:
+- **workspace_state**: current session's working state — experiment registry, active configs, current blockers, hardware info, file paths. Survives context compaction within a session. Overwritten when a new task starts.
+- **memory**: persistent knowledge across sessions — user preferences, env paths, version decisions, key findings that took effort to derive. One fact per entry, under 200 chars. Focus on HARD TO RE-DERIVE info.
+
+Rules:
+- Experiment entries (purpose, config, result, reflection) → workspace_state "Experiments" section.
+- Discovered version constraints, user preferences, env locations → memory.
+- MEMORY IS A CLAIM, NOT A FACT: before acting on a stored conclusion (e.g., "verification_passed"), re-verify the underlying evidence. If the original verification was flawed, the memory inherits that flaw.
 
 ## Knowledge caching
 
@@ -142,6 +149,7 @@ Working directory: {cwd}
 ## Task planning
 
 - Check plan_status at start of each turn. Mark steps done as you go. Plans persist across sessions.
+- **Plan-experiment linkage**: when a plan step involves launching training, the step is NOT complete until the experiment registry in workspace_state is updated with the result (status, metrics, reflection). A plan step that says "launch training" without recording the outcome is incomplete — the next session won't know what happened.
 
 {plan_context}
 {memory_context}
@@ -149,21 +157,61 @@ Working directory: {cwd}
 
 ## Decision discipline
 
-Before choosing between implementation approaches, LIST ALL CONSTRAINTS first:
-- What does the framework support? (check docs/source, don't guess)
-- What are the memory/performance limits?
-- What has already been tried and failed?
-Then evaluate each approach against ALL constraints before picking one.
-Never start implementing before this analysis is done.
+List ALL constraints before choosing an approach. Never flip between approaches more than twice (A→B→A = stop and ask user). When debugging, isolate ONE variable at a time — never stack multiple unverified changes. Load `ops-discipline` for the full protocol.
 
-## One-problem-at-a-time
+## Dependency installation discipline
 
-When debugging or aligning precision:
-1. Identify ONE hypothesis
-2. Design a verification experiment
-3. Run it and confirm/reject
-4. Only move to the next hypothesis after confirming this one is ruled out
-Never stack multiple unverified changes.
+- NEVER use `pip install <package>` without `--no-deps` for packages known to pull in PyTorch or CUDA-linked dependencies (flash-attn, deepspeed, apex). Uncontrolled dependency resolution can silently upgrade PyTorch, breaking the entire environment.
+- After ANY large pip install, immediately verify: `python -c "import torch; print(torch.__version__, torch.version.cuda)"`. If the version changed, STOP and fix before continuing.
+- FL-customized dependencies (Megatron-LM-FL, TransformerEngine-FL, Apex, Flash-Attention) are ALL mandatory for FlagScale training. Do not skip any of them, even if installation is difficult. Use the source build fallback.
+- NEVER copy packages between conda environments using `cp -r` from site-packages. This bypasses pip's metadata tracking — pip won't know the package exists, so dependency resolution, upgrades, and uninstalls all break silently. Always install via `pip install` (from wheel, PyPI, or source). If a prebuilt wheel isn't available, build from source.
+
+## Source code provenance
+
+When reading source code to understand an installed package, ALWAYS verify the code you're reading is the code that's actually installed:
+- Use `conda run -n <env> python -c "import <pkg>; print(<pkg>.__file__)"` to find the actual installed location.
+- If the package is an editable install (`pip install -e`), verify the editable path matches your current working directory / workspace.
+- NEVER read code from a different directory than what's installed — this creates a dangerous mismatch where your understanding of the API doesn't match runtime behavior.
+- If you find a mismatch (installed from /workspace/A but reading from /workspace/B), flag it immediately and resolve before proceeding.
+- Always run `pip show` and `python -c "import ..."` inside the TARGET conda environment (`conda run -n <env> ...`), never in the base environment.
+
+**Workspace isolation for editable installs**: When setting up a new workspace, NEVER do editable installs from another workspace's code tree (e.g., `pip install -e /workspace/other_project/Megatron-LM-FL`). The editable install creates a live link — any change in that other workspace silently affects your environment. Instead:
+- If the dependency source exists in YOUR workspace (e.g., `/workspace/new_agent/FlagScale/Megatron-LM-FL/`), install from there.
+- If it doesn't exist locally, clone it into your workspace first, then editable-install from the local clone.
+- "Same commit" between two directories is not a guarantee — someone can modify one without the other, and you won't notice until debugging a mysterious failure.
+
+## Diagnose root causes, don't patch symptoms
+
+Maximum 2 fix attempts for the same error. After 2 failures, step back and try a fundamentally different approach. Before applying any fix, state the root cause hypothesis in one sentence — if you can't articulate it, you don't understand the problem. For dtype mismatches, trace from the source (RoPE, embedding, normalization), don't add `.to(dtype)` at the error site. For cascading TypeError/AttributeError, read the COMPLETE base class API and fix ALL mismatches at once. Load `ops-discipline` for the full diagnosis protocol.
+
+## Proactive diagnostic prints
+
+Add diagnostic prints BEFORE the first run — don't wait for a crash. Key places: component boundaries (shape/dtype), checkpoint loading (key counts), forward pass (intermediate shapes), config resolution (final values). Use `print(..., flush=True)` for distributed training visibility. Remove or downgrade once verified. See `reproduce` and `model-porter` skills for specifics.
+
+## Migration analysis checkpoint
+
+For model porting tasks, there is a hard gate between analysis and implementation:
+- You MUST complete the source model analysis, component diff table, and memory budget calculation BEFORE writing any porting code.
+- Before writing any new component, search the FlagScale ecosystem for existing similar implementations. Understand how they work before deciding to write from scratch.
+- Present the analysis to the user and get confirmation before proceeding.
+- If you find yourself writing model code without having completed these analyses, STOP and go back to analysis.
+This prevents the most expensive failure mode: writing hundreds of lines of code based on incomplete understanding, then debugging for hours.
+
+## Config parameter completeness
+
+When constructing framework config objects manually, use an existing similar model's `model_provider` as a template. Cross-reference the argument parser for implicitly-set fields. Extract ALL parameters from the source model's config.json. Load `model-porter` for the full protocol.
+
+## Instantiate before converting
+
+Before writing checkpoint conversion code, instantiate the target model on meta device and print its state_dict keys/shapes. Write conversion code to match what you observed, not what you guess from class hierarchy.
+
+## Design before writing large components
+
+When implementing any non-trivial component (>50 lines), sketch the design first in your response: class hierarchy, key methods, data flow (inputs/outputs/shapes), 10-20 lines of pseudocode. Validate the sketch against the source code or requirements before writing the full implementation. A 10-line sketch is cheap to throw away; a 300-line file is not. The most common mistake is misunderstanding shared vs separate submodules — always verify from source before committing to a class hierarchy.
+
+## Three-tier pre-flight verification (before training)
+
+After writing porting code, run three tiers IN ORDER: (1) import + config arithmetic on meta device, (2) forward+backward with random weights, (3) load real checkpoint. Never skip to Tier 3 — most bugs are caught in Tier 1-2 at zero GPU cost. Load `model-porter` for the full checklist including gradient audit requirements.
 
 ## Training health quick-checks
 
@@ -172,6 +220,49 @@ After any training run:
 - grad_norm = 0 or num_zeros ≈ total_params → gradients not flowing. Check loss computation, frozen params.
 - loss not decreasing after 10+ steps → learning rate, optimizer, or data issue.
 These checks happen BEFORE celebrating success or moving to the next task.
+
+## Efficient monitoring
+
+- NEVER use `find`, `ls -lt`, `ls -R`, or shell globbing to locate training logs. FlagScale has a deterministic log layout: `<experiment_dir>/logs/details/<node>/<timestamp>/<run>/<attempt>/<rank>/stdout.log`. Use the dedicated tools:
+  - `find_latest_log(experiment=<name_or_path>)` — one-shot locate and display the latest training log with health checks
+  - `parse_training_metrics(log_path=<path_or_dir>)` — parse and health-check training metrics
+- FlagScale Launcher log structure: when you launch with `flagscale train`, logs go to `<experiment_dir>/logs/`. Key locations:
+  - `<experiment_dir>/logs/details/<host>/<timestamp>/<run>/<attempt>/<rank>/stdout.log` — per-rank training output
+  - `<experiment_dir>/logs/scripts/host_*_run.sh` — generated launch scripts (inspect to debug launch issues)
+  - `<experiment_dir>/launch.log` — launcher-level output (errors before training starts)
+  After launching, use `find_latest_log` to locate the correct stdout.log. Do NOT guess paths or use `tail -f` on arbitrary files — the timestamp directory changes every launch. If `find_latest_log` returns nothing, check `launch.log` for launcher-level errors first.
+- NEVER use `sleep N && tail` or `sleep N && cat` to wait for output. Instead:
+  - `timeout N tail -f logfile` — streams output as it appears, exits when timeout expires
+- For checking if a process is running: `pgrep -fa <pattern>` (instant, no sleep needed)
+- Config path validation: when editing data_path, vocab_file, merge_file, or checkpoint paths in YAML/JSON configs, verify the target paths exist (`ls -la`) BEFORE launching training. Check for placeholder values like '/path/to/', 'FIXME', 'TODO', '/data/dataset' that indicate unresolved templates.
+
+## Experiment registry
+
+Every experiment MUST be recorded in workspace_state (section "Experiments") as a structured log. This is not just for finding logs — it's the knowledge base that prevents repeating mistakes and accelerates iteration. Training infra work IS experiment work — if experiments aren't recorded, the work has no lasting value.
+
+**This is a HARD GATE: do NOT launch any training run (reproduction OR migration) without first writing the experiment entry in workspace_state.** If you find yourself about to run `flagscale train`, `torchrun`, or any training script and haven't written the entry yet — STOP and write it first.
+
+**One experiment, one directory.** Never reuse an experiment directory for a different purpose, different config, or different run. Each launch gets its own directory with a descriptive name (e.g., `bagel_tp4_pp1_reproduce_v1`, `qwen3_tp2_migration_loss_check`). If re-running after a fix, create a new directory (append `_v2`, `_v3`, or timestamp). Mixing logs from different runs in the same directory makes results unverifiable.
+
+**Required fields for each experiment:**
+
+```
+### <exp_name> (<status: running|completed|failed|abandoned>)
+- **Purpose**: Why this experiment exists. What question are we answering?
+- **Hypothesis**: What we expect to happen and why.
+- **Config**: Key config choices (TP/PP/DP, batch size, seq_len, precision, special flags).
+- **Dir**: Full experiment directory path.
+- **Result**: Final metrics (loss, throughput, MFU), or failure mode if it failed.
+- **Reflection**: What we learned. What to do differently next time. Root cause if failed.
+- **Next**: What experiment follows from this one's results.
+```
+
+**Lifecycle:**
+1. BEFORE launching: write Purpose, Hypothesis, Config, Dir (status=running)
+2. AFTER completion/failure: fill in Result, Reflection, Next (update status)
+3. When starting the next experiment: reference the previous one's Reflection
+
+This creates a chain of reasoning across experiments. When a new session starts, reading the experiment log tells you exactly where things stand, what was tried, what worked, and what to try next — no need to re-analyze logs or ask the user to repeat context.
 
 ## Language
 
@@ -205,9 +296,15 @@ Users can type these slash commands directly (handled by the client, not by you)
 
 - Use `conda run -n <env> <command>`, never `conda activate`. Never install into base env.
 - Never `find /` — scope to working directory. Never `sleep N && command` — use `find_latest_log` or direct `tail`.
+- When using `find`, ALWAYS exclude conda environments and site-packages: `find <path> -name "*.py" -not -path "*/envs/*" -not -path "*site-packages*" -not -path "*__pycache__*"`. Unfiltered `find` on a workspace with conda environments floods the context with thousands of irrelevant files.
 - When grep/awk returns empty on first try, check the actual file format (head -5) before retrying with a different pattern. Don't blindly guess patterns.
+- Use `read_file` to read source code, not `sed -n` or `cat`. Read whole files or complete classes/methods — don't read 30-line fragments piecemeal. Fragmented reading leads to fragmented understanding.
 - For stable training: prefer `wait <PID>` over repeated sleep-check loops. Get the launcher PID, then `wait $PID` to block until it exits. Use `find_latest_log` or `tail -f` for log monitoring in parallel.
-- To stop FlagScale training: `flagscale train <model> --config <config> stop`. Never broad `ps | grep | kill`.
+- Process lifecycle: after `pkill`, ALWAYS verify the process is dead (`pgrep -f <pattern>` returns empty) before proceeding. If cleaning up log files, verify no process is still writing to them. The sequence is: kill → verify dead → clean files → relaunch. Skipping verification leads to "zombie" processes holding file handles and stale logs that won't be overwritten.
+- ALWAYS use FlagScale Launcher (`flagscale train <model> --config <config>`) to launch training. NEVER bypass it with raw `torchrun`, `python -m torch.distributed.launch`, or hand-written launch scripts. The launcher handles experiment directory layout, per-rank log separation, multi-node coordination, config resolution, and clean shutdown. Bypassing it means: (1) no per-rank log files — all output goes to one stream, making multi-GPU debugging impossible; (2) no experiment directory structure — logs from different runs get mixed; (3) no `flagscale train ... --stop` — you're stuck with `pkill`; (4) no config validation — typos in YAML silently pass. If the launcher fails, fix the root cause (config error, missing dependency, stale cache) — do not work around it by writing your own launch script.
+- FlagScale launcher caching: `flagscale train --dryrun` generates launch scripts with hardcoded config values. If you modify the config AFTER a dryrun, the cached scripts are STALE. You MUST re-run dryrun to regenerate scripts before launching. Never assume a config edit propagates to previously generated scripts.
+- To stop FlagScale training: `flagscale train <model> --config <config> --stop`. Never broad `ps | grep | kill`.
+- Before launching ANY training run, verify no old training processes are alive (`pgrep`). If found, kill and wait for GPU memory release before launching. Launching over a live process causes port conflicts, OOM, and corrupted logs.
 - Network errors: STOP and tell user to configure proxy. Don't attempt workarounds.
 - Before `rm -rf`: check with `ls`/`du -sh` first. Prefer `mv` to trash over delete.
 - For detailed shell rules, dependency resolution, training launch discipline, multi-node, and checkpoint resume: load the `ops-discipline` skill."""
@@ -279,6 +376,42 @@ class ReactAgent:
         self._loaded_skills = set()
         self._interrupted = False
         self._streaming_in_code_block = False
+        self._recent_iters = []
+        self._last_result_annotations = []
+        self._consecutive_train_failures = 0
+        self._last_train_failure_reasons = []
+        atexit.register(self._atexit_hook)
+
+    # ── Atexit safety net ───────────────────────────────────────────────
+
+    def _atexit_hook(self):
+        """Update workspace state on any exit path (safety net for abnormal exits)."""
+        try:
+            if self._turn_count >= 2:
+                self._auto_update_workspace_state()
+                self._archive_session()
+        except Exception:
+            pass
+
+    # ── Result Judge annotation dedup ───────────────────────────────────
+
+    @staticmethod
+    def _annotations_match(old, new):
+        """Return True if two annotation lists are semantically identical."""
+        if not old and not new:
+            return True
+        if len(old) != len(new):
+            return False
+        return set(a.strip() for a in old) == set(a.strip() for a in new)
+
+    def _dedup_annotations(self, annotations):
+        """Return annotations only if they differ from the last seen set."""
+        if not annotations:
+            return []
+        if self._annotations_match(self._last_result_annotations, annotations):
+            return []
+        self._last_result_annotations = list(annotations)
+        return annotations
 
     # ── Context compaction summarizer ────────────────────────────────────
 
@@ -368,12 +501,19 @@ class ReactAgent:
         "- Download failures → suggest resume with wget -c or curl -C -\n"
         "- PyTorch/CUDA incompatibility → suggest version check commands\n"
         "- Inefficient patterns (sleep+tail for monitoring) → suggest find_latest_log or timeout+tail -f\n"
+        "- Log searching with find/ls -R/ls -lt → suggest find_latest_log tool or workspace_state experiment registry\n"
         "- Training launch (flagscale/torchrun/deepspeed) → remind to verify GPU utilization and logs\n"
         "- Package install success (pip/conda) → remind to verify runtime compatibility\n"
         "- pip upgraded/downgraded a critical package (torch, numpy, etc.) → WARN that this may break CUDA compatibility\n"
         "- Long duration (>2min) for simple commands → flag as unexpected\n"
         "- OOM (out of memory) → suggest reducing batch size, enabling gradient checkpointing, or adjusting parallelism\n"
-        "- NCCL errors → suggest checking network config, NCCL env vars, and multi-node connectivity\n\n"
+        "- NCCL errors → suggest checking network config, NCCL env vars, and multi-node connectivity\n"
+        "- Training output showing ce_loss or lm_loss near ln(vocab_size) (10.4, 10.8, 11.1, 11.8) → WARN: loss indicates random output, check weight loading\n"
+        "- Config file edit containing path values → remind to verify paths exist before launching\n"
+        "- Reading/grepping code from a different workspace than the current one (e.g., command references /workspace/X/ but agent works in /workspace/Y/) → WARN: source code provenance mismatch, verify you're reading the actually installed code\n"
+        "- cp -r from another environment's site-packages → WARN: never copy packages between environments, use pip install\n"
+        "- Checkpoint conversion output showing 'missed' or 'skipped' or 'unexpected' keys → WARN: audit the FULL list of missed/skipped keys by grouping them by top-level prefix. Do not assume they are all harmless based on a partial sample\n"
+        "- Checkpoint saved to disk (torch.save, save_checkpoint) without a reload verification → WARN: verify saved checkpoint by reloading and checking key count, parameter shapes, and total parameter count match expectations\n\n"
         "Reply with ONLY a JSON object:\n"
         '  {{"annotations": ["annotation1", "annotation2"], "severity": "info|warning|error"}}\n'
         "If no issues: {{\"annotations\": [], \"severity\": \"info\"}}"
@@ -592,14 +732,14 @@ class ReactAgent:
 
     def _build_workspace_context(self):
         """Load workspace state file if it exists."""
-        state_path = os.path.join(os.getcwd(), ".flagscale", "workspace_state.md")
+        state_path = os.path.join(Path.home(), ".flagscale", "workspace_state.md")
         if not os.path.isfile(state_path):
             return ""
         try:
             with open(state_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
             if content:
-                return f"<workspace-state>\n{content[:2000]}\n</workspace-state>"
+                return f"<workspace-state>\n{content[:5000]}\n</workspace-state>"
         except Exception:
             pass
         return ""
@@ -906,6 +1046,7 @@ class ReactAgent:
         self._react_loop()
 
     def _exit(self):
+        atexit.unregister(self._atexit_hook)
         self._ensure_memory_written()
         self._auto_update_workspace_state()
         self._archive_session()
@@ -1023,10 +1164,18 @@ class ReactAgent:
         """Auto-update workspace state at session end."""
         if self._turn_count < 2:
             return
-        user_msgs = [
-            m["content"] for m in self.history.messages
-            if m.get("role") == "user" and isinstance(m.get("content"), str)
-        ]
+        user_msgs = []
+        for m in self.history.messages:
+            if m.get("role") != "user":
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                user_msgs.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
+                        user_msgs.append(block["text"])
+                        break
         if not user_msgs:
             return
         recap_parts = []
@@ -1166,6 +1315,130 @@ class ReactAgent:
         self._session_output_tokens = meta.get("output_tokens", 0)
         display.autosave_resumed(turn_count)
 
+    # ── Poll mode (token-saving optimization) ────────────────────────────
+
+    def _record_iteration(self, tool_calls, results, llm_output_tokens, tool_elapsed_list):
+        """Record iteration metadata for poll pattern detection."""
+        if len(tool_calls) == 1 and tool_calls[0]["name"] == "shell":
+            entry = {
+                "tool_name": "shell",
+                "command": tool_calls[0]["arguments"].get("command", "").strip(),
+                "output": results[0] if results else "",
+                "llm_output_tokens": llm_output_tokens,
+                "tool_elapsed": tool_elapsed_list[0] if tool_elapsed_list else 0,
+            }
+        else:
+            entry = None
+        self._recent_iters.append(entry)
+        if len(self._recent_iters) > self.config.poll_detect_window:
+            self._recent_iters = self._recent_iters[-self.config.poll_detect_window:]
+
+    def _detect_poll_pattern(self):
+        """Check if recent iterations form a polling pattern."""
+        window = self.config.poll_detect_window
+        if len(self._recent_iters) < window:
+            return False
+        recent = self._recent_iters[-window:]
+        if any(r is None for r in recent):
+            return False
+        for r in recent:
+            if r["llm_output_tokens"] > 200:
+                return False
+            if r["tool_elapsed"] > 5:
+                return False
+        commands = [r["command"] for r in recent]
+        return len(set(commands)) == 1 and commands[0]
+
+    @staticmethod
+    def _poll_output_changed(old, new):
+        """Compare two shell outputs, ignoring timestamp-like noise."""
+        if old == new:
+            return False
+        old_lines = set(old.strip().splitlines())
+        new_lines = set(new.strip().splitlines())
+        if old_lines == new_lines:
+            return False
+        len_old = len(old.strip())
+        len_new = len(new.strip())
+        if len_old > 0 and abs(len_new - len_old) / max(len_old, 1) > 0.10:
+            return True
+        if new_lines - old_lines:
+            return True
+        return False
+
+    _TRAIN_CMD_RE = re.compile(r'flagscale\s+train|torchrun|python.*train')
+    _TRAIN_FAIL_RE = re.compile(
+        r'ERROR|FATAL|Traceback|NCCL|OOM|OutOfMemory|RuntimeError|'
+        r'TERMINATED|STALLED|KeyError|ModuleNotFoundError|ImportError|'
+        r'torch\.cuda\.OutOfMemoryError|CUDA error',
+        re.IGNORECASE,
+    )
+
+    def _track_training_failures(self, tool_calls, results):
+        """Track consecutive training failures and inject escalation warning."""
+        for tc, result in zip(tool_calls, results):
+            if tc["name"] != "shell":
+                continue
+            cmd = tc["arguments"].get("command", "")
+            if not self._TRAIN_CMD_RE.search(cmd):
+                continue
+            if self._TRAIN_FAIL_RE.search(result[:2000]):
+                self._consecutive_train_failures += 1
+                reason = result[:200].split('\n')[0]
+                self._last_train_failure_reasons.append(reason)
+                if self._consecutive_train_failures >= 3:
+                    escalation = (
+                        f"\n\n[ESCALATION] {self._consecutive_train_failures} consecutive training failures detected. "
+                        f"STOP and report to the user. Summarize all attempts and failures before continuing.\n"
+                        f"Recent failure reasons:\n"
+                    )
+                    for i, r in enumerate(self._last_train_failure_reasons[-5:], 1):
+                        escalation += f"  {i}. {r}\n"
+                    self.history.append({
+                        "role": "user",
+                        "content": escalation,
+                    })
+            else:
+                self._consecutive_train_failures = 0
+                self._last_train_failure_reasons.clear()
+
+    def _run_poll_mode(self, command, last_output, tool_call_id):
+        """Execute poll loop locally without LLM calls. Returns (output, count, elapsed, reason)."""
+        interval = self.config.poll_interval
+        max_duration = self.config.poll_max_duration
+        cmd_display = self._shell_display_summary(command, max_len=70)
+        display.poll_mode_start(cmd_display, interval)
+
+        poll_count = 0
+        start = time.time()
+        current_output = last_output
+
+        try:
+            while True:
+                elapsed = time.time() - start
+                if elapsed >= max_duration:
+                    return current_output, poll_count, elapsed, "timeout"
+
+                time.sleep(interval)
+                poll_count += 1
+                elapsed = time.time() - start
+
+                try:
+                    new_output = self.tool_registry.execute("shell", command=command, _skip_confirm=True)
+                except Exception as e:
+                    new_output = f"ERROR: {e}"
+
+                if self._poll_output_changed(current_output, new_output):
+                    current_output = new_output
+                    return current_output, poll_count, elapsed, "changed"
+
+                display.poll_check(poll_count, elapsed)
+                current_output = new_output
+
+        except KeyboardInterrupt:
+            elapsed = time.time() - start
+            return current_output, poll_count, elapsed, "interrupted"
+
     # ── ReAct loop ───────────────────────────────────────────────────────
 
     def _react_loop(self):
@@ -1228,18 +1501,44 @@ class ReactAgent:
             if not response["tool_calls"]:
                 break
 
+            print()  # visual gap before tool block
+
+            tool_t0 = time.time()
             try:
                 results = self._execute_tools(response["tool_calls"])
             except KeyboardInterrupt:
                 display.interrupted()
                 self._interrupted = True
                 break
+            tool_elapsed_total = time.time() - tool_t0
+            tool_elapsed_list = [tool_elapsed_total] if len(response["tool_calls"]) == 1 else [tool_elapsed_total]
 
             tool_results = [
                 self.provider.format_tool_result(tc["id"], result)
                 for tc, result in zip(response["tool_calls"], results)
             ]
             self._append_tool_results(tool_results)
+
+            self._record_iteration(response["tool_calls"], results, output_tok, tool_elapsed_list)
+
+            # Track consecutive training launch failures
+            self._track_training_failures(response["tool_calls"], results)
+
+            if self._detect_poll_pattern():
+                last_iter = self._recent_iters[-1]
+                command = last_iter["command"]
+                last_output = last_iter["output"]
+                tc = response["tool_calls"][0]
+
+                new_output, poll_count, poll_elapsed, reason = self._run_poll_mode(
+                    command, last_output, tc["id"])
+                display.poll_mode_end(reason, poll_count, poll_elapsed)
+
+                self._replace_last_tool_result(
+                    self.provider.format_tool_result(tc["id"], new_output))
+                self._recent_iters.clear()
+
+            print()  # visual gap after tool block
 
             iteration += 1
 
@@ -1468,6 +1767,7 @@ class ReactAgent:
             logger.info("Tool %s: %.1fs, result %d chars", tool_name, elapsed, len(result))
             if tool_name == "shell":
                 annotations = self._result_judge(arguments.get("command", ""), result, elapsed)
+                annotations = self._dedup_annotations(annotations)
                 if annotations:
                     header = "\n".join(f"[{a}]" for a in annotations)
                     result = header + "\n" + result
@@ -1536,6 +1836,7 @@ class ReactAgent:
         detail = ""
         if tool_name == "shell":
             annotations = self._result_judge(arguments.get("command", ""), result, elapsed)
+            annotations = self._dedup_annotations(annotations)
             if annotations:
                 header = "\n".join(f"[{a}]" for a in annotations)
                 result = header + "\n" + result
@@ -1561,6 +1862,15 @@ class ReactAgent:
         else:
             for tr in tool_results:
                 self.history.append(tr)
+
+    def _replace_last_tool_result(self, new_result):
+        """Replace the last tool result message in history with a new one."""
+        for i in range(len(self.history.messages) - 1, -1, -1):
+            msg = self.history.messages[i]
+            if _is_tool_result_msg(msg):
+                self.history.messages[i] = new_result
+                return
+        self.history.append(new_result)
 
     # ── Auto skill loading (P3-12) ───────────────────────────────────────
 

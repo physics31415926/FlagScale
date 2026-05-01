@@ -35,6 +35,9 @@ class AgentConfig:
     skill_dirs: List[str] = field(default_factory=list)
     shell_env: Dict[str, str] = field(default_factory=dict)
     memory_ttl_days: int = 7
+    poll_detect_window: int = 2
+    poll_interval: int = 15
+    poll_max_duration: int = 300
     _config_path: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self):

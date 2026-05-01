@@ -93,7 +93,8 @@ Do NOT: change three things at once, then wonder which one helped.
 - Use `head`/`tail` ONLY for quick previewing. If you need the complete output to analyze or diagnose, NEVER truncate — a truncated error log is useless.
 - To run commands in a conda environment, ALWAYS use `conda run -n <env> <command>`. NEVER use `conda activate` or `source activate` — they don't work in non-interactive shells.
 - NEVER install packages into the base or current environment unless explicitly asked. ALL pip/conda install commands MUST target the new environment (`conda run -n <env> pip install ...`).
-- To stop FlagScale training: prefer `flagscale train <model> --config <config> stop`. Fallback: `cat outputs/<exp>/logs/pids/* | xargs kill -9`. NEVER use broad `ps | grep | kill` — it will kill the agent.
+- To stop FlagScale training: prefer `flagscale train <model> --config <config> --stop`. Fallback: `cat outputs/<exp>/logs/pids/* | xargs kill -9`. NEVER use broad `ps | grep | kill` — it will kill the agent.
+- Before launching ANY training run, verify no old training processes are alive (`pgrep`). If found, kill and wait for GPU memory release. Launching over a live process causes port conflicts, OOM, and corrupted logs.
 - Network errors: STOP and tell user to configure proxy in ~/.flagscale/agent.yaml under shell_env. Don't attempt workarounds.
 - NEVER use `sleep N && <command>` for monitoring. Use `find_latest_log` tool, direct `tail`, or `timeout 30 tail -f <logfile>`.
 - NEVER run the same command twice in a row. If results are unclear, try a DIFFERENT diagnostic command.
@@ -195,3 +196,24 @@ When pip install upgrades a critical package unexpectedly, use `--no-deps` or ve
 - FlagScale log path: `outputs/<exp>/logs/details/host_*/TIMESTAMP_DIR/default_*/attempt_0/0/stdout.log`. Use `find_latest_log` tool.
 - Error diagnosis order: stderr FIRST → stdout tail → full stdout only if needed.
 - When training fails: check stderr → identify error → fix root cause → clean stale outputs → retry. Don't retry without understanding the failure.
+
+## Root cause diagnosis protocol
+
+1. If the same category of error recurs after a fix attempt, STOP patching and diagnose the root cause. Common pattern: fixing a version mismatch by upgrading one package causes a cascade of new mismatches — the root cause is the original incompatible install, not each downstream error.
+2. Before applying any fix, state the root cause hypothesis in one sentence. If you can't articulate it, you don't understand the problem.
+3. Maximum 2 fix attempts for the same error. After 2 failures, step back and try a fundamentally different approach.
+4. dtype mismatches (e.g., fp32 tensors in bf16 pipelines) are architecture-level issues. Trace the dtype from its source (RoPE, embedding, normalization) rather than adding `.to(dtype)` at the error site. For multimodal models, proactively add dtype casts at every component boundary during implementation.
+5. Cascading TypeError/AttributeError on module init or forward means you didn't read the base class API. After the FIRST such error, read the COMPLETE `__init__` and `forward` signatures of the base class, then fix ALL mismatches at once.
+6. Before calling any base class method from custom code, read its IMPLEMENTATION, not just its signature. Framework methods often do more than their name suggests (e.g., `get_query_key_value_tensors()` internally applies `linear_qkv` again).
+
+## Fail-fast preflight checklist
+
+Before any operation that takes >30 seconds, do a lightweight pre-check:
+- **Model loading**: verify state_dict keys and shapes match BEFORE loading weights into GPU
+- **Checkpoint conversion**: compare key counts and shapes between source and target BEFORE running full conversion
+- **Training launch**: validate config arithmetic, verify ALL framework dependencies are importable (`python -c "import megatron, transformer_engine, apex, flash_attn"`)
+- **Checkpoint ↔ parallelism**: verify checkpoint TP/PP matches runtime parallelism BEFORE launching
+- **Memory budget**: `model_params × 2 (bf16) + gradients × 2 + optimizer_states × (8/DP)` — if it exceeds GPU memory, do NOT launch
+- **Config arithmetic**: `global_batch_size % (micro_batch_size × DP) == 0`, `num_heads % TP == 0`, `num_kv_heads % TP == 0`
+- **Config types**: verify values match expected types (int vs float, string vs list). Read argparse definitions for non-obvious types.
+- **Environment install**: check version constraints BEFORE running pip install

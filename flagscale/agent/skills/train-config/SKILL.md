@@ -434,6 +434,37 @@ data:
 
 ---
 
+## Config Verification Checklist
+
+After generating or modifying a config, verify ALL of the following before handing off to `train-run`:
+
+### Arithmetic Constraints
+```python
+assert global_batch_size % (micro_batch_size * data_parallel_size) == 0, "batch size not divisible"
+assert num_attention_heads % tensor_model_parallel_size == 0, "heads not divisible by TP"
+assert num_key_value_heads % tensor_model_parallel_size == 0, "KV heads not divisible by TP"  # GQA
+if pipeline_model_parallel_size > 1:
+    assert num_layers % pipeline_model_parallel_size == 0, "layers not divisible by PP"
+```
+
+### Path Validation
+- All paths in config (`data_path`, `vocab_file`, `merge_file`, `tokenizer_path`, `load`) must point to existing files/directories
+- Check for placeholder values: `/path/to/`, `FIXME`, `TODO`, `/data/dataset`
+- For checkpoint paths (`load`), verify `latest_checkpointed_iteration.txt` exists
+
+### Type Validation
+- Read the argparse definitions for non-obvious types before setting values
+- Common traps: `--rotary-base` expects int not float, boolean flags vs YAML booleans, string lists vs comma-separated strings
+- YAML `1e5` is a float — if the parser expects int, use `100000`
+
+### Cross-Config Consistency
+- `vocab_size` in task config must match the tokenizer's actual vocab size
+- `seq_length` must match what the data was preprocessed with
+- `ckpt_format` in experiment config must match the checkpoint's actual format
+- `num_layers`, `hidden_size`, `num_attention_heads` must match the model weights being loaded
+
+---
+
 ## Related Skills
 
 - `train-run` — launch training with generated configuration

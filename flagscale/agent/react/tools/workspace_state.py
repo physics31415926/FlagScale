@@ -7,7 +7,7 @@ from flagscale.agent.react.tools.base import Tool
 
 
 def _default_state_path():
-    return os.path.join(os.getcwd(), ".flagscale", "workspace_state.md")
+    return os.path.join(os.path.expanduser("~"), ".flagscale", "workspace_state.md")
 
 
 class WorkspaceStateTool(Tool):

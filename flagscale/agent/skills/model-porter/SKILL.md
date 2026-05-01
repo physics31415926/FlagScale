@@ -44,6 +44,7 @@ Port models to Megatron-LM-FL / FlagScale for distributed pre-training.
 - **Quantized models (GPTQ, AWQ, GGUF)**: These are inference-optimized and NOT suitable for training. If the user provides a quantized checkpoint, inform them that the original full-precision (FP16/BF16) weights are needed for pre-training or fine-tuning.
 - **Tokenizer handling**: Always copy or reference the tokenizer from the source model. Verify `vocab_size` in the training config matches the tokenizer's vocabulary size. For models with added special tokens, check `added_tokens.json`.
 - **Megatron-LM-FL path**: Checkpoint conversion code imports from `megatron`. Ensure Megatron-LM-FL (not upstream Megatron-LM) is installed — it contains FL-specific modules like `megatron.plugin.platform`.
+- **Source code provenance**: When reading source code to understand Megatron-LM-FL or any dependency, verify you're reading the ACTUALLY INSTALLED code, not a stale copy from another directory. Run `conda run -n <env> python -c "import megatron; print(megatron.__file__)"` to find the real location. If the installed package is an editable install from a different workspace (e.g., installed from `/workspace/A/` but you're working in `/workspace/B/`), this is a critical mismatch — the code you read for API understanding won't match runtime behavior. Resolve by reinstalling from the correct source tree.
 - **Auto-fetch FL dependencies**: When you need to analyze or compile Megatron-LM-FL or TransformerEngine-FL source code and it's not available locally, pull the latest automatically — don't ask the user. Use the repos from env-setup skill (github.com/flagos-ai/Megatron-LM-FL, github.com/flagos-ai/TransformerEngine-FL).
 - **Model size selection**: When a model family has multiple size variants (e.g., 0.6B/1.8B/7B/70B) or multiple training configs (e.g., e6_d6_size256 vs e18_d18_size1024) and the user did not specify a size, list the available options with their parameter counts and ask the user to choose. Recommend the smallest variant for initial porting/verification, but let the user decide.
 
@@ -56,12 +57,100 @@ Model porting is the task most prone to "understand 20%, implement, then debug f
 **Before writing a single line of porting code:**
 1. Read the COMPLETE source model code (modeling_*.py, config.json, tokenizer_config.json)
 2. Read the COMPLETE target Megatron model code (the relevant model_provider, builder, and spec)
-3. Read at least ONE existing porting example in `tools/checkpoint/` that handles a similar architecture
-4. Build a complete mapping table: source layer name → target layer name, with shape transformations
-5. Identify ALL non-standard components (custom attention, custom FFN, MoE routing, etc.)
-6. Save this analysis to workspace_state before proceeding
+3. **Read the FULL `__init__` and `forward` signatures of every Megatron base class you will subclass or call** — TransformerLayer, SelfAttention, TransformerBlock, MLP, etc. These APIs evolve (e.g., `pg_collection` was added to TransformerLayer). If your subclass doesn't accept a parameter the base class passes, you get a TypeError at runtime. Read the CURRENT signatures, not what you remember from a previous session.
+4. **Read the IMPLEMENTATION (not just signature) of every base class method you plan to call from your custom code.** Megatron methods often do more than their name suggests — e.g., `get_query_key_value_tensors()` internally calls `self.linear_qkv()` again, so passing already-projected QKV to it causes double projection. You cannot safely call a method you haven't read the body of.
+5. **Understand existing implementations before writing new code.** For every component you need to port, first search the FlagScale ecosystem (flagscale/models/, Megatron-LM-FL, TransformerEngine-FL, tools/checkpoint/) for similar implementations. Understand how they handle TP, pipeline integration, dtype, and checkpoint conversion. Reuse or adapt when possible; when writing from scratch, base your patterns on what already works in the codebase.
+6. Build a complete mapping table: source layer name → target layer name, with shape transformations
+7. Identify ALL non-standard components (custom attention, custom FFN, MoE routing, etc.)
+8. **Extract ALL config parameters from the source model's config.json** — not just the obvious ones (hidden_size, num_layers). Every parameter that affects tensor shapes or model behavior must be captured and mapped to the corresponding Megatron config field. This includes activation function type and gating, positional encoding parameters, vocabulary size, bias settings per layer type, normalization constants, and any model-specific dimensions. Missing a single parameter causes shape mismatches that waste hours of debugging.
+9. Save this analysis to workspace_state before proceeding
 
-**The mapping table is your contract.** Don't start coding without it.
+**Read whole files, not fragments.** Don't use `sed -n '100,130p'` to read 30-line snippets — you'll miss context. Use `read_file` to read the complete file or at least the complete class/method. Piecemeal reading leads to piecemeal understanding.
+
+### Pre-coding analysis gate (MANDATORY for models >10B params or multimodal)
+
+Before writing ANY porting code, complete and present these three analyses. These are not optional — skipping them caused real failures (wrong parallelism, missing components, broken checkpoints).
+
+**Analysis 1: Component-by-component diff table**
+
+For every architectural component in the source model, document how it maps to Megatron-LM-FL:
+
+```
+| Source Component       | HF Implementation         | Megatron-LM-FL Equivalent    | Existing Reference             | Gap / Action Required          |
+|------------------------|---------------------------|------------------------------|--------------------------------|--------------------------------|
+| LLM backbone           | Qwen2ForCausalLM          | GPTModel (config-driven)     | qwen2 model in flagscale       | Config mapping only            |
+| Vision encoder (ViT)   | SigLIPVisionModel         | CLIPViTModel (adaptable)     | CLIPViTModel in mcore          | Modify image preprocessing     |
+| MoT routing            | custom MoTLayer           | NONE                         | none found                     | Implement from scratch         |
+| Flow matching / VAE    | custom FlowMatching       | NONE                         | none found                     | Implement from scratch         |
+```
+
+The "Existing Reference" column forces you to look before writing. Filling it in means you've studied what's already there — even when the answer is "none found".
+| Checkpoint TP split    | N/A (single-GPU weights)  | sharded_state_dict needed    | Implement for each custom layer|
+```
+
+Every row must have an explicit action. "TBD" or blank is not acceptable.
+
+**Analysis 2: Memory budget calculation**
+
+Calculate BEFORE choosing parallelism strategy:
+
+```
+Model parameters:        <N>B (total), <M>B (active if MoE/MoT)
+Bytes per param (bf16):  2 bytes × <N>B = <X> GB (weights only)
+Adam optimizer states:   12 bytes × <N>B = <Y> GB (fp32 weights + fp32 momentum + fp32 variance)
+Gradients (bf16):        2 bytes × <N>B = <Z> GB
+Activation memory:       estimate based on batch_size × seq_len × hidden_size × num_layers
+─────────────────────────────────────────────
+Total per-GPU (no parallelism): <W> GB
+Available GPU memory:    <V> GB per GPU × <K> GPUs
+```
+
+**Analysis 3: Parallelism strategy (derived from memory budget)**
+
+Based on the memory budget above, choose parallelism:
+- Total memory fits in 1 GPU → DP only (single-GPU verification OK)
+- Total memory fits in 1 GPU with activation checkpointing → DP + activation checkpointing
+- Total memory > 1 GPU → MUST use TP, PP, or FSDP. **Never use bare DDP for models >10B params** — DDP replicates the full model on every GPU, so a 14B model needs ~196GB per GPU with Adam, which exceeds any single GPU.
+- For verification scripts: use the MINIMUM parallelism that fits in available hardware. If the model doesn't fit on one GPU, the verification script must use TP or model sharding — not DDP.
+
+Save all three analyses to workspace_state. Present to user for confirmation before writing code.
+
+**Analysis 4: Data pipeline compatibility**
+
+Before writing any training script, analyze the source model's data pipeline and its compatibility with Megatron's `pretrain()`:
+
+```
+| Aspect                  | Source Model              | Megatron pretrain()                  | Gap / Action                    |
+|-------------------------|---------------------------|--------------------------------------|---------------------------------|
+| Dataset type            | (IterableDataset? Map?)   | Map-style by default, cyclic loader  | Adapter if iterable             |
+| Batch format            | (what fields?)            | Determined by get_batch/forward_step | Custom get_batch if different   |
+| Sequence handling       | (packed? padded? variable?)| Fixed-length, optional packing      | Packing adapter if needed       |
+| Multimodal inputs       | (how are they batched?)   | Text-only by default                 | Custom data provider            |
+```
+
+Key questions to answer:
+- Does the source use `IterableDataset` or `Dataset`? Megatron's standard pipeline expects indexed datasets.
+- Does the source use packed sequences? If so, how are sequence boundaries marked?
+- What is the exact batch dict format? Map every field to what `get_batch()` / `forward_step()` expects.
+- For multimodal: how are image/video tokens interleaved with text? How are they batched?
+
+If the data pipeline is incompatible, plan the adapter BEFORE writing the training script — not after discovering the mismatch during implementation.
+
+### Verify runtime state, not config declarations
+
+Config objects and code structure can be misleading about what actually happens at runtime. Before writing any conversion or splitting code, verify these by instantiation (on meta device or with tiny shapes):
+
+1. **Target model's actual state_dict keys**: Instantiate the target model and print `model.state_dict().keys()`. Do NOT guess key names from class hierarchy — nested modules, shared parameters, and framework-injected keys (like TransformerEngine's `_extra_state`) make guessing unreliable.
+
+2. **Actual parallelism behavior**: A config field like `tensor_model_parallel_size=1` on a subnetwork does NOT mean that subnetwork runs with TP=1. Framework layers (ColumnParallelLinear, RowParallelLinear, TE layers) typically query the global process group, not the config. Verify by checking the actual tensor shapes after model construction — if a layer's weight shape is divided by global TP, it IS TP-sharded regardless of what the config says.
+
+3. **Vocab size transformation chain**: Tokenizers may add special tokens (e.g., NullTokenizer adds +1 for EOD). Then `make_vocab_size_divisible_by × TP` rounds up further. Trace the full chain: `raw_vocab → tokenizer adjustment → padding → per-rank size` and verify the final per-rank size matches your checkpoint BEFORE launching training.
+
+4. **Activation function and gating**: A CLI flag like `--swiglu` may set multiple config fields (e.g., `gated_linear_unit=True` which doubles fc1 output size, plus `activation_func`). When constructing configs manually in `model_provider`, these implicit settings are NOT auto-propagated — you must set them explicitly. Verify by checking the actual fc1 weight shape after construction.
+
+5. **dtype at component boundaries**: In multimodal or multi-component models, different subnetworks (ViT, connector, LLM, VAE) may operate in different dtypes. Position embeddings, normalization layers, and custom modules often default to fp32 even when the rest of the model is bf16. The forward pass will crash at the first `nn.Linear` or `matmul` where input dtype doesn't match weight dtype. Before writing the forward pass, trace the dtype through every component boundary (encoder output → connector input, connector output → LLM input, etc.) and add explicit `.to(dtype)` casts at each boundary. Do NOT wait for runtime crashes to discover these — add the casts proactively during implementation, and verify them in Tier 2 (random-weight forward).
+
+The pattern: **instantiate first, then write conversion code to match what you observed** — not the other way around.
 
 ### No approach flip-flopping
 
@@ -70,6 +159,29 @@ When porting, you'll face choices (e.g., use TE attention vs custom attention, T
 2. Pick one approach and commit
 3. If it fails, record WHY it failed before trying the next approach
 4. Never flip between approaches more than twice — if A→B→A happens, stop and ask the user
+
+### Design before writing — especially for custom components
+
+When implementing a custom component from scratch (MoT layer, MoE router, flow matching, etc.):
+
+1. **Write a design sketch first** (in your response, not a file): class hierarchy, key methods, data flow (what tensors flow in/out, what shapes). Keep it to 10-20 lines of pseudocode.
+2. **Validate the design against the source model**: trace the source forward pass to confirm your component receives the right inputs and produces the right outputs. Pay special attention to shared vs separate submodules (e.g., does MoT share attention weights between paths or use separate modules?).
+3. **Only then write the full implementation.**
+
+This prevents the "write 300 lines → realize the design is wrong → rewrite 300 lines" pattern. A 10-line pseudocode sketch is cheap to throw away; a full implementation is not. The most common design mistake is misunderstanding which submodules are shared vs duplicated — always verify this from the source code before committing to a class hierarchy.
+
+### Add diagnostic prints during development
+
+When writing new model code, checkpoint conversion, or training scripts, add print statements at key points BEFORE the first run:
+- **Forward pass**: print shape and dtype at every component boundary (encoder output, connector output, LLM input, etc.)
+- **Checkpoint loading**: print key counts (loaded, missing, unexpected), sample key names and shapes
+- **Config resolution**: print final values of critical parameters after all transformations (vocab_size after padding, ffn_hidden_size after gating, per-rank shapes after TP split)
+
+The goal is to get a complete diagnostic picture on the FIRST run, whether it succeeds or fails. Without these prints, a crash gives you only a traceback — with them, you see exactly where shapes, dtypes, or keys diverged from expectations. This eliminates the crash → guess → add print → rerun → crash cycle that wastes multiple GPU-minutes per iteration.
+
+Remove or downgrade to logging.debug after the component is verified working.
+
+**Distributed training visibility**: In multi-GPU training, plain `print()` from worker processes is often buffered or lost. Always use `print(..., flush=True)` or `print(..., file=sys.stderr)`. When using FlagScale Launcher, each rank's output is captured in separate log files — check per-rank logs for debug output. If debug prints don't appear in the main log, check per-rank files before concluding the code path wasn't reached.
 
 ### Verify fundamentals first
 
@@ -81,12 +193,60 @@ After the first successful training launch, check these IN ORDER before celebrat
 
 Only after ALL four pass should you proceed to precision alignment or scaling.
 
+### Verify ALL model components are integrated
+
+For multimodal or multi-component models (VL, MoT, robotics), verify EACH component individually before end-to-end testing:
+1. **Vision encoder (ViT/SigLIP)**: Does it produce non-zero embeddings? Are image tokens reaching the LLM?
+2. **Generation components (VAE/flow matching)**: Are they connected in the forward pass? Do they receive gradients?
+3. **Routing layers (MoE/MoT)**: Are experts being activated? Is the routing loss included?
+4. **Auxiliary losses**: Are ALL loss terms from the source model present? Compare loss breakdown (lm_loss, router_loss, etc.) against source.
+
+A model that "runs without errors" but silently ignores the ViT or VAE is a broken port.
+
+### Verification scripts must match the actual API
+
+Before writing a Tier 2 verification script (forward+backward test), read the `forward()` signatures of every module you'll call — especially the top-level model, `TransformerBlock.forward()`, and any custom layer's `forward()`. Common failures:
+- Passing kwargs that the module doesn't accept (e.g., custom kwargs to `TransformerBlock.forward()`)
+- Missing required initialization (CUDA RNG tracker, process groups, parallel state)
+- Using config fields that don't exist on the config class you're using
+
+A verification script that takes 6 rounds of fix-run-fix to pass is a sign you didn't read the APIs before writing it. Read first, write once.
+
 ### TransformerEngine attention mask gotcha
 
 TE's `DotProductAttention` with `attn_mask_type="causal"` IGNORES any custom attention mask you pass. If your model needs a non-standard mask (e.g., per-sample causal for packed sequences), you must either:
 - Use `attn_mask_type="arbitrary"` (slower but respects your mask)
 - Use THD format with `cu_seqlens` (efficient, but requires careful setup)
 - Verify the mask is actually being used by checking intermediate attention outputs, not just loss
+
+### get_batch is a critical porting surface — treat it with the same rigor as model code
+
+`get_batch` (or `get_batch_on_this_tp_rank` / the dataloader collate function) is where raw data becomes model input tensors. Under parallelism, this is deceptively complex:
+
+**What get_batch must handle correctly:**
+- **TP**: All TP ranks must receive identical input tensors (same tokens, same masks, same labels). If get_batch produces different data on different TP ranks, the model silently computes on inconsistent inputs — loss looks normal but the model learns garbage. Use `broadcast_data` or ensure the dataloader is seeded identically across TP ranks.
+- **PP**: Only the first pipeline stage needs input tokens/embeddings; only the last stage needs labels. Intermediate stages need neither. Sending full data to all stages wastes memory. Check `mpu.is_pipeline_first_stage()` / `is_pipeline_last_stage()`.
+- **CP (Context Parallelism)**: Sequence is split across CP ranks. get_batch must shard the sequence dimension correctly and provide the right position IDs for each shard. Attention masks must account for cross-shard dependencies.
+- **DP**: Each DP rank gets a different micro-batch — this is the easy case, handled by the dataloader sampler.
+- **EP (Expert Parallelism)**: Usually transparent to get_batch, but verify that token routing metadata (if any) is consistent across EP ranks.
+
+**Multimodal models add more complexity:**
+- Image/video tokens, text tokens, and generation tokens may need different padding, masking, and position encoding
+- Packed sequences (multiple samples in one sequence) require `cu_seqlens` or equivalent metadata
+- Routing indexes for multi-path architectures (e.g., understanding vs generation paths) must be consistent with the actual token layout in the batch
+
+**Verification checklist for get_batch:**
+1. Print tensor shapes and a few values on rank 0 and rank 1 of each parallel group — confirm TP ranks match, DP ranks differ
+2. Verify position IDs are correct (especially for packed sequences and CP)
+3. Verify attention masks match the expected pattern (causal, bidirectional for vision encoders, custom for multi-path architectures)
+4. Verify labels are only computed on the correct pipeline stage
+5. Run a few training steps and confirm loss is identical across TP ranks (they should be, since they see the same data)
+
+**Common get_batch bugs:**
+- Using `torch.randint` without setting the same seed across TP ranks → inconsistent inputs
+- Forgetting to broadcast data from DP rank 0 to TP group → each TP rank generates its own random batch
+- Padding/truncation that changes sequence length differently on different ranks → shape mismatch in all-reduce
+- Position IDs not accounting for CP sequence offset → wrong RoPE embeddings on non-zero CP ranks
 
 ## Overview
 
@@ -547,6 +707,8 @@ def get_hf_final_norm_ckpt(message, model, args):
 
 ### 4.5 Conversion Commands
 
+**CRITICAL: Convert for the target parallelism.** The checkpoint MUST be converted with the same TP/PP that will be used for training. If the analysis phase determined TP=4 PP=1, the conversion command MUST use `--target-tensor-parallel-size 4 --target-pipeline-parallel-size 1`. Converting to TP=1 and then trying to load with TP=4 will fail — Megatron legacy checkpoints cannot be resharded at load time. The decided parallelism is a binding constraint for all downstream steps (conversion, config, data processing, launch). Do not change it to work around a failure; fix the failing step instead.
+
 ```bash
 # HF -> Megatron (for loading pre-trained weights)
 cd tools/checkpoint
@@ -565,6 +727,266 @@ python convert.py \
   --load-dir <megatron_ckpt_path> \
   --save-dir <hf_output_path>
 ```
+
+**TP/PP splitting completeness**: When writing a checkpoint splitter (or using the conversion tool with `--target-tensor-parallel-size`), you MUST handle ALL parameter variants that need splitting, not just the obvious ones. Models with multiple subnetworks (multimodal, mixture-of-experts, mixture-of-transformers) often have parallel sets of parameters with different name suffixes or prefixes that all require the same split logic.
+
+**TP splitting must cover ALL components, not just the LLM backbone.** In multimodal models, vision encoders (ViT/SigLIP), connectors, VAE decoders, and other subnetworks may also contain ColumnParallelLinear or RowParallelLinear layers that are TP-sharded at runtime. If you only split the LLM transformer layers, the non-LLM components will have shape mismatches at load time. To find ALL TP-sharded parameters: instantiate the model on meta device with the target TP size, then compare every key's shape against the single-GPU checkpoint. Any key where `model_shape != ckpt_shape` needs a split rule — regardless of which subnetwork it belongs to.
+
+Before running the splitter, use the 4.5.1 cross-check: instantiate the target model on meta device, compare every key's shape between the checkpoint and the model. Any shape mismatch means the splitter missed a parameter. Do NOT discover these mismatches by launching training — the cross-check takes seconds, a failed training launch takes minutes.
+
+### 4.5.1 Post-Conversion Checkpoint Verification (MANDATORY)
+
+After saving a converted checkpoint, verify it BEFORE proceeding. A 28GB file on disk does not mean a correct checkpoint. Run these checks immediately after conversion:
+
+```python
+import torch
+
+# 1. Reload and verify key count
+ckpt = torch.load("<saved_ckpt_path>", map_location="cpu")
+state_dict = ckpt["model"] if "model" in ckpt else ckpt
+print(f"Saved checkpoint: {len(state_dict)} keys")
+
+# 2. Verify total parameter count matches expectation
+total_params = sum(v.numel() for v in state_dict.values())
+print(f"Total parameters: {total_params:,} ({total_params/1e9:.2f}B)")
+# Compare against known model size — e.g., 7B model should have ~7e9 params
+
+# 3. Spot-check key names and shapes
+for k, v in sorted(state_dict.items())[:10]:
+    print(f"  {k}: {v.shape} {v.dtype}")
+
+# 4. CRITICAL: Cross-check against model state_dict
+# Instantiate the target Megatron model on meta device and compare ALL keys
+with torch.device("meta"):
+    model = build_model(config)  # same config as training
+model_keys = {k: v.shape for k, v in model.state_dict().items()}
+ckpt_keys = {k: v.shape for k, v in state_dict.items()}
+
+# Check every model key has a matching checkpoint key with correct shape
+missing_from_ckpt = set(model_keys) - set(ckpt_keys)
+extra_in_ckpt = set(ckpt_keys) - set(model_keys)
+shape_mismatch = {k for k in model_keys.keys() & ckpt_keys.keys()
+                  if model_keys[k] != ckpt_keys[k]}
+
+# Filter out expected mismatches (_extra_state from TE, padded vocab)
+missing_real = {k for k in missing_from_ckpt if '_extra_state' not in k}
+print(f"Missing from ckpt (excluding _extra_state): {len(missing_real)}")
+print(f"Extra in ckpt: {len(extra_in_ckpt)}")
+print(f"Shape mismatch: {len(shape_mismatch)}")
+for k in sorted(missing_real):
+    print(f"  MISSING: {k} (model expects {model_keys[k]})")
+for k in sorted(shape_mismatch):
+    print(f"  SHAPE: {k} ckpt={ckpt_keys[k]} model={model_keys[k]}")
+```
+
+**Gate**: Zero missing keys (excluding `_extra_state`), zero shape mismatches. If ANY model component's keys are missing, the conversion is incomplete — fix the conversion script, do not proceed to training. Common failure patterns:
+- Subnetwork keys still in source format (e.g., HF naming) instead of target format — conversion script only handled the main network
+- Variant/suffix parameters missing — conversion script only handled base parameter names, not model-specific variants
+- Keys with wrong nesting depth — double-nested prefix instead of single
+
+This cross-check is the MOST IMPORTANT verification step. Skipping it and discovering key mismatches during training wastes 10-30 minutes per attempt.
+
+**Gate**: Key count is non-zero, total parameter count is within 5% of expected model size, key names follow the expected Megatron naming convention (e.g., `decoder.layers.0.self_attention.linear_qkv.weight`).
+
+### 4.5.2 Missed/Skipped Keys Audit (MANDATORY)
+
+If the conversion script reports missed, skipped, or unexpected keys:
+
+1. **Capture the FULL list** — not just the last few lines of terminal output
+2. **Categorize every key by prefix** — group by component (e.g., `decoder.*`, `encoder.*`, `vision_model.*`, `language_model.*`)
+3. **Verify that NO model-critical keys were skipped** — if any key with a prefix that should have been converted appears in the missed list, the conversion has a bug
+4. **Document the expected skips** — e.g., "N skipped keys, all with prefix `X.` — these are weights for a separately-loaded component"
+
+Do NOT assume missed keys are harmless based on seeing a few keys with an expected prefix. The full list may contain keys from other components that were silently skipped due to a prefix mismatch in the conversion code.
+
+```bash
+# Quick audit: group missed keys by top-level prefix
+python -c "
+keys = [...]  # paste or load the missed keys list
+from collections import Counter
+prefixes = Counter(k.split('.')[0] for k in keys)
+for prefix, count in prefixes.most_common():
+    print(f'  {prefix}: {count} keys')
+"
+```
+
+### 4.6 Three-Tier Pre-flight Verification (MANDATORY before Step 5)
+
+Loading a large checkpoint onto GPUs takes minutes. Most failures (missing packages, shape mismatches, dtype errors, broken forward pass) can be caught in seconds without touching the real checkpoint. Run these tiers in order — only proceed to the next tier when the current one passes completely.
+
+**Tier 1: Zero-cost pre-checks (seconds)**
+
+Run ALL of these before any model instantiation:
+
+```python
+# 1a. Dependency imports — catch missing packages immediately
+import torch
+print(f"PyTorch {torch.__version__}, CUDA {torch.version.cuda}, GPUs: {torch.cuda.device_count()}")
+from megatron.plugin.platform import get_platform
+print(f"Megatron-LM-FL: OK (platform={get_platform()})")
+import transformer_engine; print(f"TransformerEngine-FL: {transformer_engine.__version__}")
+import apex; print("Apex: OK")
+import flash_attn; print(f"Flash-Attention: {flash_attn.__version__}")
+
+# 1b. Config sanity — catch arithmetic errors before they become shape mismatches
+config = ...  # load model config
+assert config["hidden_size"] % config["num_attention_heads"] == 0, "hidden_size must be divisible by num_heads"
+assert config["num_attention_heads"] % config.get("num_key_value_heads", config["num_attention_heads"]) == 0, "num_heads must be divisible by num_kv_heads"
+tp = <target_tp_size>
+assert config["num_attention_heads"] % tp == 0, f"num_heads ({config['num_attention_heads']}) not divisible by TP ({tp})"
+assert config.get("num_key_value_heads", config["num_attention_heads"]) % tp == 0, f"num_kv_heads not divisible by TP ({tp})"
+
+# 1b-2. Training config arithmetic — catch batch size / parallelism mismatches
+dp = num_gpus // (tp * pp)
+micro_batch = 1  # from config
+global_batch = 8  # from config
+assert global_batch % (micro_batch * dp) == 0, f"global_batch ({global_batch}) must be divisible by micro_batch ({micro_batch}) × DP ({dp})"
+grad_accum = global_batch // (micro_batch * dp)
+print(f"DP={dp}, micro_batch={micro_batch}, global_batch={global_batch}, grad_accum_steps={grad_accum}")
+
+# 1c. Checkpoint key/shape audit — read metadata only, no GPU memory used
+from safetensors import safe_open
+with safe_open("<ckpt_path>", framework="pt", device="meta") as f:
+    ckpt_keys = {k: f.get_tensor(k).shape for k in f.keys()}
+print(f"Checkpoint: {len(ckpt_keys)} tensors")
+# Instantiate model on meta device (zero memory)
+with torch.device("meta"):
+    model = MyModel(config)
+model_keys = {k: v.shape for k, v in model.state_dict().items()}
+missing = set(model_keys) - set(ckpt_keys)
+unexpected = set(ckpt_keys) - set(model_keys)
+shape_mismatch = {k for k in model_keys.keys() & ckpt_keys.keys() if model_keys[k] != ckpt_keys[k]}
+print(f"Missing: {len(missing)}, Unexpected: {len(unexpected)}, Shape mismatch: {len(shape_mismatch)}")
+for k in sorted(shape_mismatch):
+    print(f"  MISMATCH {k}: model={model_keys[k]} ckpt={ckpt_keys[k]}")
+```
+
+**Gate**: ALL imports succeed, ALL config assertions pass, zero shape mismatches (or all mismatches have known transforms in the conversion code). If any fail, fix before proceeding.
+
+**Tier 1b: Checkpoint ↔ parallelism compatibility (seconds)**
+
+Before launching training, verify the checkpoint format is compatible with the target parallelism:
+
+```python
+import torch, os
+
+ckpt_dir = "<megatron_ckpt_path>"
+target_tp = 4
+target_pp = 1
+
+# Check checkpoint TP/PP by examining directory structure
+# Legacy format: iter_XXXXXXX/mp_rank_XX/model_optim_rng.pt
+# Dist-ckpt format: iter_XXXXXXX/mp_rank_XX_XXX/ (multiple shards)
+ckpt_files = []
+for root, dirs, files in os.walk(ckpt_dir):
+    for f in files:
+        if f.endswith('.pt') or f.endswith('.distcp'):
+            ckpt_files.append(os.path.join(root, f))
+
+# Count mp_rank directories to determine saved TP×PP
+mp_ranks = set()
+for f in ckpt_files:
+    parts = f.split('/')
+    for p in parts:
+        if p.startswith('mp_rank_'):
+            mp_ranks.add(p)
+
+saved_tp_pp = len(mp_ranks) if mp_ranks else 1
+print(f"Checkpoint saved with {saved_tp_pp} model-parallel ranks")
+print(f"Target: TP={target_tp}, PP={target_pp} → {target_tp * target_pp} ranks")
+
+if saved_tp_pp != target_tp * target_pp:
+    print("WARNING: Checkpoint TP×PP mismatch!")
+    print("  Options:")
+    print("  1. Re-convert checkpoint with target TP/PP (recommended)")
+    print("  2. Use dist_checkpointing with resharding (if supported)")
+    print("  3. Match runtime TP×PP to checkpoint (may cause OOM)")
+```
+
+**Gate**: Checkpoint TP×PP matches runtime TP×PP, OR you have a verified resharding path. Do NOT launch training with a mismatch — it will either fail to load or silently load incorrect weights.
+
+Also verify memory budget when changing parallelism:
+```python
+model_params = <N>  # from checkpoint param count
+bytes_per_param_model = 2  # bf16
+bytes_per_param_optim = 8  # Adam: fp32 copy + momentum + variance
+dp_size = <num_gpus> // (target_tp * target_pp)
+use_distributed_optim = True
+
+per_gpu_model = model_params * bytes_per_param_model / target_tp / target_pp
+per_gpu_grad = per_gpu_model  # same size as model
+per_gpu_optim = (model_params * bytes_per_param_optim / dp_size) if use_distributed_optim else (model_params * bytes_per_param_optim / target_tp / target_pp)
+
+total_gb = (per_gpu_model + per_gpu_grad + per_gpu_optim) / 1e9
+gpu_mem_gb = <gpu_memory_in_gb>
+print(f"Estimated per-GPU memory: {total_gb:.1f} GB (model={per_gpu_model/1e9:.1f} + grad={per_gpu_grad/1e9:.1f} + optim={per_gpu_optim/1e9:.1f})")
+print(f"GPU memory available: {gpu_mem_gb} GB")
+if total_gb > gpu_mem_gb * 0.9:  # leave 10% headroom for activations
+    print("WARNING: Will likely OOM! Increase TP or enable activation checkpointing.")
+```
+
+**Tier 2: Random-weight forward/backward (tens of seconds)**
+
+Instantiate the model with random weights (no checkpoint loading) and run one micro-batch through the full compute graph:
+
+```python
+import torch
+model = MyModel(config).cuda().bfloat16()  # random init, no ckpt
+
+# Build a minimal dummy batch matching the model's expected input format
+dummy_input = build_dummy_batch(
+    batch_size=1, seq_len=128, vocab_size=config["vocab_size"],
+    device="cuda", dtype=torch.bfloat16,
+)
+
+# Forward
+with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+    output = model(**dummy_input)
+
+# Verify output structure
+assert "loss" in output or isinstance(output, torch.Tensor), "Model must return loss or tensor"
+loss = output["loss"] if isinstance(output, dict) else output
+print(f"Forward OK — loss shape: {loss.shape}, dtype: {loss.dtype}, value: {loss.item():.4f}")
+
+# Backward
+loss.backward()
+grad_norms = {n: p.grad.norm().item() for n, p in model.named_parameters() if p.grad is not None}
+zero_grads = [n for n, g in grad_norms.items() if g == 0.0]
+print(f"Backward OK — {len(grad_norms)} params with grads, {len(zero_grads)} with zero grad")
+if zero_grads:
+    print(f"  WARNING zero-grad params: {zero_grads[:5]}")
+```
+
+This tier catches: dtype mismatches (fp32/bf16 promotion errors), attention mask shape errors, MoT/MoE routing bugs, missing forward connections (ViT, VAE not wired up), and backward graph breaks. All without waiting for checkpoint loading.
+
+**Gate**: Forward produces finite loss, backward produces non-zero gradients for all trainable parameters. If any component (ViT, VAE, routing) is present in the model but produces zero gradients, it's not connected — fix before proceeding.
+
+**Tier 3: Real checkpoint loading and validation (minutes)**
+
+Only after Tier 1 and Tier 2 pass:
+
+```python
+# Load real checkpoint
+state_dict = load_checkpoint("<ckpt_path>")  # or converted Megatron ckpt
+result = model.load_state_dict(state_dict, strict=False)
+print(f"Missing: {result.missing_keys[:5]}")
+print(f"Unexpected: {result.unexpected_keys[:5]}")
+
+# Verify weights are loaded (not random)
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(f"  {name}: norm={param.data.norm().item():.4f}")
+        break
+
+# Forward with real weights — compare against source model if possible
+with torch.no_grad():
+    output = model(**dummy_input)
+print(f"Real-weight forward OK — loss: {output['loss'].item():.4f}")
+```
+
+**Gate**: No missing keys (or all missing keys are expected, e.g., optimizer states). Parameter norms are non-zero and reasonable (not identical to random init norms from Tier 2).
+
+**Summary**: Tier 1 catches environment and config errors (seconds). Tier 2 catches code-level bugs in the compute graph (tens of seconds). Tier 3 catches weight mapping errors (minutes). Most debugging happens in Tier 1-2 without ever loading a checkpoint.
 
 ---
 
@@ -882,6 +1304,62 @@ for k, s in sorted(ckpt_keys.items())[:20]:
 - Different vocab sizes: model has padded vocab, checkpoint does not
 
 Fix all shape mismatches before proceeding to full model load.
+
+---
+
+## Checkpoint Verification Protocol
+
+After checkpoint conversion, verify BEFORE proceeding to training:
+
+### Quick Checks (seconds)
+```python
+import torch
+ckpt = torch.load("<converted_checkpoint>/mp_rank_00/model_optim_rng.pt", map_location="cpu")
+state = ckpt["model"]
+print(f"Total keys: {len(state)}")
+print(f"Sample shapes: {[(k, v.shape) for k, v in list(state.items())[:10]]}")
+print(f"Dtypes: {set(v.dtype for v in state.values())}")
+```
+
+### Key Count Match
+Compare converted checkpoint keys against the target model's expected keys (from meta-device instantiation):
+```python
+expected_keys = set(model.state_dict().keys())
+actual_keys = set(state.keys())
+missing = expected_keys - actual_keys
+unexpected = actual_keys - expected_keys
+print(f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+if missing: print(f"Missing samples: {list(missing)[:10]}")
+if unexpected: print(f"Unexpected samples: {list(unexpected)[:10]}")
+assert len(missing) == 0, "Checkpoint is incomplete — conversion has bugs"
+```
+
+### Shape Match
+```python
+for key in expected_keys:
+    if key in actual_keys:
+        expected_shape = model.state_dict()[key].shape
+        actual_shape = state[key].shape
+        if expected_shape != actual_shape:
+            print(f"SHAPE MISMATCH: {key}: expected {expected_shape}, got {actual_shape}")
+```
+
+### Norm Sanity Check
+Converted weights should NOT look like random init:
+```python
+for key in list(state.keys())[:20]:
+    norm = state[key].float().norm().item()
+    print(f"{key}: norm={norm:.4f}")
+# Random init norms are typically ~0.01-0.1 for small tensors
+# Real weights have larger, varied norms
+```
+
+### Source Code Provenance
+When reading source code to understand Megatron-LM-FL or any dependency, verify you're reading the ACTUALLY INSTALLED code:
+```bash
+conda run -n <env> python -c "import megatron; print(megatron.__file__)"
+```
+If the installed package is an editable install from a different workspace, this is a critical mismatch — resolve by reinstalling from the correct source tree.
 
 ---
 

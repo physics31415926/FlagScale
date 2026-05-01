@@ -63,6 +63,9 @@ def _parse_megatron_metrics(text: str) -> dict:
     return metrics
 
 
+_COMMON_VOCAB_SIZES = [32000, 50257, 65536, 100000, 128256, 151936, 256000]
+
+
 def _health_check(metrics: dict, vocab_size: int = 0) -> list:
     """Run training health checks on parsed metrics."""
     warnings = []
@@ -78,6 +81,19 @@ def _health_check(metrics: dict, vocab_size: int = 0) -> list:
                 f"WARNING: loss={loss_val:.4f} ~ ln({vocab_size})={random_loss:.2f} "
                 f"-> model may be outputting random. Check: weights loaded? forward pass correct?"
             )
+    elif loss_val is not None and vocab_size == 0:
+        best_v, best_diff = None, float("inf")
+        for v in _COMMON_VOCAB_SIZES:
+            diff = abs(loss_val - math.log(v))
+            if diff < best_diff:
+                best_v, best_diff = v, diff
+        if best_v is not None:
+            random_loss = math.log(best_v)
+            if best_diff / random_loss < 0.10:
+                warnings.append(
+                    f"WARNING: loss={loss_val:.4f} ~ ln({best_v})={random_loss:.2f} "
+                    f"-> model may be outputting random. Check: weights loaded? forward pass correct?"
+                )
     grad_norm = metrics["last_loss"].get("grad_norm")
     if grad_norm is not None and grad_norm == 0:
         warnings.append("WARNING: grad_norm=0 -> gradients not flowing. Check loss computation and frozen params.")

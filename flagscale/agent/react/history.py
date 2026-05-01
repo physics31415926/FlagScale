@@ -287,13 +287,34 @@ class HistoryManager:
         self._accumulated_summary = ""
 
 
+def _extract_error_tail(content: str, max_chars: int = 1500) -> str:
+    """Extract error/traceback portion from tool output for preservation during truncation."""
+    lines = content.splitlines()
+    error_start = -1
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if any(kw in lower for kw in ('traceback', 'error:', 'exception:', 'fatal:', 'failed')):
+            if error_start < 0:
+                error_start = i
+    if error_start >= 0:
+        error_text = "\n".join(lines[error_start:])
+        if len(error_text) > max_chars:
+            error_text = error_text[-max_chars:]
+        return error_text
+    return ""
+
+
 def _truncate_message(msg: Dict[str, Any]) -> Dict[str, Any]:
-    """Replace long content in tool results with a summary placeholder."""
+    """Replace long content in tool results with a summary placeholder.
+    Preserves error/traceback content to avoid losing diagnostic information."""
     content = msg.get("content", "")
 
     if isinstance(content, str) and len(content) > TRUNCATE_THRESHOLD:
         role = msg.get("role", "")
         if role == "tool":
+            error_tail = _extract_error_tail(content)
+            if error_tail:
+                return {**msg, "content": f"[truncated tool result, {len(content)} chars. Error preserved:]\n{error_tail}"}
             return {**msg, "content": f"[truncated tool result, {len(content)} chars]"}
 
     if isinstance(content, list):
@@ -302,7 +323,11 @@ def _truncate_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 inner = block.get("content", "")
                 if isinstance(inner, str) and len(inner) > TRUNCATE_THRESHOLD:
-                    new_blocks.append({**block, "content": f"[truncated tool result, {len(inner)} chars]"})
+                    error_tail = _extract_error_tail(inner)
+                    if error_tail:
+                        new_blocks.append({**block, "content": f"[truncated tool result, {len(inner)} chars. Error preserved:]\n{error_tail}"})
+                    else:
+                        new_blocks.append({**block, "content": f"[truncated tool result, {len(inner)} chars]"})
                 else:
                     new_blocks.append(block)
             else:

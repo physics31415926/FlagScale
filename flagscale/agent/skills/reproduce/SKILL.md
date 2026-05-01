@@ -174,6 +174,17 @@ print(f"step {global_step} | loss {loss.item():.6f}")
 
 The output format must include at minimum: **step number** and **loss value** per step. Grad norm is also useful if available.
 
+### Step 4.5: Add Diagnostic Prints for Migration Comparison
+
+Reproduction isn't just about "does it run" — it's the baseline you'll compare against during migration. Add prints that capture information you'll need later for alignment:
+
+- **Intermediate tensor shapes and dtypes** at component boundaries (e.g., encoder output, connector output, decoder input) — so you can verify the migrated model produces the same shapes
+- **Key tensor statistics** (mean, std, min, max) at a few critical points in the forward pass — so you can spot numerical divergence early during migration
+- **Checkpoint key names and shapes** — dump the state_dict structure so you have a reference for writing the checkpoint converter
+- **Config values that affect computation** — log the resolved values of hidden_size, num_heads, ffn_hidden_size, vocab_size, etc. as the model sees them
+
+These prints only need to run for the first few steps. Gate them with `if step < 5` or similar. The goal is to produce a reference snapshot that makes migration comparison straightforward — instead of re-running the reproduction later when you realize you need a specific piece of information.
+
 ### Step 5: Run and Verify
 
 ```bash

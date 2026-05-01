@@ -32,6 +32,12 @@ parameters:
 
 Monitor running FlagScale training jobs: locate logs, check health, detect anomalies, and report metrics.
 
+## Finding the Experiment Directory
+
+Before searching the filesystem, check workspace_state's "Experiments" section — it contains a registry of all launched experiments with their directories. Use `workspace_state(action="read")` and look up the experiment dir from the table. This is the fastest and most reliable way to find logs.
+
+If the registry is empty or the experiment isn't listed, fall back to the log directory structure below.
+
 ## Log Directory Structure
 
 FlagScale training logs follow this structure:
