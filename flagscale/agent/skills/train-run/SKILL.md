@@ -125,12 +125,39 @@ All target GPUs must show near-zero memory usage.
 
 ### 3c. Data Path Validation
 
+Validate ALL data paths referenced in the training config. This is not just "do the files exist" — it's "will the data pipeline actually load them at runtime."
+
+**For Megatron binary format (FlagScale native):**
 ```bash
 DATA_PATH="<data_path from config>"
 ls -lh ${DATA_PATH}.bin ${DATA_PATH}.idx
 ```
 
-If files are missing, stop and tell the user. Suggest running `/skill data-prep`.
+**For third-party frameworks (parquet, JSONL, custom loaders):**
+1. Check that data directories exist and contain expected files:
+   ```bash
+   ls <data_dir>/*.parquet | wc -l   # or *.jsonl, *.json, etc.
+   ```
+2. If the config references a metadata/index file (e.g., parquet_info JSON, dataset_info), open it and verify that the paths INSIDE the file match the actual data locations. Placeholder paths like `your_data_path/`, `/path/to/`, or paths from a different machine are the #1 cause of silent data loading failures.
+   ```bash
+   # Example: check if parquet_info keys match actual data_dir
+   python -c "
+   import json, os
+   info = json.load(open('<parquet_info_path>'))
+   data_dir = '<actual_data_dir>'
+   actual_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
+   matched = [f for f in actual_files if f in info]
+   print(f'Matched: {len(matched)}/{len(actual_files)} files')
+   if len(matched) == 0:
+       print(f'WARNING: Zero matches! Info keys sample: {list(info.keys())[:2]}')
+       print(f'Actual files sample: {actual_files[:2]}')
+   "
+   ```
+3. If paths don't match, fix the metadata file (replace placeholder prefix with actual path) BEFORE launching.
+
+**General rule**: any config file, JSON, or Python dict that maps dataset names to file paths is a potential source of path mismatch. After modifying data paths, always verify the FULL chain: config → dataset registry → metadata files → actual files on disk.
+
+If files are missing or paths don't match, stop and tell the user. Suggest running `/skill data-prep`.
 
 ### 3d. Topology Freshness (Optional)
 
@@ -147,6 +174,7 @@ If GPU count or model differs from what's in memory, warn the user that topology
 
 **Do NOT launch real training without completing dryrun first.**
 
+For FlagScale-native training:
 ```bash
 flagscale train <model> --dryrun
 ```
@@ -160,6 +188,8 @@ cat {exp_dir}/logs/scripts/host_*_run.sh
 Verify: correct GPU count (`--nproc_per_node`), correct entrypoint, all expected CLI flags, no placeholder paths (`/path/to/`, `FIXME`, `TODO`).
 
 **If you modify the config after dryrun, you MUST re-run dryrun.** Cached scripts contain hardcoded values from the previous config.
+
+For third-party reproduction tasks (no FlagScale launcher): construct the full launch command, print it, and verify it manually before executing. Check: correct `--nproc_per_node`, correct `PYTHONPATH`, correct entrypoint script, all required CLI args present, no placeholder paths in any referenced config files.
 
 ### 3f. Config Arithmetic Verification
 
@@ -200,6 +230,8 @@ If this exceeds GPU memory, do NOT launch — fix parallelism or enable activati
 
 **ALWAYS use FlagScale Launcher** — never bypass it with raw `torchrun` or hand-written launch scripts. The launcher provides per-rank log separation, experiment directory structure, config validation, and clean shutdown (`--stop`). Without it, all ranks write to one stream (debug prints get lost or interleaved), there's no experiment directory structure, and you can't use `--stop`. If the launcher fails, fix the root cause — do not work around it.
 
+**Exception — third-party reproduction tasks**: When reproducing a third-party model's training (e.g., Bagel, LLaVA) using their own training scripts before migrating to FlagScale, use their native launch method (typically `torchrun` + their training script). The FlagScale launcher doesn't apply here. However, ALL other rules in this skill still apply: experiment registry, preflight checks, data validation, post-launch monitoring, and health checks. The only difference is the launch command itself.
+
 **IMPORTANT**: Always set `PYTHONUNBUFFERED=1` before launching training. Without it, Python buffers stdout and training logs appear delayed or empty, making health monitoring unreliable.
 
 ```bash
@@ -223,7 +255,13 @@ After launching training, follow this sequence EVERY time. Do NOT skip steps.
 
 **Before launch — HARD GATE: register the experiment and create its directory:**
 
-0a. Create a DEDICATED experiment directory for this run. Never reuse a directory from a previous experiment. Naming convention: `<model>_<config>_<purpose>_v<N>` (e.g., `bagel_tp4_pp1_reproduce_v1`). If re-running after a fix, increment the version.
+0a. Create a DEDICATED experiment directory for this run. Never reuse a directory from a previous experiment. Naming convention: `<model>_<config>_<purpose>_v<N>` (e.g., `bagel_tp4_pp1_reproduce_v1`).
+
+**Version bumping rule — what counts as a new experiment:**
+- Produced at least 1 step of metrics → real experiment. Next meaningful change → bump version.
+- Changed a meaningful parameter (LR, TP/PP, batch size, data, model code, freeze strategy) → new version.
+- Launch failed before any metrics (import error, path error, config typo, port conflict) → NOT a new experiment. Record as "launch attempt N failed: reason" in the current entry's **Launch notes** field. Fix and retry under the same version and directory.
+- Training crashed after producing metrics, restarting with same config → still the same experiment. Note the crash in Result.
 
 0b. Write the experiment entry in workspace_state (section "Experiments") BEFORE launching. **If you haven't written this entry, you are NOT allowed to launch.**
 
@@ -234,6 +272,7 @@ After launching training, follow this sequence EVERY time. Do NOT skip steps.
    - **Hypothesis**: <expected outcome — e.g., loss starts near ln(vocab_size) and decreases>
    - **Config**: TP=<N> PP=<N> DP=<N>, micro_bs=<N>, seq_len=<N>, bf16, <N> steps
    - **Dir**: <experiment_directory>
+   - **Launch notes**: (record failed launch attempts here, not as separate experiments)
    - **Result**: (pending)
    - **Reflection**: (pending)
    - **Next**: (pending)
@@ -241,6 +280,16 @@ After launching training, follow this sequence EVERY time. Do NOT skip steps.
    ```
 
    Purpose and Hypothesis are the most important fields — they force you to think about WHY before acting. If you can't articulate the purpose, you're not ready to launch.
+
+0b-retry. **If a launch fails before producing metrics**, update the SAME entry's Launch notes:
+   ```
+   workspace_state(action="write", section="Experiments", content="""
+   ### <model>_<config>_<purpose> (running)
+   ...same fields...
+   - **Launch notes**: attempt 1 failed: <reason>. Fixed: <what you changed>.
+   """)
+   ```
+   Then fix and retry. Do NOT create a new experiment entry or bump the version.
 
 0c. **Verify no old training processes are running.** Before every launch, check for leftover processes from previous runs and clean them up:
 
@@ -403,6 +452,28 @@ When the user wants to quickly verify a training setup works:
 2. Fix ALL identified issues before relaunching
 3. Clean Hydra cache if config was changed: `rm -rf outputs/<exp>/hydra/ outputs/<exp>/logs/scripts/`
 4. Never retry more than once without a clear diagnosis
+
+### Fast Isolated Verification (before relaunching)
+
+A full training launch can take 10+ minutes just to load the model before reaching the code you're debugging. Before relaunching, ask: "can I verify this fix without a full launch?"
+
+**Data pipeline bugs** (the most common category):
+```python
+# Write a quick standalone script — runs in seconds, no model loading
+import sys; sys.path.insert(0, '<project_root>')
+from <dataset_module> import <DatasetClass>
+ds = <DatasetClass>(<args_from_config>)
+batch = next(iter(ds))
+print(f"Batch keys: {batch.keys()}, shapes: {[(k, v.shape) for k, v in batch.items() if hasattr(v, 'shape')]}")
+```
+
+**Import / path errors**: `python -c "import <module>; print('OK')"` — instant.
+
+**Config errors**: run with `--help` or a dry-run flag if available.
+
+**Shape / architecture errors**: instantiate model on meta device, no checkpoint needed.
+
+Only relaunch the full training when the fix is in a component that can't be tested in isolation (e.g., distributed communication, optimizer state, checkpoint loading itself).
 
 ---
 

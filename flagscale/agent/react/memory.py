@@ -8,6 +8,9 @@ from typing import Dict, List, Optional
 import yaml
 
 
+_TYPE_PRIORITY = {"todo": 0, "decision": 1, "finding": 2, "context": 3}
+
+
 class SessionMemory:
     """Incremental memory for cross-session continuity with TTL expiration."""
 
@@ -72,9 +75,16 @@ class SessionMemory:
         return entries
 
     def recent(self, max_tokens: int = 800) -> List[dict]:
-        """Return recent valid entries, newest first, within a token budget."""
+        """Return entries within a token budget, prioritized by type then recency.
+
+        Priority: todo > decision > finding > context.
+        Within the same type, newest entries come first.
+        """
         entries = self.list_entries()
-        entries.sort(key=lambda e: e.get("created", 0), reverse=True)
+        entries.sort(key=lambda e: (
+            _TYPE_PRIORITY.get(e.get("type", "context"), 9),
+            -e.get("created", 0),
+        ))
         result = []
         used = 0
         for e in entries:

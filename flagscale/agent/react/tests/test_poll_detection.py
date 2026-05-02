@@ -181,8 +181,8 @@ class TestRunPollMode(unittest.TestCase):
     @patch('flagscale.agent.react.agent.display')
     def test_output_changes_immediately(self, mock_display):
         agent = self._make_agent()
-        agent.tool_registry.execute.return_value = "new output line\nmore data"
-        output, count, elapsed, reason = agent._run_poll_mode(
+        agent.tool_registry.execute.return_value = "ERROR: something broke\nnew output line"
+        output, count, elapsed, reason, routine = agent._run_poll_mode(
             "wc -l log.txt", "old output", "call-1")
         assert reason == "changed"
         assert count == 1
@@ -194,10 +194,28 @@ class TestRunPollMode(unittest.TestCase):
         agent.config.poll_interval = 1
         agent.config.poll_max_duration = 3
         agent.tool_registry.execute.return_value = "same output"
-        output, count, elapsed, reason = agent._run_poll_mode(
+        output, count, elapsed, reason, routine = agent._run_poll_mode(
             "wc -l log.txt", "same output", "call-1")
         assert reason == "timeout"
         assert count >= 1
+
+    @patch('flagscale.agent.react.agent.display')
+    def test_routine_change_absorbed(self, mock_display):
+        """Routine changes (e.g., line count +1) should not break poll."""
+        agent = self._make_agent()
+        agent.config.poll_interval = 1
+        agent.config.poll_max_duration = 3
+        call_count = [0]
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                return f"{24 + call_count[0]} train.log"
+            return "26 train.log"
+        agent.tool_registry.execute.side_effect = side_effect
+        output, count, elapsed, reason, routine = agent._run_poll_mode(
+            "wc -l train.log", "24 train.log", "call-1")
+        assert reason == "timeout"
+        assert routine == 2
 
 
 class TestReplaceLastToolResult(unittest.TestCase):

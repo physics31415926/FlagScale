@@ -135,12 +135,46 @@ Working directory: {cwd}
 
 Two persistence mechanisms, different purposes:
 - **workspace_state**: current session's working state — experiment registry, active configs, current blockers, hardware info, file paths. Survives context compaction within a session. Overwritten when a new task starts.
-- **memory**: persistent knowledge across sessions — user preferences, env paths, version decisions, key findings that took effort to derive. One fact per entry, under 200 chars. Focus on HARD TO RE-DERIVE info.
+- **memory**: persistent knowledge across sessions — env quirks, tool incompatibilities, version constraints, user preferences, key findings that took effort to derive. Focus on HARD TO RE-DERIVE info that saves future sessions from repeating trial-and-error.
 
 Rules:
 - Experiment entries (purpose, config, result, reflection) → workspace_state "Experiments" section.
 - Discovered version constraints, user preferences, env locations → memory.
 - MEMORY IS A CLAIM, NOT A FACT: before acting on a stored conclusion (e.g., "verification_passed"), re-verify the underlying evidence. If the original verification was flawed, the memory inherits that flaw.
+
+Proactive memory discipline:
+- After any unexpected failure that required a workaround, ask: "would a future session hit this same issue?" If yes, memorize it immediately. Examples: conda env doesn't support a flag, a package requires --no-deps, a specific import path is needed.
+- After discovering env-specific facts through trial-and-error (version constraints, path conventions, framework quirks), memorize them — that's exactly the kind of knowledge that's expensive to re-derive.
+- Periodically review memories for staleness — environments change, packages get updated. If you notice a memory contradicts current reality, update or delete it.
+
+## Experiment registry format (MANDATORY)
+
+All experiment entries MUST be written to the `## Experiments` section of workspace_state using `section='Experiments'`. The content MUST use `### ` sub-headers for each experiment. Example:
+
+```
+workspace_state(action='write', section='Experiments', content='''### exp_name (running)
+- **Purpose**: what and why
+- **Config**: hardware, parallelism, hyperparams
+- **Dir**: /path/to/experiment
+- **Result**: (pending)
+- **Reflection**: (pending)
+- **Next**: (pending)
+''')
+```
+
+NEVER write experiment entries as bare content without the `## Experiments` section wrapper — the tool handles the `## Experiments` header automatically when you use `section='Experiments'`. NEVER write `## Experiments` inside the content itself — that creates a nested header. Just provide the `### ` entries as content.
+
+## Experiment lifecycle — pre-launch discipline (MANDATORY)
+
+Before launching any training run:
+
+1. **Understand every parameter**. Read the training script and config. Before running, output your understanding of key parameters — what each one controls, which are required vs optional, which affect checkpoint loading vs model architecture vs data pipeline. This applies to ANY framework (Bagel, FlagScale, Megatron, DeepSpeed, etc.).
+
+2. **Verify before you invest**. If the run involves a slow operation (checkpoint loading, large data preprocessing), first run a minimal version that skips the slow part to validate the pipeline end-to-end. Explicitly state what you changed for the minimal run and why each change is safe — this proves you understand the parameters.
+
+3. **Record everything**. On any failure, retry, or completion, IMMEDIATELY update the experiment entry's Launch notes, Result, Reflection, and Next fields. A blank Launch notes after a retry is a bug — the audit trail matters.
+
+4. **Plan-experiment linkage**: a plan step involving training is NOT complete until the experiment registry is updated with the outcome.
 
 ## Knowledge caching
 
@@ -182,36 +216,27 @@ When reading source code to understand an installed package, ALWAYS verify the c
 
 ## Diagnose root causes, don't patch symptoms
 
-Maximum 2 fix attempts for the same error. After 2 failures, step back and try a fundamentally different approach. Before applying any fix, state the root cause hypothesis in one sentence — if you can't articulate it, you don't understand the problem. For dtype mismatches, trace from the source (RoPE, embedding, normalization), don't add `.to(dtype)` at the error site. For cascading TypeError/AttributeError, read the COMPLETE base class API and fix ALL mismatches at once. Load `ops-discipline` for the full diagnosis protocol.
+Maximum 2 fix attempts for the same error. After 2 failures, step back and try a fundamentally different approach. Before applying any fix, state the root cause hypothesis in one sentence — if you can't articulate it, you don't understand the problem. Load `ops-discipline` for the full diagnosis protocol.
 
-## Proactive diagnostic prints
+## Model porting tasks
 
-Add diagnostic prints BEFORE the first run — don't wait for a crash. Key places: component boundaries (shape/dtype), checkpoint loading (key counts), forward pass (intermediate shapes), config resolution (final values). Use `print(..., flush=True)` for distributed training visibility. Remove or downgrade once verified. See `reproduce` and `model-porter` skills for specifics.
+For model porting / migration tasks, load the `model-porter` skill BEFORE writing any code. It has mandatory gates: source analysis → component diff → memory budget → implementation → three-tier verification. Skipping the analysis phase is the most expensive mistake — it leads to hundreds of lines of code based on wrong assumptions.
 
-## Migration analysis checkpoint
+## Fast validation principle
 
-For model porting tasks, there is a hard gate between analysis and implementation:
-- You MUST complete the source model analysis, component diff table, and memory budget calculation BEFORE writing any porting code.
-- Before writing any new component, search the FlagScale ecosystem for existing similar implementations. Understand how they work before deciding to write from scratch.
-- Present the analysis to the user and get confirmation before proceeding.
-- If you find yourself writing model code without having completed these analyses, STOP and go back to analysis.
-This prevents the most expensive failure mode: writing hundreds of lines of code based on incomplete understanding, then debugging for hours.
+Not every problem requires a full training launch. Before launching (especially when debugging), ask: "what is the FASTEST way to verify this specific fix?"
 
-## Config parameter completeness
+- **Data pipeline issues** (path errors, format mismatches, missing files): write a 10-line script that imports the dataset class and iterates 1 batch. This takes seconds, not the 10+ minutes of model loading.
+- **Config/argument errors** (wrong flags, missing args): run the training script with `--help` or a minimal dry-run that exits before model init.
+- **Import errors** (missing modules, wrong PYTHONPATH): `python -c "import <module>"` — instant.
+- **Model architecture issues** (shape mismatches, missing layers): instantiate on meta device with random weights. No checkpoint needed.
+- **Checkpoint loading issues** (key mismatches, format errors): only THESE require actually loading the checkpoint.
 
-When constructing framework config objects manually, use an existing similar model's `model_provider` as a template. Cross-reference the argument parser for implicitly-set fields. Extract ALL parameters from the source model's config.json. Load `model-porter` for the full protocol.
-
-## Instantiate before converting
-
-Before writing checkpoint conversion code, instantiate the target model on meta device and print its state_dict keys/shapes. Write conversion code to match what you observed, not what you guess from class hierarchy.
+The general rule: isolate the component you're testing and verify it independently. A full training launch is the LAST resort for verification, not the first. Each failed launch that loads a 28GB checkpoint wastes 10+ minutes — multiply by 3-4 debug iterations and you've burned an hour on something a 5-second script could have caught.
 
 ## Design before writing large components
 
-When implementing any non-trivial component (>50 lines), sketch the design first in your response: class hierarchy, key methods, data flow (inputs/outputs/shapes), 10-20 lines of pseudocode. Validate the sketch against the source code or requirements before writing the full implementation. A 10-line sketch is cheap to throw away; a 300-line file is not. The most common mistake is misunderstanding shared vs separate submodules — always verify from source before committing to a class hierarchy.
-
-## Three-tier pre-flight verification (before training)
-
-After writing porting code, run three tiers IN ORDER: (1) import + config arithmetic on meta device, (2) forward+backward with random weights, (3) load real checkpoint. Never skip to Tier 3 — most bugs are caught in Tier 1-2 at zero GPU cost. Load `model-porter` for the full checklist including gradient audit requirements.
+When implementing any non-trivial component (>50 lines), sketch the design first: class hierarchy, key methods, data flow, 10-20 lines of pseudocode. Validate against source code before writing the full implementation.
 
 ## Training health quick-checks
 
@@ -235,6 +260,19 @@ These checks happen BEFORE celebrating success or moving to the next task.
   - `timeout N tail -f logfile` — streams output as it appears, exits when timeout expires
 - For checking if a process is running: `pgrep -fa <pattern>` (instant, no sleep needed)
 - Config path validation: when editing data_path, vocab_file, merge_file, or checkpoint paths in YAML/JSON configs, verify the target paths exist (`ls -la`) BEFORE launching training. Check for placeholder values like '/path/to/', 'FIXME', 'TODO', '/data/dataset' that indicate unresolved templates.
+- **Data pipeline content validation**: verifying that a file EXISTS is not enough. If a config or metadata file contains paths (e.g., parquet_info JSON with file path keys, dataset registry dicts), open the file and verify the paths INSIDE it match the actual data locations. Placeholder paths (`your_data_path/`, paths from another machine) are the #1 cause of "file exists but data loading crashes" failures. After modifying any data path, trace the full chain: config → dataset registry → metadata files → actual files on disk.
+
+## Monitoring strategy during training
+
+Different training phases need different monitoring approaches:
+
+- **Model loading phase** (first 5-15 min after launch): log output is sparse (stdout buffered under nohup). Use `timeout 300 tail -f logfile` with a long timeout. Do NOT repeatedly run `wc -l` or `tail -1` every 10 seconds — each check triggers an LLM inference cycle (~10s, ~60K tokens) for zero information gain. One `timeout 300 tail -f` is worth 30 individual `wc -l` checks.
+- **Active training phase** (metrics appearing every few seconds): use poll mode with `grep "step=" logfile | tail -5` — poll will absorb routine step increments and only return when something interesting happens (error, loss spike, completion).
+- **Checkpoint saving phase** (after training completes): use `timeout 120 tail -f logfile` or poll `pgrep` until process exits. Don't repeatedly check `du -sh` on the checkpoint directory.
+
+General rule: if you expect to wait >2 minutes, use a single long `timeout N tail -f` rather than many short queries. The cost of one 5-minute tail -f is one tool call; the cost of 30 short queries is 30 LLM inference cycles.
+
+**Phase transition**: adapt your monitoring approach as the situation changes. Once output is flowing steadily, switch from streaming to targeted queries — the cost of each check should match the information you expect to gain.
 
 ## Experiment registry
 
@@ -242,16 +280,44 @@ Every experiment MUST be recorded in workspace_state (section "Experiments") as 
 
 **This is a HARD GATE: do NOT launch any training run (reproduction OR migration) without first writing the experiment entry in workspace_state.** If you find yourself about to run `flagscale train`, `torchrun`, or any training script and haven't written the entry yet — STOP and write it first.
 
-**One experiment, one directory.** Never reuse an experiment directory for a different purpose, different config, or different run. Each launch gets its own directory with a descriptive name (e.g., `bagel_tp4_pp1_reproduce_v1`, `qwen3_tp2_migration_loss_check`). If re-running after a fix, create a new directory (append `_v2`, `_v3`, or timestamp). Mixing logs from different runs in the same directory makes results unverifiable.
+**One experiment, one directory.** Never reuse an experiment directory for a different purpose, different config, or different run. Each launch gets its own directory with a descriptive name (e.g., `bagel_tp4_pp1_reproduce_v1`, `qwen3_tp2_migration_loss_check`). Mixing logs from different runs in the same directory makes results unverifiable.
+
+### What counts as a new experiment (bump version)
+
+The version number tracks **meaningful experiment iterations**, not debug attempts. The dividing line:
+
+- **Produced at least 1 step of training metrics** → this is a real experiment. Record it fully. Next change → new version.
+- **Changed a meaningful parameter** (LR, TP/PP, batch size, data, model code, freeze strategy) → new experiment regardless of whether the previous one succeeded.
+- **Launch failed before producing any metrics** (import error, path error, config typo, port conflict, NCCL init failure) → this is a **failed launch attempt**, NOT a new experiment. Record the failure in the current entry's Result field as a note (e.g., "launch attempt 1 failed: ModuleNotFoundError, fixed PYTHONPATH"). Fix and retry under the same version.
+- **Training crashed after producing metrics, restarting with same config** (e.g., NCCL timeout from network glitch, OOM on a specific batch) → still the same experiment. Note the crash and restart in Result.
+
+Example of a well-recorded experiment entry:
+```
+### bagel_finetune_baseline_v1 (completed)
+- **Purpose**: Reproduce Bagel fine-tune training on 8×A800 with official example data
+- **Hypothesis**: Loading pretrained EMA weights, so loss should start well below random init level and decrease further over 100 steps
+- **Config**: 8GPU FSDP HYBRID_SHARD, micro_bs=auto, seq_len=10240, bf16, 100 steps, lr=2e-5
+- **Dir**: /workspace/experiments/bagel_finetune_baseline_v1
+- **Launch notes**: attempt 1 failed (--no-banner unsupported), attempt 2 failed (PYTHONPATH missing), attempt 3 succeeded
+- **Result**: 100 steps completed. loss: 4.82→3.15, grad_norm stable ~0.5, throughput 1.2k tok/s, peak mem 72GB/GPU
+- **Reflection**: Official training script works out of box once PYTHONPATH is set. Loss curve matches expected range. Memory headroom ~8GB/GPU.
+- **Next**: Try with full dataset, or proceed to FlagScale migration
+```
+
+This way, when a human reviews the experiment log, they see:
+1. Clean experiment history (v1, v2, v3...) with clear purpose/result chains
+2. Debug noise captured as brief notes within each entry, not as separate entries
+3. Enough context to understand what happened without reading raw logs
 
 **Required fields for each experiment:**
 
 ```
 ### <exp_name> (<status: running|completed|failed|abandoned>)
 - **Purpose**: Why this experiment exists. What question are we answering?
-- **Hypothesis**: What we expect to happen and why.
+- **Hypothesis**: What we expect to happen and why. Ground your prediction in the model's actual starting state and the training setup — don't assume defaults.
 - **Config**: Key config choices (TP/PP/DP, batch size, seq_len, precision, special flags).
 - **Dir**: Full experiment directory path.
+- **Launch notes**: Brief record of any failed launch attempts before successful start.
 - **Result**: Final metrics (loss, throughput, MFU), or failure mode if it failed.
 - **Reflection**: What we learned. What to do differently next time. Root cause if failed.
 - **Next**: What experiment follows from this one's results.
@@ -259,10 +325,11 @@ Every experiment MUST be recorded in workspace_state (section "Experiments") as 
 
 **Lifecycle:**
 1. BEFORE launching: write Purpose, Hypothesis, Config, Dir (status=running)
-2. AFTER completion/failure: fill in Result, Reflection, Next (update status)
-3. When starting the next experiment: reference the previous one's Reflection
+2. If launch fails before metrics: add to Launch notes, fix, retry. Do NOT create a new entry.
+3. AFTER completion/failure (with metrics): fill in Result, Reflection, Next (update status). Do this IMMEDIATELY — before debugging, before launching the next experiment, before anything else. A failed experiment without a recorded reflection is wasted knowledge.
+4. When starting the next experiment: reference the previous one's Reflection. The new entry MUST coexist with all previous entries — never overwrite the Experiments section with only the latest entry.
 
-This creates a chain of reasoning across experiments. When a new session starts, reading the experiment log tells you exactly where things stand, what was tried, what worked, and what to try next — no need to re-analyze logs or ask the user to repeat context.
+The system enforces this: launching training without a registered experiment entry will trigger a warning in the tool output. But don't rely on the warning — make it a habit.
 
 ## Language
 
@@ -380,6 +447,9 @@ class ReactAgent:
         self._last_result_annotations = []
         self._consecutive_train_failures = 0
         self._last_train_failure_reasons = []
+        self._experiment_registered = False  # True after workspace_state Experiments section is written
+        self._dry_run_passed = False  # True after a quick-test / dry-run training command succeeds
+        self._last_tool_call = None  # (tool_name, cmd_or_key, was_error) for workaround detection
         atexit.register(self._atexit_hook)
 
     # ── Atexit safety net ───────────────────────────────────────────────
@@ -387,7 +457,7 @@ class ReactAgent:
     def _atexit_hook(self):
         """Update workspace state on any exit path (safety net for abnormal exits)."""
         try:
-            if self._turn_count >= 2:
+            if self._session_output_tokens:
                 self._auto_update_workspace_state()
                 self._archive_session()
         except Exception:
@@ -513,7 +583,9 @@ class ReactAgent:
         "- Reading/grepping code from a different workspace than the current one (e.g., command references /workspace/X/ but agent works in /workspace/Y/) → WARN: source code provenance mismatch, verify you're reading the actually installed code\n"
         "- cp -r from another environment's site-packages → WARN: never copy packages between environments, use pip install\n"
         "- Checkpoint conversion output showing 'missed' or 'skipped' or 'unexpected' keys → WARN: audit the FULL list of missed/skipped keys by grouping them by top-level prefix. Do not assume they are all harmless based on a partial sample\n"
-        "- Checkpoint saved to disk (torch.save, save_checkpoint) without a reload verification → WARN: verify saved checkpoint by reloading and checking key count, parameter shapes, and total parameter count match expectations\n\n"
+        "- Checkpoint saved to disk (torch.save, save_checkpoint) without a reload verification → WARN: verify saved checkpoint by reloading and checking key count, parameter shapes, and total parameter count match expectations\n"
+        "- Training log/output showing crash, error, or exitcode!=0 (e.g., tail/cat/grep of a train.log showing Traceback, RuntimeError, exitcode=1) → WARN: update the experiment entry in workspace_state with the failure reason and reflection before debugging or relaunching\n"
+        "- Training log showing successful completion (all steps done, checkpoint saved) → remind to update experiment entry with final metrics and reflection\n\n"
         "Reply with ONLY a JSON object:\n"
         '  {{"annotations": ["annotation1", "annotation2"], "severity": "info|warning|error"}}\n'
         "If no issues: {{\"annotations\": [], \"severity\": \"info\"}}"
@@ -721,14 +793,28 @@ class ReactAgent:
             web_fetch_tool._proxies = self._build_proxies()
 
     def _build_memory_context(self):
-        """Build memory context string from recent memories."""
-        notes = self.session_memory.recent(max_tokens=800)
+        """Build memory context string from recent memories, with staleness warnings and session review hint."""
+        notes = self.session_memory.recent(max_tokens=2000)
         if not notes:
             return ""
         lines = []
+        stale_keys = []
+        stale_threshold = 14 * 86400  # 14 days
+        now = time.time()
         for n in notes:
-            lines.append(f'[{n.get("type", "?")}] {n.get("content", "")}')
-        return "<session-memory>\n" + "\n".join(lines) + "\n</session-memory>"
+            lines.append(f'[{n.get("type", "?")}:{n.get("key", "?")}] {n.get("content", "")}')
+            age = now - n.get("created", 0)
+            if age > stale_threshold:
+                stale_keys.append(n.get("key", "?"))
+        result = "<session-memory>\n" + "\n".join(lines) + "\n</session-memory>"
+        if stale_keys:
+            result += self._STALE_MEMORY_WARNING_TEMPLATE.format(
+                count=len(stale_keys), days=14,
+                keys=", ".join(stale_keys[:5]) + ("..." if len(stale_keys) > 5 else ""),
+            )
+        if self._turn_count >= 5:
+            result += self._SESSION_MEMORY_REVIEW
+        return result
 
     def _build_workspace_context(self):
         """Load workspace state file if it exists."""
@@ -739,10 +825,89 @@ class ReactAgent:
             with open(state_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
             if content:
-                return f"<workspace-state>\n{content[:5000]}\n</workspace-state>"
+                # Don't set _experiment_registered from existing state —
+                # the Agent must write a NEW entry for each new launch,
+                # even if previous experiments are already recorded.
+                content = self._truncate_workspace_state(content, max_chars=5000)
+                return f"<workspace-state>\n{content}\n</workspace-state>"
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def _truncate_workspace_state(content: str, max_chars: int = 5000) -> str:
+        """Truncate workspace state preserving high-priority sections.
+
+        Priority: Experiments > Hardware > Session Summary > others.
+        Drops lowest-priority sections first. If Experiments alone exceeds
+        the budget, keeps only the most recent entries.
+        """
+        if len(content) <= max_chars:
+            return content
+
+        PRIORITY = {"Experiments": 0, "Hardware": 1, "Session Summary": 2}
+
+        lines = content.split("\n")
+        current_header = ""
+        current_lines: list[str] = []
+        preamble_lines: list[str] = []
+        sections: list[tuple[str, str]] = []
+
+        for line in lines:
+            if line.startswith("## "):
+                if current_header:
+                    sections.append((current_header, "\n".join(current_lines)))
+                else:
+                    preamble_lines = current_lines
+                current_header = line[3:].strip()
+                current_lines = []
+            else:
+                current_lines.append(line)
+        if current_header:
+            sections.append((current_header, "\n".join(current_lines)))
+        else:
+            # No sections at all — everything is preamble
+            preamble_lines = current_lines
+
+        # If no sections exist, just truncate the raw content
+        if not sections:
+            return content[:max_chars]
+
+        preamble = "\n".join(preamble_lines).strip()
+        if len(preamble) > max_chars // 2:
+            preamble = preamble[:max_chars // 2]
+
+        sections.sort(key=lambda s: PRIORITY.get(s[0], 10))
+
+        result_parts = [preamble] if preamble else []
+        for header, body in sections:
+            section_text = f"## {header}\n{body}"
+            candidate = "\n\n".join(result_parts + [section_text])
+            if len(candidate) <= max_chars:
+                result_parts.append(section_text)
+            elif header == "Experiments":
+                if "### " in body:
+                    # Keep only the most recent experiment entries
+                    entries = body.split("### ")[1:]
+                    kept: list[str] = []
+                    for entry in reversed(entries):
+                        test_body = "### " + "### ".join(kept + [entry]) if kept else "### " + entry
+                        test_section = f"## Experiments\n{test_body}"
+                        full = "\n\n".join(result_parts + [test_section])
+                        if len(full) <= max_chars:
+                            kept.insert(0, entry)
+                        else:
+                            break
+                    if kept:
+                        trimmed = "## Experiments\n### " + "### ".join(kept)
+                        result_parts.append(trimmed)
+                else:
+                    # No sub-headers — truncate the body to fit
+                    budget = max_chars - len("\n\n".join(result_parts)) - len("## Experiments\n") - 4
+                    if budget > 100:
+                        result_parts.append(f"## Experiments\n{body[:budget]}")
+
+        return "\n\n".join(result_parts)
 
     def _inject_context(self, user_input):
         """Auto-inject session memory, plan, and workspace context into the system prompt."""
@@ -1152,17 +1317,14 @@ class ReactAgent:
         except Exception as e:
             logger.debug("Memory judge skipped: %s", e)
 
-    _WORKSPACE_STATE_PROMPT = (
-        "Summarize the current workspace state based on this session.\n"
-        "Focus on: what was worked on, key outcomes, and what's next.\n"
-        "Keep it under 500 chars. Use markdown sections: ## Current Task, ## Status, ## Next Steps.\n"
-        "If nothing meaningful happened, reply with exactly: SKIP\n\n"
-        "Session:\n{summary}"
-    )
-
     def _auto_update_workspace_state(self):
-        """Auto-update workspace state at session end."""
-        if self._turn_count < 2:
+        """Auto-update workspace state Session Summary at session end.
+
+        Uses a deterministic template instead of LLM generation.
+        Only updates the '## Session Summary' section — never overwrites
+        the full file.
+        """
+        if not self._session_output_tokens:
             return
         user_msgs = []
         for m in self.history.messages:
@@ -1170,31 +1332,34 @@ class ReactAgent:
                 continue
             content = m.get("content")
             if isinstance(content, str) and content.strip():
-                user_msgs.append(content)
+                user_msgs.append(content.strip())
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
-                        user_msgs.append(block["text"])
+                        user_msgs.append(block["text"].strip())
                         break
         if not user_msgs:
             return
-        recap_parts = []
-        for msg in user_msgs[-5:]:
-            line = msg.strip().replace("\n", " ")
-            if len(line) > 120:
-                line = line[:117] + "..."
-            recap_parts.append(line)
-        summary = " | ".join(recap_parts)
+
+        parts = []
+        first_msg = user_msgs[0].replace("\n", " ")
+        if len(first_msg) > 100:
+            first_msg = first_msg[:97] + "..."
+        parts.append(f"Task: {first_msg}")
+
+        elapsed = time.time() - self._session_start
+        elapsed_str = f"{int(elapsed // 60)}m" if elapsed > 60 else f"{int(elapsed)}s"
+        parts.append(f"Turns: {self._turn_count}, Duration: {elapsed_str}")
+
+        if self._session_input_tokens or self._session_output_tokens:
+            parts.append(f"Tokens: {self._session_input_tokens}in/{self._session_output_tokens}out")
+
+        summary = "\n".join(parts)
+
         try:
-            prompt = self._WORKSPACE_STATE_PROMPT.format(summary=summary)
-            messages = [{"role": "user", "content": prompt}]
-            response = self.provider.chat(messages, tools=[])
-            text = (response.get("content") or "").strip()
-            if text == "SKIP" or len(text) < 10:
-                return
             ws_tool = self.tool_registry.get("workspace_state")
             if ws_tool:
-                ws_tool.execute(action="write", content=text)
+                ws_tool.execute(action="write", content=summary, section="Session Summary")
         except Exception as e:
             logger.debug("Workspace state auto-update skipped: %s", e)
 
@@ -1349,6 +1514,15 @@ class ReactAgent:
         commands = [r["command"] for r in recent]
         return len(set(commands)) == 1 and commands[0]
 
+    _INTERESTING_CHANGE_RE = re.compile(
+        r'ERROR|FATAL|Traceback|NCCL|OOM|OutOfMemory|RuntimeError|'
+        r'TERMINATED|STALLED|KeyError|ModuleNotFoundError|ImportError|'
+        r'torch\.cuda\.OutOfMemoryError|CUDA error|'
+        r'loss[=:\s]|grad.norm|throughput|step\s+\d|iteration\s+\d|'
+        r'training\s+complete|finished|saved\s+checkpoint',
+        re.IGNORECASE,
+    )
+
     @staticmethod
     def _poll_output_changed(old, new):
         """Compare two shell outputs, ignoring timestamp-like noise."""
@@ -1366,12 +1540,94 @@ class ReactAgent:
             return True
         return False
 
+    @classmethod
+    def _poll_output_interesting(cls, old, new):
+        """Check if the change is interesting enough to return to LLM.
+
+        Routine changes (e.g., wc -l going from 24 to 25) should keep
+        polling.  Interesting changes (errors, training metrics, large
+        jumps) should break out so the LLM can react.
+        """
+        if not cls._poll_output_changed(old, new):
+            return False
+        old_lines = set(old.strip().splitlines())
+        new_lines = new.strip().splitlines()
+        added = [l for l in new_lines if l not in old_lines]
+        for line in added:
+            if cls._INTERESTING_CHANGE_RE.search(line):
+                return True
+        len_old = len(old.strip())
+        len_new = len(new.strip())
+        if len_old > 0 and abs(len_new - len_old) / max(len_old, 1) > 0.30:
+            return True
+        return False
+
     _TRAIN_CMD_RE = re.compile(r'flagscale\s+train|torchrun|python.*train')
+    _TRAIN_LAUNCH_RE = re.compile(
+        r'flagscale\s+train|torchrun\s|deepspeed\s|'
+        r'python\s+.*(?:pretrain|finetune|train).*\.py',
+    )
     _TRAIN_FAIL_RE = re.compile(
         r'ERROR|FATAL|Traceback|NCCL|OOM|OutOfMemory|RuntimeError|'
         r'TERMINATED|STALLED|KeyError|ModuleNotFoundError|ImportError|'
         r'torch\.cuda\.OutOfMemoryError|CUDA error',
         re.IGNORECASE,
+    )
+
+    _CHECKPOINT_LOAD_RE = re.compile(
+        r'--resume[_-]from|--finetune[_-]from|--load\s|--pretrained[_-]model|'
+        r'--init[_-]checkpoint|--restore[_-]file',
+    )
+
+    _DRY_RUN_WARNING = (
+        "\n⚠️ PRE-LAUNCH CHECK: This command loads a checkpoint but no dry-run was done first.\n"
+        "Principle: validate cheap things before expensive things. Checkpoint loading is slow — "
+        "verify the pipeline works with random init first, then add checkpoint loading.\n"
+    )
+
+    _EXPERIMENT_GATE_WARNING = (
+        "\n⚠️ EXPERIMENT REGISTRY GATE: You launched a training run without "
+        "writing an experiment entry in workspace_state first.\n"
+        "This is a HARD REQUIREMENT. You MUST now:\n"
+        "1. Call workspace_state(action='write', section='Experiments', content='### <exp_name> (running)\\n"
+        "- **Purpose**: ...\\n- **Config**: ...\\n- **Dir**: ...')\n"
+        "   NOTE: Use section='Experiments' — the tool adds the ## header. "
+        "Your content should start with ### entries directly.\n"
+        "2. Record the result when training completes or fails.\n"
+    )
+
+    _EXPERIMENT_UPDATE_REMINDER = (
+        "\n⚠️ EXPERIMENT REGISTRY: Training ended (completed or failed). "
+        "You MUST update the experiment entry in workspace_state:\n"
+        "1. Update **Result** with actual outcome (error message if failed, metrics if succeeded).\n"
+        "2. Update **Launch notes** with what happened (especially if this was a retry — "
+        "record what changed since last attempt).\n"
+        "3. Update **Reflection** and **Next** fields.\n"
+        "Use workspace_state(action='write', section='Experiments', content=...) "
+        "with the FULL experiments section including ALL previous entries plus the updated one.\n"
+    )
+
+    _WORKAROUND_MEMORY_HINT = (
+        "\n💡 MEMORY HINT: You just succeeded after a prior failure on a similar operation. "
+        "If a future session could hit the same issue, memorize the fix now with memory_write. "
+        "Include: what failed, why, and the exact workaround (flag, path, version, etc.).\n"
+    )
+
+    _SESSION_MEMORY_REVIEW = (
+        "\n📝 SESSION REVIEW: Before this session ends, consider: did you discover any "
+        "env quirks, version constraints, tool incompatibilities, or workarounds during this session? "
+        "If so, save them with memory_write so future sessions don't repeat the same trial-and-error.\n"
+    )
+
+    _TRAINING_MEMORY_HINT = (
+        "\n💡 MEMORY HINT: Training is running. Review what you learned getting here — "
+        "if you figured something out through trial-and-error, memorize it so the next session doesn't repeat the work.\n"
+    )
+
+    _STALE_MEMORY_WARNING_TEMPLATE = (
+        "\n⚠️ STALE MEMORIES: {count} memory entries are older than {days} days: {keys}. "
+        "When you encounter these during work, verify they still hold. "
+        "If outdated, update or delete them with memory_write / memory_read.\n"
     )
 
     def _track_training_failures(self, tool_calls, results):
@@ -1403,13 +1659,19 @@ class ReactAgent:
                 self._last_train_failure_reasons.clear()
 
     def _run_poll_mode(self, command, last_output, tool_call_id):
-        """Execute poll loop locally without LLM calls. Returns (output, count, elapsed, reason)."""
+        """Execute poll loop locally without LLM calls. Returns (output, count, elapsed, reason, routine_changes).
+
+        Only returns to the LLM when the output change is "interesting"
+        (errors, training metrics, large jumps) or on timeout.  Routine
+        changes (e.g., line count +1) are absorbed silently.
+        """
         interval = self.config.poll_interval
         max_duration = self.config.poll_max_duration
         cmd_display = self._shell_display_summary(command, max_len=70)
         display.poll_mode_start(cmd_display, interval)
 
         poll_count = 0
+        routine_changes = 0
         start = time.time()
         current_output = last_output
 
@@ -1417,7 +1679,7 @@ class ReactAgent:
             while True:
                 elapsed = time.time() - start
                 if elapsed >= max_duration:
-                    return current_output, poll_count, elapsed, "timeout"
+                    return current_output, poll_count, elapsed, "timeout", routine_changes
 
                 time.sleep(interval)
                 poll_count += 1
@@ -1428,16 +1690,21 @@ class ReactAgent:
                 except Exception as e:
                     new_output = f"ERROR: {e}"
 
-                if self._poll_output_changed(current_output, new_output):
+                if self._poll_output_interesting(current_output, new_output):
                     current_output = new_output
-                    return current_output, poll_count, elapsed, "changed"
+                    return current_output, poll_count, elapsed, "changed", routine_changes
 
-                display.poll_check(poll_count, elapsed)
-                current_output = new_output
+                if self._poll_output_changed(current_output, new_output):
+                    routine_changes += 1
+                    current_output = new_output
+                    display.poll_check(poll_count, elapsed, routine_change=True)
+                else:
+                    display.poll_check(poll_count, elapsed)
+                    current_output = new_output
 
         except KeyboardInterrupt:
             elapsed = time.time() - start
-            return current_output, poll_count, elapsed, "interrupted"
+            return current_output, poll_count, elapsed, "interrupted", routine_changes
 
     # ── ReAct loop ───────────────────────────────────────────────────────
 
@@ -1530,9 +1797,9 @@ class ReactAgent:
                 last_output = last_iter["output"]
                 tc = response["tool_calls"][0]
 
-                new_output, poll_count, poll_elapsed, reason = self._run_poll_mode(
+                new_output, poll_count, poll_elapsed, reason, routine_changes = self._run_poll_mode(
                     command, last_output, tc["id"])
-                display.poll_mode_end(reason, poll_count, poll_elapsed)
+                display.poll_mode_end(reason, poll_count, poll_elapsed, routine_changes)
 
                 self._replace_last_tool_result(
                     self.provider.format_tool_result(tc["id"], new_output))
@@ -1797,7 +2064,6 @@ class ReactAgent:
 
         def _fmt_arg(k, v):
             s = str(v)
-            # Truncate long content for display (write_file, edit_file, etc.)
             if k in ("content", "new_string", "old_string") and len(s) > 100:
                 lines = s.split('\n')
                 if len(lines) > 3:
@@ -1810,7 +2076,6 @@ class ReactAgent:
 
         t0 = time.time()
 
-        # For shell commands, show a clean one-line summary instead of the full command
         if tool_name == "shell":
             cmd = arguments.get("command", "")
             cmd_display = self._shell_display_summary(cmd)
@@ -1833,9 +2098,47 @@ class ReactAgent:
 
         logger.info("Tool %s: %.1fs, result %d chars", tool_name, elapsed, len(result))
         error = "ERROR" in result[:20] if result else False
+
+        # Track experiment registration — only on successful write
+        if (tool_name == "workspace_state" and not error):
+            section = arguments.get("section", "")
+            if section and "experiment" in section.lower():
+                self._experiment_registered = True
+
         detail = ""
         if tool_name == "shell":
-            annotations = self._result_judge(arguments.get("command", ""), result, elapsed)
+            cmd = arguments.get("command", "")
+            # Track dry-run success
+            if (self._TRAIN_LAUNCH_RE.search(cmd)
+                    and self._is_quick_test_command(cmd)
+                    and not error):
+                self._dry_run_passed = True
+
+            # Experiment registry gate: warn if training launched without entry
+            if (self._TRAIN_LAUNCH_RE.search(cmd)
+                    and not self._is_quick_test_command(cmd)):
+                if not self._experiment_registered:
+                    result = self._EXPERIMENT_GATE_WARNING + result
+                    display.warn("Training launched without experiment entry in workspace_state!")
+                # Dry-run gate: warn if checkpoint-loading run without prior dry-run
+                if (self._CHECKPOINT_LOAD_RE.search(cmd)
+                        and not self._dry_run_passed):
+                    result = self._DRY_RUN_WARNING + result
+                    display.warn("Checkpoint-loading training launched without prior dry-run!")
+                # Reset after each launch — next launch needs its own entry/dry-run
+                self._experiment_registered = False
+                self._dry_run_passed = False
+            # Remind to update experiment record when training fails
+            if (self._TRAIN_LAUNCH_RE.search(cmd)
+                    and not self._is_quick_test_command(cmd)
+                    and error):
+                result = result + self._EXPERIMENT_UPDATE_REMINDER
+            # Remind to memorize learnings when training launches successfully
+            if (self._TRAIN_LAUNCH_RE.search(cmd)
+                    and not self._is_quick_test_command(cmd)
+                    and not error):
+                result = result + self._TRAINING_MEMORY_HINT
+            annotations = self._result_judge(cmd, result, elapsed)
             annotations = self._dedup_annotations(annotations)
             if annotations:
                 header = "\n".join(f"[{a}]" for a in annotations)
@@ -1843,8 +2146,41 @@ class ReactAgent:
         if error and result:
             raw = result.split('\n')[0].replace("ERROR:", "").strip()
             detail = (raw[:57] + "...") if len(raw) > 60 else raw
+
+        # Workaround detection: same tool, previous call failed, this one succeeded
+        if (self._last_tool_call is not None
+                and not error
+                and self._last_tool_call[0] == tool_name
+                and self._last_tool_call[2]):
+            result = result + self._WORKAROUND_MEMORY_HINT
+
+        # Track for next call's workaround detection
+        cmd_key = arguments.get("command", "") if tool_name == "shell" else tool_name
+        self._last_tool_call = (tool_name, cmd_key, error)
+
         display.tool_done(tool_name, elapsed, detail=detail, error=error)
         return result
+
+    @staticmethod
+    def _is_quick_test_command(cmd):
+        """Check if a training-like command is actually a quick test (dry-run, help, etc.)."""
+        cmd_lower = cmd.lower()
+        # Exact patterns (no word-boundary issues)
+        exact_patterns = ['--dryrun', '--dry-run', '--dry_run', '--help', '-h', '--version',
+                          'python -c', 'import ']
+        if any(p in cmd_lower for p in exact_patterns):
+            return True
+        # Numeric patterns — must match the exact value (e.g., "1" not "100")
+        numeric_patterns = [
+            (r'--total[_-]steps\s+1\b', None),
+            (r'--max[_-]steps\s+1\b', None),
+            (r'--num[_-]steps\s+[01]\b', None),
+            (r'--train[_-]iters\s+[01]\b', None),
+        ]
+        for pattern, _ in numeric_patterns:
+            if re.search(pattern, cmd_lower):
+                return True
+        return False
 
     def _append_tool_results(self, tool_results):
         """Append tool results, merging into one message for Anthropic compatibility."""

@@ -585,21 +585,24 @@ def poll_mode_start(command_summary, interval):
     global _poll_anim
     _stop_all_spinners()
     _print()
-    _print(cyan(f"  🔄 Poll mode: re-running every {interval}s until output changes"))
+    _print(cyan(f"  🔄 Poll mode: re-running every {interval}s until interesting change"))
     _print(dim(f"     cmd: {command_summary}"))
     _print(dim(f"     Ctrl+C to exit poll mode"))
     _poll_anim = _PollAnim()
     _poll_anim.start()
 
 
-def poll_check(n, elapsed, changed=False):
+def poll_check(n, elapsed, changed=False, routine_change=False):
     """Update poll status on the same line."""
     global _poll_anim
     if _poll_anim:
-        _poll_anim.set_status(f"poll #{n} — no change ({elapsed:.0f}s)")
+        if routine_change:
+            _poll_anim.set_status(f"poll #{n} — routine change ({elapsed:.0f}s)")
+        else:
+            _poll_anim.set_status(f"poll #{n} — no change ({elapsed:.0f}s)")
 
 
-def poll_mode_end(reason, poll_count, total_elapsed):
+def poll_mode_end(reason, poll_count, total_elapsed, routine_changes=0):
     """Print poll mode exit summary."""
     global _poll_anim
     if _poll_anim:
@@ -607,16 +610,22 @@ def poll_mode_end(reason, poll_count, total_elapsed):
         _poll_anim = None
     icon = green("✓") if reason == "changed" else yellow("⏱")
     reasons = {
-        "changed": "output changed",
+        "changed": "interesting change detected",
         "timeout": "max duration reached",
         "interrupted": "interrupted by user",
     }
     reason_text = reasons.get(reason, reason)
-    _print(f"  {icon} Poll ended: {reason_text} ({poll_count} checks, {total_elapsed:.0f}s)")
+    extra = f", {routine_changes} routine changes absorbed" if routine_changes else ""
+    _print(f"  {icon} Poll ended: {reason_text} ({poll_count} checks, {total_elapsed:.0f}s{extra})")
     _print()
 
 
 # ── Turn / session summary ──────────────────────────────────────────────
+
+def warn(message):
+    """Display a warning message to the user."""
+    _print(f"  {yellow('⚠')} {yellow(message)}")
+
 
 def turn_summary(turn_num, elapsed, input_tokens, output_tokens):
     _stop_all_spinners()

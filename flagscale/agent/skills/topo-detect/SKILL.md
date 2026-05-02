@@ -48,10 +48,10 @@ Detect compute, communication, and storage topology on the current node. Collect
 ### 1a. GPU inventory
 
 ```bash
-nvidia-smi --query-gpu=index,name,memory.total,memory.free,driver_version,pci.bus_id,compute_cap --format=csv,noheader
+nvidia-smi --query-gpu=index,name,memory.total,memory.free,driver_version,pci.bus_id,compute_cap --format=csv,noheader && echo "GPU_COUNT=$(nvidia-smi -L | wc -l)"
 ```
 
-Extract: GPU count, model name, memory per GPU (GB), driver version, compute capability.
+The `GPU_COUNT=` line gives the exact GPU count. Use that number — never count nvidia-smi output lines manually.
 
 If `nvidia-smi` is not found, record `gpus: unavailable` and skip to Step 1d.
 

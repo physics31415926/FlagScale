@@ -10,9 +10,14 @@ class MemoryWriteTool(Tool):
         "Use to record important discoveries, choices made, or pending work "
         "so the agent remembers them across conversations. "
         "Writing the same key updates the existing entry. "
-        "Prioritize recording: file/weight/env paths, numerical results (loss, throughput, alignment diffs), "
-        "component analysis outcomes (SUPPORTED/ADAPTABLE/CUSTOM), blockers and workarounds, "
-        "and anything hard to re-derive. Skip things easily re-read from code or configs."
+        "Prioritize recording: env quirks and tool incompatibilities (e.g., 'bagel env does not support --no-banner'), "
+        "file/weight/env paths, version constraints, framework-specific gotchas, "
+        "numerical results (loss, throughput), workarounds that took trial-and-error to find, "
+        "and anything hard to re-derive. "
+        "PROACTIVE RULE: after any unexpected failure that required a workaround, "
+        "immediately memorize it if a future session could hit the same issue. "
+        "Do NOT use memory for: experiment records (use workspace_state Experiments section), "
+        "current session state (use workspace_state), or information easily re-read from files/configs."
     )
     parameters = {
         "type": "object",
@@ -28,7 +33,7 @@ class MemoryWriteTool(Tool):
             },
             "content": {
                 "type": "string",
-                "description": "The memory content. Keep concise — one fact per entry.",
+                "description": "The memory content. Be clear and specific — include the exact error, flag, or version number so future sessions can act on it directly.",
             },
         },
         "required": ["key", "type", "content"],

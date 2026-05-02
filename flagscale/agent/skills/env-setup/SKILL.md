@@ -59,9 +59,11 @@ Collect all version constraints before installing anything.
 ### 1a. Hardware constraint — driver → max CUDA
 
 ```bash
-nvidia-smi --query-gpu=driver_version,name,compute_cap --format=csv,noheader | head -1
+nvidia-smi --query-gpu=driver_version,name,compute_cap,memory.total --format=csv,noheader | head -1 && echo "GPU_COUNT=$(nvidia-smi -L | wc -l)"
 nvcc --version 2>/dev/null || echo "nvcc not found"
 ```
+
+The `GPU_COUNT=` line gives the exact GPU count. Use that number in all subsequent references — never count nvidia-smi output lines manually.
 
 Driver → max CUDA version (for PyTorch wheel selection):
 - Driver 570.x → CUDA ≤ 12.8 → wheels: cu118, cu121, cu124, cu126, cu128
