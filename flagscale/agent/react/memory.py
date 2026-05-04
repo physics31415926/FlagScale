@@ -1,5 +1,6 @@
 """Session memory — stores key findings, decisions, and todos across conversations."""
 
+import logging
 import os
 import time
 
@@ -7,8 +8,9 @@ from typing import Dict, List, Optional
 
 import yaml
 
+logger = logging.getLogger(__name__)
 
-_TYPE_PRIORITY = {"todo": 0, "decision": 1, "finding": 2, "context": 3}
+_TYPE_PRIORITY = {"finding": 0, "decision": 1, "todo": 2, "context": 3}
 
 
 class SessionMemory:
@@ -17,6 +19,27 @@ class SessionMemory:
     def __init__(self, memory_dir: str, ttl_days: int = 7):
         self._dir = memory_dir
         self._ttl = ttl_days * 86400
+        self._cleanup_expired()  # Clean up expired entries on init
+
+    def _cleanup_expired(self):
+        """Remove expired memory entries from disk."""
+        if not os.path.isdir(self._dir):
+            return
+        removed = 0
+        for fname in os.listdir(self._dir):
+            if not fname.endswith(".yaml"):
+                continue
+            path = os.path.join(self._dir, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    entry = yaml.safe_load(f)
+                if not self._is_valid(entry):
+                    os.remove(path)
+                    removed += 1
+            except Exception:
+                pass
+        if removed > 0:
+            logger.info("Cleaned up %d expired memory entries", removed)
 
     def _entry_path(self, key: str) -> str:
         safe_key = key.replace("/", "_").replace(" ", "_")
@@ -36,13 +59,14 @@ class SessionMemory:
             return None
         return entry
 
-    def put(self, key: str, mem_type: str, content: str, session_id: str = ""):
+    def put(self, key: str, mem_type: str, content: str, session_id: str = "", task: str = ""):
         os.makedirs(self._dir, exist_ok=True)
         entry = {
             "key": key,
             "type": mem_type,
             "content": content,
             "session_id": session_id,
+            "task": task,
             "created": time.time(),
         }
         path = self._entry_path(key)
@@ -74,17 +98,39 @@ class SessionMemory:
                 continue
         return entries
 
-    def recent(self, max_tokens: int = 800) -> List[dict]:
-        """Return entries within a token budget, prioritized by type then recency.
+    def recent(self, max_tokens: int = 4000, task_filter: str = "") -> List[dict]:
+        """Return entries within a token budget, prioritized by task relevance, type, then recency.
 
-        Priority: todo > decision > finding > context.
+        If task_filter is provided, entries matching that task come first, then other entries.
+        Priority within each group: finding > decision > todo > context.
         Within the same type, newest entries come first.
         """
         entries = self.list_entries()
-        entries.sort(key=lambda e: (
-            _TYPE_PRIORITY.get(e.get("type", "context"), 9),
-            -e.get("created", 0),
-        ))
+
+        if task_filter:
+            # Split into task-matching and other entries
+            task_entries = [e for e in entries if e.get("task", "") == task_filter]
+            other_entries = [e for e in entries if e.get("task", "") != task_filter]
+
+            # Sort each group by type priority, then recency
+            task_entries.sort(key=lambda e: (
+                _TYPE_PRIORITY.get(e.get("type", "context"), 9),
+                -e.get("created", 0),
+            ))
+            other_entries.sort(key=lambda e: (
+                _TYPE_PRIORITY.get(e.get("type", "context"), 9),
+                -e.get("created", 0),
+            ))
+
+            # Task entries come first
+            entries = task_entries + other_entries
+        else:
+            # No filter: sort by type priority, then recency
+            entries.sort(key=lambda e: (
+                _TYPE_PRIORITY.get(e.get("type", "context"), 9),
+                -e.get("created", 0),
+            ))
+
         result = []
         used = 0
         for e in entries:

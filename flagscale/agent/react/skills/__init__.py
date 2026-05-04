@@ -1,10 +1,13 @@
 """Skill manager — loads and parses SKILL.md files."""
 
+import logging
 import os
 
 from typing import Dict, List, Optional, Tuple
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class SkillManager:
@@ -52,12 +55,15 @@ class SkillManager:
                         seen_paths[skill_file] = {"name": entry, "description": "", "keywords": [], "parameters": []}
         return list(seen_paths.values())
 
-    def load(self, name: str, **params) -> str:
+    def load(self, name: str, _loading_stack: set | None = None, **params) -> str:
         """Load a skill by frontmatter name or directory name. Later directories take priority.
 
         Optional keyword arguments are substituted into {param_name} placeholders
         in the skill body. Parameters defined in frontmatter with defaults are
         used when not provided by the caller.
+
+        Auto-loads dependency summaries declared in frontmatter 'requires' field.
+        Appends 'suggests' hints for related skills.
         """
         mapping = self._scan()
         skill_file = mapping.get(name)
@@ -65,6 +71,42 @@ class SkillManager:
             raise FileNotFoundError(f"Skill '{name}' not found in: {self._dirs}")
         meta, body = self._parse_file(skill_file)
         skill_name = meta.get("name", name)
+
+        # Auto-load dependency summaries with circular dependency detection
+        if _loading_stack is None:
+            _loading_stack = set()
+        _loading_stack.add(name)
+
+        requires = meta.get("requires", [])
+        if requires and isinstance(requires, list):
+            dep_hints = []
+            for dep_name in requires:
+                if dep_name in _loading_stack:
+                    logger.warning("Circular skill dependency: %s -> %s, skipping", name, dep_name)
+                    continue
+                # Prefer summary over full content for dependencies
+                summary = self.load_summary(dep_name)
+                if summary:
+                    dep_hints.append(f"<dependency name=\"{dep_name}\" type=\"summary\">\n{summary}\n</dependency>")
+                else:
+                    try:
+                        dep_content = self.load(dep_name, _loading_stack=_loading_stack, **params)
+                        dep_hints.append(dep_content)
+                    except FileNotFoundError:
+                        pass
+            if dep_hints:
+                body = "\n\n".join(dep_hints) + "\n\n" + body
+
+        # Append suggests hints (lightweight — just names and descriptions)
+        suggests = meta.get("suggests", [])
+        if suggests and isinstance(suggests, list):
+            available = {s["name"] for s in self.list_skills()}
+            valid_suggests = [s for s in suggests if s in available]
+            if valid_suggests:
+                hints = ", ".join(f"`{s}`" for s in valid_suggests)
+                body += f"\n\n---\nRelated skills (load if needed): {hints}"
+
+        _loading_stack.discard(name)
 
         param_defs = meta.get("parameters", [])
         if isinstance(param_defs, list):
@@ -78,6 +120,19 @@ class SkillManager:
             body = body.replace(f"{{{k}}}", str(v))
 
         return f"<skill name=\"{skill_name}\">\n{body}\n</skill>"
+
+    def load_summary(self, name: str) -> str | None:
+        """Load SUMMARY.md for a skill if it exists. Returns None if no summary available."""
+        mapping = self._scan()
+        skill_file = mapping.get(name)
+        if skill_file is None:
+            return None
+        skill_dir = os.path.dirname(skill_file)
+        summary_file = os.path.join(skill_dir, "SUMMARY.md")
+        if not os.path.isfile(summary_file):
+            return None
+        with open(summary_file, "r", encoding="utf-8") as f:
+            return f.read()
 
     def _parse_file(self, path: str) -> Tuple[dict, str]:
         """Read a SKILL.md and split YAML frontmatter from body."""

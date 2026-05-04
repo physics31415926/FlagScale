@@ -27,6 +27,8 @@ keywords:
   - 环境
   - huggingface
   - snapshot_download
+requires: []
+suggests: []
 ---
 
 # Workspace Layout & Storage Management

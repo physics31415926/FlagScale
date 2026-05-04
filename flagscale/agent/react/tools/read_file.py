@@ -9,7 +9,10 @@ class ReadFileTool(Tool):
     name = "read_file"
     description = (
         "Read the contents of a file. Supports line ranges for large files. "
-        "Returns content with line numbers for easy reference."
+        "Returns content with line numbers for easy reference. "
+        "IMPORTANT: Prefer reading the whole file (omit start_line/end_line) over "
+        "fragmented reads. If you need to understand a file, read it once in full. "
+        "Re-reading the same file wastes tokens — save key findings to memory instead."
     )
     parameters = {
         "type": "object",

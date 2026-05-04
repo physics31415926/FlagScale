@@ -26,6 +26,8 @@ parameters:
   - name: nproc_per_node
     description: Number of GPUs per node
     default: "8"
+requires: [train-run]
+suggests: []
 ---
 
 # FlagScale Training Monitor

@@ -34,6 +34,8 @@ parameters:
     description: "Directory to store processed data. Use shared storage for multi-node training."
   - name: tokenizer_dir
     description: "Directory containing tokenizer files. Use shared storage for multi-node training."
+requires: [workspace-layout]
+suggests: [env-setup]
 ---
 
 # Data Preparation for FlagScale
@@ -527,6 +529,70 @@ if 'conversation' in sample:
 - For git clone on large repos, use `--depth 1`
 - If download speed < 500KB/s for a large file, stop and ask user
 - Run large downloads as separate commands, not chained with `&&`
+
+---
+
+## Data Pipeline Comprehension
+
+Before writing any data processing code (TaskEncoder, preprocessing scripts, dataset classes, data config), you must trace the full data pipeline for the target model. This is not a checklist — it is a thinking framework. The goal is to understand the chain from raw data to model input so that your code is correct on the first attempt.
+
+### The Three-Link Chain
+
+Every training data pipeline has three links. You must understand all three before writing code:
+
+```
+Source Format                Processing Operations           Model Input Interface
+─────────────                ────────────────────           ─────────────────────
+What does the raw data       What transformations           How does the training
+look like? File format,      happen? Tokenization,          loop consume data?
+schema, fields, modalities.  image processing, padding,     get_batch signature,
+                             label masking, special          tensor shapes, dtypes,
+                             tokens, sequence packing.       batch collation.
+```
+
+### How to Trace the Chain
+
+1. **Source Format** — Read the raw data files or their documentation. Identify:
+   - File format (JSONL, WebDataset tar, parquet, custom binary)
+   - Schema: what fields exist, what types, what modalities (text, image paths, video, state/action)
+   - Sample count and size characteristics
+   - Any special conventions (placeholder tokens like `<image>`, conversation format like ChatML)
+
+2. **Processing Operations** — Read the preprocessing/encoding code. Identify:
+   - Tokenizer: which one, special tokens, chat template
+   - Visual processing: resize, normalize, frame sampling for video
+   - Label construction: which tokens are masked (IGNORE_IDX = -100), loss mask logic
+   - Sequence construction: how multi-turn conversations become a single sequence
+   - Packing: whether multiple samples are packed into one sequence
+
+3. **Model Input Interface** — Read the training script's `get_batch` or equivalent. Identify:
+   - What keys the model's `forward()` expects
+   - Tensor shapes and dtypes for each input
+   - How visual tokens are interleaved with text tokens
+   - Batch collation: padding strategy, attention mask construction
+
+### Persist Your Understanding
+
+After tracing the chain, write a concise summary to memory covering:
+- Source format and key fields
+- Critical transformations (especially non-obvious ones like label masking rules or special token insertion)
+- Model input tensor shapes and the mapping from data fields to model inputs
+
+This persistence serves two purposes: (1) the engineering gate clears, allowing you to write code, and (2) future sessions can pick up without re-reading everything.
+
+### When This Applies
+
+This framework applies whenever you are about to write or modify:
+- TaskEncoder or encode_sample implementations
+- Data preprocessing scripts
+- Dataset class definitions
+- Data configuration files that affect how data is loaded or processed
+- Training script data loading (get_batch, data_provider)
+
+It does NOT apply to:
+- Downloading or copying data files
+- Simple config changes (paths, weights)
+- Running existing preprocessing commands with known parameters
 
 ---
 

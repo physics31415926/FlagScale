@@ -27,6 +27,8 @@ parameters:
     description: Model name for config directory (e.g., qwen3, llama3)
   - name: model_size
     description: Model size variant (e.g., 0_6b, 7b, 70b)
+requires: [workspace-layout]
+suggests: [topo-detect]
 ---
 
 # FlagScale Training Configuration

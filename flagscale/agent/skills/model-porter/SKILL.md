@@ -24,6 +24,8 @@ parameters:
     default: huggingface
   - name: model_name
     description: "Name for the ported model (used in directory names)"
+requires: [env-setup, train-config, data-prep, train-run]
+suggests: [topo-detect, parallel-strategy, precision-alignment]
 ---
 
 # Model Porter
@@ -136,6 +138,29 @@ Key questions to answer:
 
 If the data pipeline is incompatible, plan the adapter BEFORE writing the training script — not after discovering the mismatch during implementation.
 
+### Persist analysis before coding (MANDATORY)
+
+After completing the analyses above, you MUST save the results before writing any porting code. The reading depth gate will block porting code writes until analysis is persisted.
+
+```
+workspace_experiment create:
+  name: "<model>_porting_analysis"
+  purpose: "Architecture analysis for <model> → Megatron-LM-FL porting"
+  hypothesis: "<one-line porting strategy>"
+  config:
+    source_model: "<HF model id or paper>"
+    target_base: "<Megatron model class>"
+    parallelism: "TP=<N>, PP=<N>"
+  dir: "<experiment directory>"
+
+memory_write:
+  key: "<model>_component_map"
+  type: "finding"
+  content: "<full component mapping table from Analysis 1>"
+```
+
+This ensures the next session can load the analysis directly instead of re-reading 20+ source files. Without this step, every new session wastes millions of tokens re-deriving the same architecture understanding.
+
 ### Verify runtime state, not config declarations
 
 Config objects and code structure can be misleading about what actually happens at runtime. Before writing any conversion or splitting code, verify these by instantiation (on meta device or with tiny shapes):
@@ -176,6 +201,28 @@ When writing new model code, checkpoint conversion, or training scripts, add pri
 - **Forward pass**: print shape and dtype at every component boundary (encoder output, connector output, LLM input, etc.)
 - **Checkpoint loading**: print key counts (loaded, missing, unexpected), sample key names and shapes
 - **Config resolution**: print final values of critical parameters after all transformations (vocab_size after padding, ffn_hidden_size after gating, per-rank shapes after TP split)
+
+### Checkpoint key schema verification (MANDATORY)
+
+After writing BOTH the model code AND the checkpoint converter, run a key comparison script BEFORE attempting any forward pass. This catches naming mismatches early:
+
+```python
+# Print model state_dict keys
+for k in sorted(model.state_dict().keys()):
+    print(f"MODEL: {k}  {model.state_dict()[k].shape}")
+# Print checkpoint keys
+for k in sorted(ckpt.keys()):
+    print(f"CKPT:  {k}  {ckpt[k].shape}")
+```
+
+Common mismatches to check:
+- Prefix differences (`model.layers.` vs `decoder.layers.`)
+- Component naming (`connector.fc1` vs `connector.mlp.0`)
+- Bias presence (model expects bias but checkpoint has none, or vice versa)
+- Extra state keys (`_extra_state` from ColumnParallelLinear)
+- Output layer naming (`lm_head` vs `output_layer`)
+
+Fix ALL mismatches before running the forward pass. The converter and model must agree on a single key schema — define it once, implement it in both places.
 
 The goal is to get a complete diagnostic picture on the FIRST run, whether it succeeds or fails. Without these prints, a crash gives you only a traceback — with them, you see exactly where shapes, dtypes, or keys diverged from expectations. This eliminates the crash → guess → add print → rerun → crash cycle that wastes multiple GPU-minutes per iteration.
 
@@ -250,11 +297,66 @@ TE's `DotProductAttention` with `attn_mask_type="causal"` IGNORES any custom att
 
 ## Overview
 
-FlagScale supports models in two modes:
+FlagScale supports models in three modes:
 
 **Mode A — Config-driven** (most LLMs): Architecture expressed entirely through YAML parameters. Uses `train_gpt.py` → `gpt_builder()` → `GPTModel`. No model code needed.
 
-**Mode B — Custom entrypoint** (non-standard architectures): Requires a dedicated `train_*.py`. Needed for RWKV, VL models, robotics models, or any architecture with components not in Megatron-LM-FL.
+**Mode B — Megatron Native** (non-standard architectures, production-scale): Full native implementation in Megatron-LM-FL. Requires dedicated `train_*.py`, custom model spec, and checkpoint conversion. Unlocks all parallelism modes (TP/PP/DP/EP/CP/SP), fused kernels, TransformerEngine-FL, and FP8.
+
+**Mode C — HuggingFace Wrapper** (non-standard architectures, fast path): Wraps existing HuggingFace model via `HuggingFaceModule` (inherits `MegatronModule`), uses FSDP2 for distribution. Gets Megatron training loop (optimizer, logging, checkpointing) with minimal code changes. Limited to FSDP2 parallelism only.
+
+**MANDATORY**: When Mode A does not apply, the agent MUST present Mode B vs Mode C trade-offs to the user and get explicit confirmation before writing any porting code. The user decides the path.
+
+### Mode B vs Mode C Trade-offs
+
+| Aspect | Mode B (Megatron Native) | Mode C (HF Wrapper) |
+|--------|--------------------------|---------------------|
+| Parallelism | TP, PP, DP, EP, CP, SP — full | FSDP2 only (DP-like sharding) |
+| Performance | Best (fused kernels, TE-FL, FP8) | Good (HF kernels, no TE-FL/FP8) |
+| Implementation effort | High (rewrite model in Megatron) | Low (wrap existing HF model) |
+| Maintenance | Tied to Megatron API evolution | Tied to HF transformers updates |
+| Checkpoint compatibility | Megatron format (needs conversion) | HF format (direct load) |
+| Scaling | Proven to 1000+ GPUs | Practical up to ~64 GPUs |
+| Best for | Production training at scale | Quick validation, fine-tuning, small-scale |
+
+### Mode C Reference Implementation
+
+Files in Megatron-LM-FL:
+- `megatron/core/models/huggingface/module.py` — `HuggingFaceModule` base class
+- `megatron/core/models/huggingface/qwen_model.py` — `QwenHuggingFaceModel` (Qwen2 LLM wrapper)
+- `megatron/core/models/huggingface/clip_model.py` — `SiglipHuggingFaceModel` (SigLIP ViT wrapper)
+- `megatron/core/distributed/torch_fully_sharded_data_parallel.py` — FSDP2 integration
+
+Pattern:
+1. Subclass `HuggingFaceModule`
+2. Set `_fsdp_modules = [LayerClass]` for sharding granularity
+3. Load HF model in `__init__` via `from_pretrained` or manual assembly
+4. Implement `forward()` matching Megatron's expected interface
+5. Training script uses same pattern as Mode B: `model_provider`, `forward_step`, `get_batch`
+
+Existing example: LLaVA OneVision (`flagscale/train/megatron/train_llava_onevision.py`) uses HF wrapper for both Qwen LLM and SigLIP ViT components.
+
+### Artifact Naming Convention
+
+Mode C (HF Wrapper) artifacts MUST use the `_hf_fsdp2` suffix to distinguish from Mode B (native) artifacts:
+
+| Artifact | Mode B (Native) | Mode C (HF Wrapper) |
+|----------|-----------------|---------------------|
+| Training script | `train_<model>.py` | `train_<model>_hf_fsdp2.py` |
+| Model wrapper | `<model>_model.py` | `<model>_model_hf_fsdp2.py` |
+| Config YAML | `examples/<model>/conf/train/7b.yaml` | `examples/<model>/conf/train/7b_hf_fsdp2.yaml` |
+| Experiment dir | `<model>_finetune_v1` | `<model>_finetune_hf_fsdp2_v1` |
+
+This ensures both paths can coexist in the same repo without confusion. When a model has both Mode B and Mode C implementations, the native version has no suffix (it is the canonical form).
+
+### Phased Migration Strategy
+
+Mode C can serve as **Phase 0** before committing to full native port:
+1. Phase 0 (Mode C): Wrap HF model, validate training pipeline works, establish baseline metrics
+2. Phase 1 (Mode B): Implement native Megatron model, verify numerical alignment with Phase 0
+3. Phase 2: Scale up with full parallelism
+
+This de-risks the native port by providing a reference implementation for loss comparison.
 
 The skill determines which mode applies, then generates all artifacts.
 
@@ -378,10 +480,17 @@ IF all components are in the supported list above:
   → Mode A (config-driven)
   → entrypoint = flagscale/train/megatron/train_gpt.py
 ELSE:
-  → Mode B (custom entrypoint needed)
-  → List unsupported components
-  → Find closest existing custom entrypoint as reference
+  → Custom components exist — present Mode B vs Mode C to user
+  → List unsupported components and what each mode requires
+  → Find closest existing entrypoint as reference
+  → REQUIRE user to choose before writing any code
 ```
+
+When presenting Mode B vs Mode C, include model-specific analysis:
+- For Mode B: list which custom components need native Megatron implementation, estimate effort
+- For Mode C: confirm the HF model can be wrapped (has `from_pretrained` or manual assembly path), list what parallelism is lost
+- If the model is >30B params or needs multi-node training, recommend Mode B (FSDP2 scaling limits)
+- If the model is <10B and the goal is validation/fine-tuning, Mode C is often sufficient
 
 ### Finding the Closest Baseline
 
@@ -421,9 +530,9 @@ For models where all components are supported:
 3. Confirm entrypoint is `train_gpt.py`
 4. Proceed to Step 4 (checkpoint conversion)
 
-### Mode B: Custom Entrypoint
+### Mode B: Megatron Native
 
-For models with unsupported components:
+For models with unsupported components where the user chose full native implementation:
 
 1. Identify which components need custom implementation
 2. Find the closest existing `train_*.py` as reference
@@ -438,6 +547,8 @@ For models with unsupported components:
 ### Mode B: Phased Migration Plan (Complex Models)
 
 For models with significant architectural gaps (multiple unsupported components, custom attention patterns, multi-modal generation, etc.), a phased migration is required. The agent MUST present a complete plan upfront, organized by the phases below, before implementing any code.
+
+**Note**: Mode C (HuggingFace Wrapper) can serve as Phase 0 — a quick validation path before committing to the full native port. If the user chose Mode C first, the Phase 0 output becomes the reference baseline for Phase 1 alignment.
 
 **Communicate to the user**: FlagScale Agent has the capability to achieve full distributed training optimization for any architecture. The work is phased because training infrastructure is inherently complex — each phase builds on the previous one, and attempting everything at once increases risk without saving time.
 
@@ -519,32 +630,32 @@ Phase 1: Model Structure
   │ LLM backbone (Qwen2)   │ SUPPORTED │ Config only          │
   │ GQA Attention           │ SUPPORTED │ Config only          │
   │ SwiGLU MLP              │ SUPPORTED │ Config only          │
-  │ MoT dual-path layer     │ CUSTOM    │ New TransformerLayer │
-  │ SigLIP ViT              │ ADAPTABLE │ Modify existing ViT  │
-  │ Flow matching / VAE     │ CUSTOM    │ New module           │
-  │ NaViT packed sequence   │ CUSTOM    │ Custom attention mask│
+  │ Vision Encoder (ViT)   │ ADAPTABLE │ Modify existing ViT  │
+  │ Vision-Language Proj   │ CUSTOM    │ New projection layer │
+  │ Multimodal Attention   │ ADAPTABLE │ Extend existing attn │
   └─────────────────────────────────────────────────────────┘
 
   Files to create/modify:
-    - flagscale/train/megatron/train_bagel.py
-    - megatron/core/models/bagel/mot_layer.py
-    - megatron/core/models/bagel/siglip_vit.py
-    - megatron/core/models/bagel/flow_matching.py
-    - tools/checkpoint/bagel/{args,ckpt,convert}.py
+    - flagscale/train/megatron/train_qwen3vl.py
+    - megatron/core/models/qwen3vl/vision_encoder.py
+    - megatron/core/models/qwen3vl/vision_projection.py
+    - tools/checkpoint/qwen3vl/{args,ckpt,convert}.py
+    - tools/datasets/qwenvl/data/dataset_helpers.py
 
 Phase 2: Basic Parallelism
   - DP: standard (no custom work)
-  - TP: MoT layer needs custom sharding logic
+  - TP: Vision encoder and projection need TP-aware sharding
   - Estimated: 1 week after Phase 1
 
 Phase 3: Advanced Parallelism
-  - PP: Define stage boundaries (ViT | LLM layers 0-N | LLM layers N-M + VAE)
-  - EP: If MoE layers present
+  - PP: Define stage boundaries (ViT | LLM layers 0-N | LLM layers N-M)
+  - Data pipeline: Megatron-Energon for multimodal data (WebDataset + TaskEncoder)
   - Estimated: 1-2 weeks after Phase 2
 
 Phase 4: Performance Optimization
-  - FlashAttention for NaViT packed sequences
+  - FlashAttention for vision-language attention
   - FP8 for eligible linear layers
+  - Dynamic resolution support
   - Estimated: 1-2 weeks after Phase 3
 
 FlagScale Agent can execute each phase incrementally.
@@ -987,6 +1098,29 @@ print(f"Real-weight forward OK — loss: {output['loss'].item():.4f}")
 **Gate**: No missing keys (or all missing keys are expected, e.g., optimizer states). Parameter norms are non-zero and reasonable (not identical to random init norms from Tier 2).
 
 **Summary**: Tier 1 catches environment and config errors (seconds). Tier 2 catches code-level bugs in the compute graph (tens of seconds). Tier 3 catches weight mapping errors (minutes). Most debugging happens in Tier 1-2 without ever loading a checkpoint.
+
+---
+
+### Verification Ladder (MANDATORY — Engineering Enforced)
+
+The agent enforces incremental verification via a state machine. You CANNOT launch full training until all prior stages pass. The stages are:
+
+| Stage | What to do | How the gate advances |
+|-------|-----------|----------------------|
+| `analysis` | Complete source/target analysis, persist to workspace | Automatically set when analysis is persisted |
+| `init_ok` | Run `python -c 'from <module> import <Model>; m = <Model>(cfg); print("init OK")'` | Detected when model init script succeeds |
+| `forward_aligned` | Run 1 forward pass, compare output/loss with HF reference | Detected when forward/compare script succeeds |
+| `backward_ok` | Run `--train-iters 1` dry-run, check no crash | Detected when quick-test training succeeds |
+| `distributed_ok` | Run 2 steps at target TP/PP (TP>1), check no hang | Detected when distributed quick-test succeeds |
+| `full_training` | All stages passed, safe to launch | Unlocked after distributed_ok |
+
+If the automatic detection doesn't advance the stage (e.g., your script name doesn't match the pattern), you can manually advance by writing `verification_stage: <stage_name>` in a `workspace_experiment` update.
+
+Each stage catches different failure classes:
+- `init_ok`: import errors, config mismatches, missing dependencies
+- `forward_aligned`: shape errors, wrong attention implementation, broken projections
+- `backward_ok`: gradient computation errors, non-differentiable ops, memory issues
+- `distributed_ok`: NCCL hangs, TP split errors, PP stage assignment bugs
 
 ---
 

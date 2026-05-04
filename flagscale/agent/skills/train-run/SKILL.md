@@ -24,6 +24,8 @@ parameters:
     description: Model name (e.g., qwen3, llama3)
   - name: exp_dir
     description: Experiment output directory
+requires: [workspace-layout]
+suggests: [env-setup, data-prep]
 ---
 
 # FlagScale Training Launch
@@ -222,7 +224,67 @@ per_gpu_memory = model_params × 2 (bf16) + gradients × 2 + optimizer_states ×
 ```
 If this exceeds GPU memory, do NOT launch — fix parallelism or enable activation checkpointing first.
 
-**Only after ALL checks pass (3a through 3h), proceed to start training.**
+### 3i. Data Pipeline Standalone Test — HARD GATE
+
+**Do NOT launch training without verifying the data pipeline independently.**
+
+This catches: path mismatches, format errors, infinite loops, missing files, wrong tokenization — all in seconds instead of the 10+ minutes of model loading.
+
+```bash
+python -c "
+import sys, time
+sys.path.insert(0, '.')
+# Import the dataset class used in training config
+from <dataset_module> import <DatasetClass>
+
+# Instantiate with the SAME args as training config
+ds = <DatasetClass>(<args_from_config>)
+print(f'Dataset length: {len(ds)}')
+
+# Fetch 3 batches, with timeout
+for i in range(3):
+    t0 = time.time()
+    batch = ds[i]
+    elapsed = time.time() - t0
+    if isinstance(batch, dict):
+        shapes = {k: v.shape if hasattr(v, 'shape') else type(v).__name__ for k, v in batch.items()}
+    else:
+        shapes = batch.shape if hasattr(batch, 'shape') else type(batch).__name__
+    print(f'Batch {i}: {shapes} ({elapsed:.2f}s)')
+    if elapsed > 10:
+        print(f'WARNING: batch {i} took {elapsed:.1f}s — possible infinite loop or I/O issue')
+        break
+print('Data pipeline OK')
+"
+```
+
+If this script hangs, crashes, or shows unexpected shapes, fix the data pipeline BEFORE launching training.
+
+### 3j. Checkpoint Loading Verification
+
+If loading a pretrained checkpoint (not training from scratch), verify it actually loaded by checking step-0 loss.
+
+After the dry-run (3e) completes 2 iterations:
+1. Check the loss at iteration 0
+2. Compare with `ln(vocab_size)` — the expected loss for random initialization
+
+```bash
+# Extract step-0 loss from training log
+grep -m1 "lm loss" <log_file>
+python -c "import math; print(f'Random init baseline: {math.log(<vocab_size>):.2f}')"
+```
+
+**Decision rule**:
+- Loss ≈ ln(vocab_size) → checkpoint did NOT load. Model is randomly initialized. STOP and debug.
+- Loss << ln(vocab_size) → checkpoint loaded successfully. Proceed.
+
+Common causes of checkpoint not loading:
+- Conversion code exists but isn't called in the training script
+- `--load` path is wrong or points to empty directory
+- TP/PP mismatch between checkpoint and config (silent fallback to random init)
+- `--finetune` flag missing (Megatron skips optimizer state but still needs the flag to load weights in some modes)
+
+**Only after ALL checks pass (3a through 3j), proceed to start training.**
 
 ---
 
@@ -230,7 +292,7 @@ If this exceeds GPU memory, do NOT launch — fix parallelism or enable activati
 
 **ALWAYS use FlagScale Launcher** — never bypass it with raw `torchrun` or hand-written launch scripts. The launcher provides per-rank log separation, experiment directory structure, config validation, and clean shutdown (`--stop`). Without it, all ranks write to one stream (debug prints get lost or interleaved), there's no experiment directory structure, and you can't use `--stop`. If the launcher fails, fix the root cause — do not work around it.
 
-**Exception — third-party reproduction tasks**: When reproducing a third-party model's training (e.g., Bagel, LLaVA) using their own training scripts before migrating to FlagScale, use their native launch method (typically `torchrun` + their training script). The FlagScale launcher doesn't apply here. However, ALL other rules in this skill still apply: experiment registry, preflight checks, data validation, post-launch monitoring, and health checks. The only difference is the launch command itself.
+**Exception — third-party reproduction tasks**: When reproducing a third-party model's training (e.g., LLaVA-OneVision, Qwen-VL) using their own training scripts before migrating to FlagScale, use their native launch method (typically `torchrun` + their training script). The FlagScale launcher doesn't apply here. However, ALL other rules in this skill still apply: experiment registry, preflight checks, data validation, post-launch monitoring, and health checks. The only difference is the launch command itself.
 
 **IMPORTANT**: Always set `PYTHONUNBUFFERED=1` before launching training. Without it, Python buffers stdout and training logs appear delayed or empty, making health monitoring unreliable.
 
@@ -255,7 +317,7 @@ After launching training, follow this sequence EVERY time. Do NOT skip steps.
 
 **Before launch — HARD GATE: register the experiment and create its directory:**
 
-0a. Create a DEDICATED experiment directory for this run. Never reuse a directory from a previous experiment. Naming convention: `<model>_<config>_<purpose>_v<N>` (e.g., `bagel_tp4_pp1_reproduce_v1`).
+0a. Create a DEDICATED experiment directory for this run. Never reuse a directory from a previous experiment. Naming convention: `<model>_<config>_<purpose>_v<N>` (e.g., `qwen3_tp4_pp1_pretrain_v1`).
 
 **Version bumping rule — what counts as a new experiment:**
 - Produced at least 1 step of metrics → real experiment. Next meaningful change → bump version.

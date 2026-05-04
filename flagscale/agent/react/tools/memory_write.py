@@ -10,14 +10,23 @@ class MemoryWriteTool(Tool):
         "Use to record important discoveries, choices made, or pending work "
         "so the agent remembers them across conversations. "
         "Writing the same key updates the existing entry. "
-        "Prioritize recording: env quirks and tool incompatibilities (e.g., 'bagel env does not support --no-banner'), "
+        "Use 'supersedes' to delete old entries that this new one replaces. "
+        "Entries are automatically associated with the current task from workspace current.yaml. "
+        "Prioritize recording: env quirks and tool incompatibilities, "
         "file/weight/env paths, version constraints, framework-specific gotchas, "
         "numerical results (loss, throughput), workarounds that took trial-and-error to find, "
         "and anything hard to re-derive. "
         "PROACTIVE RULE: after any unexpected failure that required a workaround, "
         "immediately memorize it if a future session could hit the same issue. "
-        "Do NOT use memory for: experiment records (use workspace_state Experiments section), "
-        "current session state (use workspace_state), or information easily re-read from files/configs."
+        "SUPERSEDE RULE: when new information contradicts, completes, or replaces older memories, "
+        "use 'supersedes' to list the old key(s) to delete. This applies to ALL memory types:\n"
+        "  - finding: new analysis contradicts old conclusion\n"
+        "  - decision: choice was reversed or refined\n"
+        "  - todo: task completed, abandoned, or superseded by new approach\n"
+        "  - context: background info became outdated\n"
+        "Keeping stale memories misleads future sessions. When in doubt, supersede. "
+        "Do NOT use memory for: experiment records (use workspace_experiment), "
+        "current session state (use workspace_current), or information easily re-read from files/configs."
     )
     parameters = {
         "type": "object",
@@ -35,20 +44,41 @@ class MemoryWriteTool(Tool):
                 "type": "string",
                 "description": "The memory content. Be clear and specific — include the exact error, flag, or version number so future sessions can act on it directly.",
             },
+            "supersedes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of old memory keys that this entry replaces. Those entries will be deleted.",
+            },
         },
         "required": ["key", "type", "content"],
     }
 
-    def __init__(self, memory, session_id: str = ""):
+    def __init__(self, memory, session_id: str = "", workspace_manager=None):
         self._memory = memory
         self._session_id = session_id
+        self._workspace_manager = workspace_manager
+
+    def _get_current_task(self) -> str:
+        if self._workspace_manager:
+            return self._workspace_manager.get_current_task()
+        return ""
 
     def execute(self, **kwargs) -> str:
         key = kwargs["key"]
         mem_type = kwargs["type"]
         content = kwargs["content"]
+        supersedes = kwargs.get("supersedes", [])
+        task = self._get_current_task()
         try:
-            self._memory.put(key, mem_type, content, self._session_id)
-            return f"Memorized [{mem_type}] '{key}' ({len(content)} chars)."
+            # Delete superseded entries first
+            deleted = []
+            for old_key in supersedes:
+                if self._memory.delete(old_key):
+                    deleted.append(old_key)
+
+            self._memory.put(key, mem_type, content, self._session_id, task=task)
+            task_info = f" [task: {task}]" if task else ""
+            supersede_info = f" Superseded: {', '.join(deleted)}." if deleted else ""
+            return f"Memorized [{mem_type}] '{key}' ({len(content)} chars).{task_info}{supersede_info}"
         except Exception as e:
             return f"ERROR: Failed to save memory: {e}"

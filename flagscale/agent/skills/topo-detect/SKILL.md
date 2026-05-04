@@ -21,6 +21,8 @@ parameters:
   - name: output_path
     description: Path to write YAML topology report
     default: ./topo_report.yaml
+requires: []
+suggests: []
 ---
 
 # Hardware Topology Detection (Single Node)

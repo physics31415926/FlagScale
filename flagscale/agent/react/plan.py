@@ -112,6 +112,18 @@ class TaskPlan:
             raise ValueError(f"Invalid status: {status}")
 
         step = self._find_step(plan, step_id)
+
+        # Plan Phase Gate: block completion if notes contain deferred work markers
+        if status == "done":
+            check_notes = notes or step.get("notes", "")
+            _DEFERRED_MARKERS = ("todo", "deferred", "skipped", "pending", "later", "not yet", "tbd")
+            found = [m for m in _DEFERRED_MARKERS if m in check_notes.lower()]
+            if found:
+                raise ValueError(
+                    f"Step {step_id} has unfinished markers ({', '.join(found)}) in notes. "
+                    f"Move deferred work to a new step with add_steps, or remove the markers."
+                )
+
         step["status"] = status
         if notes:
             step["notes"] = notes

@@ -25,7 +25,9 @@ COMPACTION_NOTICE = (
 
 MAX_SUMMARY_TOKENS = 2000
 TRUNCATE_THRESHOLD = 2000
-KEEP_RECENT = 20
+KEEP_RECENT = 12  # Reduced from 20 to limit recent message token consumption
+AGING_WINDOW = 10
+AGING_THRESHOLD = 800
 
 
 def _estimate_tokens(text: str) -> int:
@@ -33,6 +35,67 @@ def _estimate_tokens(text: str) -> int:
     cjk = sum(1 for c in text if '一' <= c <= '鿿' or '　' <= c <= '〿' or '가' <= c <= '힯' or '぀' <= c <= 'ヿ')
     ascii_chars = len(text) - cjk
     return ascii_chars // 4 + int(cjk * 1.5) + 1
+
+
+def _smart_truncate(content: str, max_chars: int = 600) -> str:
+    """Truncate preserving structure: first lines + error tail + summary."""
+    if len(content) <= max_chars:
+        return content
+    lines = content.splitlines()
+
+    error_tail = _extract_error_tail(content, max_chars=400)
+    if error_tail:
+        head = "\n".join(lines[:3])
+        return f"{head}\n[... {len(lines)} lines, {len(content)} chars ...]\n{error_tail}"
+
+    if len(lines) > 15:
+        head = "\n".join(lines[:5])
+        tail = "\n".join(lines[-5:])
+        return f"{head}\n[... {len(lines) - 10} lines omitted, {len(content)} chars total ...]\n{tail}"
+
+    return content[:max_chars] + f"\n[... truncated, {len(content)} chars total]"
+
+
+def _age_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Truncate a single message's tool results if they're large."""
+    content = msg.get("content", "")
+
+    if isinstance(content, str) and len(content) > AGING_THRESHOLD:
+        if msg.get("role") == "tool":
+            return {**msg, "content": _smart_truncate(content)}
+
+    if isinstance(content, list):
+        new_blocks = []
+        changed = False
+        for block in content:
+            if (isinstance(block, dict) and block.get("type") == "tool_result"
+                    and isinstance(block.get("content", ""), str)
+                    and len(block["content"]) > AGING_THRESHOLD):
+                new_blocks.append({**block, "content": _smart_truncate(block["content"])})
+                changed = True
+            else:
+                new_blocks.append(block)
+        if changed:
+            return {**msg, "content": new_blocks}
+
+    return msg
+
+
+def _age_tool_results(messages: List[Dict[str, Any]], keep_recent: int = AGING_WINDOW) -> List[Dict[str, Any]]:
+    """Proactively truncate old tool results to save context budget."""
+    if len(messages) <= keep_recent:
+        return messages
+    cutoff = len(messages) - keep_recent
+    result = []
+    for i, msg in enumerate(messages):
+        if i >= cutoff:
+            result.append(msg)
+            continue
+        if msg.get("role") == "system":
+            result.append(msg)
+            continue
+        result.append(_age_message(msg))
+    return result
 
 
 def _message_tokens(msg: Dict[str, Any]) -> int:
@@ -117,6 +180,7 @@ class HistoryManager:
         self._last_compacted_from = None
         self._last_compacted_to = None
         self._actual_input_tokens = None
+        self._last_inflation_ratio = 1.0  # Preserve inflation ratio across compactions
         self._summarizer: Optional[Callable[[str], str]] = None
         self._accumulated_summary: str = ""
         self._compaction_happened = False
@@ -152,6 +216,84 @@ class HistoryManager:
         idx = min(self._compaction_count - 1, len(self._COMPACTION_RATIOS) - 1)
         return self._COMPACTION_RATIOS[idx]
 
+    def get_context_pressure(self) -> float:
+        """Return current context usage as a ratio (0.0 to 1.0+)."""
+        if self.max_context_tokens <= 0:
+            return 0.0
+        estimated = sum(_message_tokens(m) for m in self._messages)
+        actual = self._actual_input_tokens or 0
+        total = max(estimated, actual)
+        return total / self.max_context_tokens
+
+    def _get_inflation_ratio(self) -> float:
+        """Return ratio of actual API tokens to local estimate.
+
+        When the API reports actual_input_tokens, local estimates can be off
+        by 1.5-2x.  This ratio lets compaction target a *local-estimate*
+        budget that, after inflation, lands at the real target.
+
+        Falls back to last known ratio if actual_input_tokens is not available.
+        """
+        estimated = sum(_message_tokens(m) for m in self._messages)
+        actual = self._actual_input_tokens or 0
+        if actual > 0 and estimated > 0:
+            ratio = max(actual / estimated, 1.0)
+            self._last_inflation_ratio = ratio  # Remember for future use
+            return ratio
+        return self._last_inflation_ratio  # Use last known ratio as fallback
+
+    def force_compact(self, target_ratio: float = 0.50) -> bool:
+        """Force compaction to a target ratio. Returns True if compaction occurred."""
+        estimated = sum(_message_tokens(m) for m in self._messages)
+        actual = self._actual_input_tokens or 0
+        current = max(estimated, actual)
+        inflation = self._get_inflation_ratio()
+
+        # Target in *real* tokens, then deflate to local-estimate space
+        real_target = int(self.max_context_tokens * target_ratio)
+        local_target = int(real_target / inflation)
+
+        if current <= real_target:
+            return False
+
+        logger.warning(
+            "Force compact: estimated=%d, actual=%d, inflation=%.2f, "
+            "real_target=%d, local_target=%d",
+            estimated, actual, inflation, real_target, local_target,
+        )
+
+        keep_recent = min(KEEP_RECENT, max(len(self._messages) - 2, 1))
+        result = []
+        for i, msg in enumerate(self._messages):
+            is_recent = (i >= len(self._messages) - keep_recent)
+            if msg.get("role") == "system":
+                result.append(msg)
+            elif is_recent:
+                result.append(msg)
+            else:
+                result.append(_truncate_message(msg))
+
+        new_estimated = sum(_message_tokens(m) for m in result)
+        if new_estimated > local_target:
+            to_drop, to_keep = _collect_droppable(result, local_target)
+            if to_drop and self._summarizer:
+                summary_text = self._build_summary_input(to_drop)
+                try:
+                    new_summary = self._summarizer(summary_text)
+                    self._merge_summary(new_summary)
+                except Exception as e:
+                    logger.warning("Summarizer failed during force compact: %s", e)
+            result = to_keep
+
+        result = self._inject_summary(result)
+        self._messages = result
+        # Keep _actual_input_tokens to preserve inflation ratio memory
+        self._compaction_count += 1
+        final_estimated = sum(_message_tokens(m) for m in self._messages)
+        logger.info("Force compact done: %d -> %d estimated tokens (≈%d real)",
+                    estimated, final_estimated, int(final_estimated * inflation))
+        return True
+
     def append(self, message: Dict[str, Any]):
         self._messages.append(message)
         self._full_log.append(message)
@@ -162,24 +304,28 @@ class HistoryManager:
 
     def get_messages(self) -> List[Dict[str, Any]]:
         """Return messages, compacting with LLM summary if over budget."""
+        self._messages = _age_tool_results(self._messages, keep_recent=AGING_WINDOW)
         estimated = sum(_message_tokens(m) for m in self._messages)
-        total = max(estimated, self._actual_input_tokens or 0)
+        actual = self._actual_input_tokens or 0
+        total = max(estimated, actual)
+        inflation = self._get_inflation_ratio()
         self._last_compacted_from = None
         self._last_compacted_to = None
         self._compaction_happened = False
         if total <= self.max_context_tokens:
             return _validate_tool_pairs(list(self._messages))
 
-        logger.info("History exceeds budget (estimated=%d, actual=%s, limit=%d), compacting",
-                     estimated, self._actual_input_tokens, self.max_context_tokens)
+        logger.info("History exceeds budget (estimated=%d, actual=%d, inflation=%.2f, limit=%d), compacting",
+                     estimated, actual, inflation, self.max_context_tokens)
         original_total = total
 
         # Dynamic target: compress harder each successive time
         ratio_idx = min(self._compaction_count, len(self._COMPACTION_RATIOS) - 1)
         ratio = self._COMPACTION_RATIOS[ratio_idx]
-        target_budget = int(self.max_context_tokens * ratio)
-        logger.info("Compaction #%d, target ratio=%.0f%%, budget=%d tokens",
-                     self._compaction_count + 1, ratio * 100, target_budget)
+        real_target = int(self.max_context_tokens * ratio)
+        local_target = int(real_target / inflation)
+        logger.info("Compaction #%d, target ratio=%.0f%%, real_budget=%d, local_budget=%d",
+                     self._compaction_count + 1, ratio * 100, real_target, local_target)
 
         keep_recent = min(KEEP_RECENT, max(len(self._messages) - 2, 1))
 
@@ -197,9 +343,10 @@ class HistoryManager:
         new_estimated = sum(_message_tokens(m) for m in result)
 
         # Step 2: if still over target, collect messages to drop and summarize them
-        if new_estimated > target_budget:
-            logger.info("Still over target after truncation (%d tokens), summarizing and dropping", new_estimated)
-            to_drop, to_keep = _collect_droppable(result, target_budget)
+        if new_estimated > local_target:
+            logger.info("Still over target after truncation (%d tokens, local_target=%d), summarizing and dropping",
+                        new_estimated, local_target)
+            to_drop, to_keep = _collect_droppable(result, local_target)
 
             if to_drop and self._summarizer:
                 summary_text = self._build_summary_input(to_drop)
@@ -215,11 +362,21 @@ class HistoryManager:
         # Step 3: inject accumulated summary after system message
         result = self._inject_summary(result)
 
+        # Step 4: hard ceiling — if still over budget, aggressively truncate recent messages
         new_estimated = sum(_message_tokens(m) for m in result)
-        logger.info("After compaction #%d (ratio=%.0f%%): %d -> %d estimated tokens",
-                     self._compaction_count + 1, ratio * 100, estimated, new_estimated)
+        if new_estimated > local_target:
+            logger.warning(
+                "Hard ceiling: still %d tokens after drop (local_target=%d), truncating recent",
+                new_estimated, local_target,
+            )
+            result = self._hard_ceiling_truncate(result, local_target)
+
+        new_estimated = sum(_message_tokens(m) for m in result)
+        logger.info("After compaction #%d (ratio=%.0f%%): %d -> %d estimated (≈%d real)",
+                     self._compaction_count + 1, ratio * 100, estimated, new_estimated,
+                     int(new_estimated * inflation))
         self._messages = result
-        self._actual_input_tokens = None
+        # Keep _actual_input_tokens to preserve inflation ratio memory
         self._last_compacted_from = original_total
         self._last_compacted_to = new_estimated
         self._compaction_happened = True
@@ -281,6 +438,42 @@ class HistoryManager:
 
         return result
 
+    def _hard_ceiling_truncate(self, messages: List[Dict[str, Any]], local_target: int) -> List[Dict[str, Any]]:
+        """Emergency truncation when normal compaction fails to reach target.
+
+        Keeps system/summary messages at the front, then fills from the most
+        recent messages backward with aggressive truncation.
+        """
+        head = []
+        body = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            is_summary = isinstance(content, str) and content.startswith("<context-summary>")
+            if role == "system" or is_summary:
+                head.append(msg)
+            else:
+                body.append(msg)
+
+        head_tokens = sum(_message_tokens(m) for m in head)
+        budget = local_target - head_tokens
+
+        kept = []
+        used = 0
+        for msg in reversed(body):
+            truncated = _truncate_message(msg, max_chars=400)
+            t = _message_tokens(truncated)
+            if used + t > budget:
+                break
+            kept.append(truncated)
+            used += t
+
+        kept.reverse()
+        result = head + kept
+        logger.warning("Hard ceiling kept %d/%d messages, %d tokens",
+                      len(result), len(messages), head_tokens + used)
+        return result
+
     def clear(self):
         self._messages.clear()
         self._full_log.clear()
@@ -304,12 +497,12 @@ def _extract_error_tail(content: str, max_chars: int = 1500) -> str:
     return ""
 
 
-def _truncate_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+def _truncate_message(msg: Dict[str, Any], max_chars: int = TRUNCATE_THRESHOLD) -> Dict[str, Any]:
     """Replace long content in tool results with a summary placeholder.
     Preserves error/traceback content to avoid losing diagnostic information."""
     content = msg.get("content", "")
 
-    if isinstance(content, str) and len(content) > TRUNCATE_THRESHOLD:
+    if isinstance(content, str) and len(content) > max_chars:
         role = msg.get("role", "")
         if role == "tool":
             error_tail = _extract_error_tail(content)
@@ -322,7 +515,7 @@ def _truncate_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 inner = block.get("content", "")
-                if isinstance(inner, str) and len(inner) > TRUNCATE_THRESHOLD:
+                if isinstance(inner, str) and len(inner) > max_chars:
                     error_tail = _extract_error_tail(inner)
                     if error_tail:
                         new_blocks.append({**block, "content": f"[truncated tool result, {len(inner)} chars. Error preserved:]\n{error_tail}"})
@@ -335,6 +528,15 @@ def _truncate_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         return {**msg, "content": new_blocks}
 
     return msg
+
+
+def _merge_user_messages(msg1: Dict[str, Any], msg2: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge two user messages into one, handling both string and list content."""
+    c1 = msg1.get("content", "")
+    c2 = msg2.get("content", "")
+    blocks1 = c1 if isinstance(c1, list) else [{"type": "text", "text": c1}]
+    blocks2 = c2 if isinstance(c2, list) else [{"type": "text", "text": c2}]
+    return {"role": "user", "content": blocks1 + blocks2}
 
 
 def _validate_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -352,6 +554,16 @@ def _validate_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 result.pop(i)
                 continue
         i += 1
+
+    # Merge consecutive user messages (Anthropic requires strict role alternation)
+    i = 0
+    while i < len(result) - 1:
+        if result[i].get("role") == "user" and result[i + 1].get("role") == "user":
+            result[i] = _merge_user_messages(result[i], result[i + 1])
+            result.pop(i + 1)
+        else:
+            i += 1
+
     return result
 
 

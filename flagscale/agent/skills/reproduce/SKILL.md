@@ -17,6 +17,8 @@ parameters:
     description: Directory containing the original implementation source code
   - name: output_dir
     description: "Directory for reproduction experiment outputs. Use shared storage for multi-node scenarios."
+requires: [precision-alignment]
+suggests: [env-setup, data-prep]
 ---
 
 # Reproduce Training Results

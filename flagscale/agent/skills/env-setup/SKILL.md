@@ -32,6 +32,8 @@ parameters:
   - name: deps_dir
     description: Directory to clone source dependencies
     default: /opt/flagscale/deps
+requires: []
+suggests: [workspace-layout]
 ---
 
 # FlagScale Training Environment Setup

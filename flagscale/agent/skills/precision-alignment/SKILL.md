@@ -43,6 +43,8 @@ parameters:
     description: "Model name being aligned"
   - name: work_dir
     description: "Working directory for alignment artifacts (dumps, logs, reports). Should be on shared storage for multi-node scenarios."
+requires: []
+suggests: [train-run, train-monitor]
 ---
 
 # Training Precision Alignment
