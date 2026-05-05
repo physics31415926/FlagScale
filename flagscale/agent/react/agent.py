@@ -112,7 +112,7 @@ When you discover something wrong, flag it immediately and fix it if the fix is 
 
 **Fail-fast**: Before operations >30 seconds, do lightweight pre-checks. Load relevant skills for preflight checklists.
 
-**Stop the fix-run-fix loop**: After the SECOND consecutive launch failure, STOP. Do systematic audit of ALL config values, API signatures, checkpoint compatibility, memory estimates. Fix everything at once, then launch.
+**Stop the fix-run-fix loop**: After the SECOND consecutive launch failure of the same error category, STOP. Do systematic audit of ALL config values, API signatures, checkpoint compatibility, memory estimates. Fix everything at once, then launch. Error categories: shape/dimension, import/module, parallelism/NCCL, data pipeline, config. Two strikes in the same category = mandatory pause and root-cause audit.
 
 **7. Infra Expertise**
 You understand GPU training (TP/PP/DP/EP/CP, memory optimization, NCCL, mixed precision), environment management (conda, pip, CUDA), FlagScale specifics (config, launcher, checkpoints, logging), and common failure modes (OOM, NCCL timeouts, dependency conflicts). Use this to make smart defaults and catch problems early.
@@ -188,13 +188,29 @@ List ALL constraints before choosing an approach. Never flip between approaches 
 
 ## Diagnose Root Causes
 
-Maximum 2 fix attempts for the same error. After 2 failures, try a fundamentally different approach. Before applying any fix, state the root cause hypothesis in one sentence — if you can't articulate it, you don't understand the problem.
+Maximum 2 fix attempts for the same error category. After 2 failures, try a fundamentally different approach. Before applying any fix, state the root cause hypothesis in one sentence — if you can't articulate it, you don't understand the problem.
+
+**Failure categories** (same category = same strike counter):
+- Shape/dimension errors (tensor size mismatch, broadcast failure)
+- Import/module errors (ModuleNotFoundError, AttributeError on module)
+- Parallelism errors (NCCL timeout, rank mismatch, hang)
+- Data pipeline errors (wrong batch format, missing keys, dtype mismatch)
+- Config errors (unknown argument, invalid value)
 
 ## Model Porting Tasks
 
 Porting means implementing the model IN Megatron-LM-FL / TransformerEngine-FL to leverage Megatron's parallelism, optimized kernels, and distributed training infrastructure. Wrapping the original model with a launcher is not porting.
 
-Load the `model-porter` skill BEFORE writing any code. It has mandatory gates: source analysis → component diff → memory budget → implementation → three-tier verification.
+Load the `model-porter` skill BEFORE writing any code. It has mandatory gates: source analysis → component diff → memory budget → **data pipeline implementation** → model code → checkpoint conversion → three-tier verification.
+
+**ENVIRONMENT COMPATIBILITY PRE-CHECK** (do this FIRST, before any code):
+FlagScale wraps Megatron-LM-FL, but they can drift out of sync (Megatron-LM-FL updates faster than FlagScale adapts). If you hit import errors, missing APIs, or wrapper incompatibilities:
+1. Check what Megatron-LM-FL version FlagScale expects: look at FlagScale's install docs or setup scripts for the pinned tag/commit.
+2. If current Megatron-LM-FL is from `main` branch and FlagScale hasn't caught up, roll back to the compatible tag: `pip install git+https://github.com/.../Megatron-LM-FL@<tag>`
+3. DECIDE EARLY: use FlagScale wrapper OR direct torchrun. If wrapper is incompatible with current Megatron-LM-FL, direct torchrun is the pragmatic choice — don't spend hours debugging wrapper internals.
+4. Record the decision and version info in workspace_experiment.
+
+**CRITICAL EXECUTION ORDER**: Data pipeline MUST be implemented and verified BEFORE writing training scripts. The order is: get_batch → dataset → model code → training script. Implementing model code first and using synthetic data causes cascading failures that waste hours of debugging. This is the #1 source of migration task failures.
 
 For parallelism selection/debugging, data pipelines under parallelism, attention under TP, or OOM/NCCL/hang issues, load the `parallel-strategy` skill.
 
@@ -217,6 +233,15 @@ For non-trivial components (>50 lines), sketch the design first: class hierarchy
 ## Investigation Discipline
 
 Before reading code for complex tasks, write down specific questions you need answered. Read to answer those questions, not to "understand everything". After reading, summarize what you learned and what questions remain.
+
+**Deep reading over mechanical checklists**: When encountering a problem during migration or implementation, STOP and read the relevant source code deeply:
+1. **Understand the pattern** — read how existing similar code works (e.g., read existing `get_batch` implementations before writing your own)
+2. **Understand the contract** — read the API signatures and docstrings of functions you'll call
+3. **Understand the constraints** — read the validation/parsing code to see what formats and values are expected
+4. **Summarize your understanding** — write down what you learned before implementing
+5. **Then implement** — following the patterns you observed
+
+This approach produces solutions that are **correct by design** rather than correct by trial-and-error. Source code is the ground truth — not static checklists or remembered patterns.
 
 When your design approach changes materially from what you communicated, surface the change and reason before continuing.
 
@@ -273,6 +298,15 @@ Different phases need different approaches:
 
 General rule: if you expect to wait >2 minutes, use single long timeout N tail -f rather than many short queries.
 
+## Auto Mode
+
+When running in auto mode, the system automatically continues to the next turn after each response. To signal your state, end your response with one of these tags on its own line:
+
+- `[TASK_COMPLETE]` — the task is fully done, no more work needed
+- `[NEED_USER_INPUT]` — you need a decision or information from the user before proceeding
+
+If neither tag is present, the system will use an LLM judge to decide whether to continue. Use the tags proactively to avoid unnecessary judge calls.
+
 ## Language
 
 Match the user's language. If the user writes in Chinese, reply in Chinese. If in English, reply in English. Code, commands, and technical terms can stay in English regardless.
@@ -285,7 +319,7 @@ You are FlagScale Agent. NEVER call yourself Claude, GPT, or any other AI name. 
 
 Users can type these slash commands directly (handled by the client, not by you). When users ask about available commands or modes, tell them about these:
 - `/mode confirm` — risky shell commands require user confirmation before execution (default)
-- `/mode auto` — all shell commands execute without confirmation
+- `/mode auto` — fully autonomous: no confirmations, auto-continues between turns until task complete (Ctrl+C to stop)
 - `/memory list` — show all memory entries
 - `/memory clear [type]` — clear memory entries, optionally filtered by type (finding/decision/todo/context)
 - `/memory delete <key>` — delete a specific memory entry
@@ -392,6 +426,8 @@ class ReactAgent:
         self._session_start = time.time()
         self._session_input_tokens = 0
         self._session_output_tokens = 0
+        self._auto_turn_count = 0
+        self._last_write_turn = 0
         self._loaded_skills = set()
         self._interrupted = False
         self._streaming_in_code_block = False
@@ -400,6 +436,8 @@ class ReactAgent:
         self._consecutive_train_failures = 0
         self._last_train_failure_reasons = []
         self._error_pattern_history = []  # Track error patterns for smart escalation
+        self._kill_retry_timestamps = []  # Track kill+relaunch cycles
+        self._training_launch_timestamps = []  # Track all training launches for hang detection
         self._context_pressure_soft_warned = False
         self._context_pressure_hard_warned = False
         self._last_checkpoint_tokens = 0  # For progress checkpoint
@@ -413,6 +451,7 @@ class ReactAgent:
         self._last_tool_had_error = False  # Error-escalation gate: track if last tool errored
         self._root_cause_recorded_since_error = False  # Error-escalation gate: track if root cause recorded
         self._files_read_this_session = set()  # Reading depth gate: track files read
+        self._files_written_this_session = set()  # Track files written for snapshot
         self._porting_mode = False  # Reading depth gate: True after model-porter skill loaded
         self._porting_path_confirmed = False  # Porting path gate: True after user confirms Mode B/C
         self._data_prep_mode = False  # Data pipeline gate: True after data-prep skill loaded
@@ -428,6 +467,16 @@ class ReactAgent:
         # Infinite loop detection — track recent tool calls
         self._recent_tool_calls = []  # [(tool_name, key_args), ...] last 10 calls
         self._tool_call_cache = {}  # {(tool_name, key_args): result} — cache within turn
+        # New gate state (Phase 1-4)
+        self._understanding_verified = False  # A1: True after verification questions answered
+        self._component_plan_created = False  # A3: True after component isolation plan created
+        self._failure_mode_analyzed = False  # B1: True after failure mode analysis done
+        self._sanity_checks_passed = False  # B2: True after 4 sanity checks passed
+        self._config_model_verified = False  # B4: True after config-model consistency verified
+        self._env_verified = False  # C2: True after environment consistency verified
+        self._component_integration_verified = False  # C4: True after per-component verification
+        self._imports_verified = False  # A4: True after critical imports verified
+        self._reference_comparison_planned = False  # A2: True after comparison strategy created
 
         # Now refresh system prompt after all state is initialized
         self._refresh_system_prompt()
@@ -1017,14 +1066,25 @@ Load ops-discipline skill for full diagnosis protocol.
             web_fetch_tool._proxies = self._build_proxies()
 
     def _build_memory_context(self):
-        """Build memory context string from recent memories, with task filtering, staleness warnings, and session review hint."""
+        """Build memory context string from recent memories, with dynamic budget based on context pressure."""
         task = self._workspace_manager.get_current_task()
-        notes = self.session_memory.recent(max_tokens=4000, task_filter=task)
+        # Dynamic budget: reduce memory injection when context is tight
+        pressure = self.history.get_context_pressure()
+        if pressure > 0.7:
+            budget = 1000
+        elif pressure > 0.5:
+            budget = 2000
+        else:
+            budget = 4000
+        notes = self.session_memory.recent(
+            max_tokens=budget, task_filter=task,
+            current_session_id=getattr(self, '_session_id', ''),
+        )
         if not notes:
             return ""
         lines = []
         stale_keys = []
-        stale_threshold = 14 * 86400  # 14 days
+        stale_threshold = 14 * 86400
         now = time.time()
         for n in notes:
             task_tag = f" @{n.get('task', '')}" if n.get("task") else ""
@@ -1169,36 +1229,12 @@ Load ops-discipline skill for full diagnosis protocol.
 
         plan_context = plan_context + complexity_hint if complexity_hint else plan_context
 
-        # Session resume gate: remind agent to load workspace state on new session or post-compaction
+        # Session resume gate: use snapshot (preferred) or current.yaml for recovery
         resume_hint = ""
         compaction_count = getattr(self.history, 'compaction_count', 0)
         if self._turn_count <= 1 or compaction_count > self._last_compaction_count:
             self._last_compaction_count = compaction_count
-            try:
-                current = self._workspace_manager.read_current()
-            except Exception:
-                current = None
-            if current:
-                task = current.get("task", "")
-                status = current.get("status", "")
-                if isinstance(task, dict):
-                    status = task.get("status", status)
-                    task_name = task.get("name", str(task))
-                else:
-                    task_name = str(task) if task else "unknown"
-                if status and status not in ("completed", "abandoned", ""):
-                    experiment = current.get("experiment", current.get("current_experiment", ""))
-                    if isinstance(experiment, dict):
-                        exp_name = experiment.get("name", "")
-                    else:
-                        exp_name = str(experiment) if experiment else ""
-                    resume_hint = (
-                        f"\n<system-hint>[SESSION RESUME] Previous work detected:\n"
-                        f"  Task: {task_name} (status: {status})\n"
-                        f"  Experiment: {exp_name}\n"
-                        f"Run workspace_current to load full state. "
-                        f"Check memory for findings. Do NOT re-read already-analyzed files.</system-hint>\n"
-                    )
+            resume_hint = self._format_snapshot_as_resume()
         if resume_hint:
             plan_context = plan_context + resume_hint if plan_context else resume_hint
 
@@ -1249,7 +1285,7 @@ Load ops-discipline skill for full diagnosis protocol.
             print(f"Current mode: {self.config.mode}")
             print("Usage: /mode confirm | /mode auto")
             print("  confirm — risky commands require user confirmation (default)")
-            print("  auto    — all commands execute without confirmation")
+            print("  auto    — fully autonomous: no confirmations, auto-continues between turns")
             return
         new_mode = parts[1].lower()
         if new_mode not in ("confirm", "auto"):
@@ -1261,7 +1297,7 @@ Load ops-discipline skill for full diagnosis protocol.
             shell_tool = self.tool_registry.get("shell")
             if shell_tool:
                 shell_tool._require_confirm = False
-            print("Mode: auto — all commands will execute without confirmation.")
+            print(f"Mode: auto — fully autonomous (max {self.config.max_auto_turns} auto turns, Ctrl+C to stop).")
         else:
             self.config.confirm_commands = True
             shell_tool = self.tool_registry.get("shell")
@@ -1472,9 +1508,31 @@ Load ops-discipline skill for full diagnosis protocol.
             if self.config.auto_skill:
                 self._auto_load_skills(user_input)
 
+            self._auto_turn_count = 0
             self._inject_context(user_input)
             self.history.append({"role": "user", "content": user_input})
             self._react_loop()
+
+            # Auto-continue loop: keep generating turns until task is done
+            while self.config.mode == "auto" and self._should_auto_continue():
+                self._auto_turn_count += 1
+                continuation = self._generate_continuation_prompt()
+                print(display.yellow(
+                    f"\n[Auto turn {self._auto_turn_count}/{self.config.max_auto_turns}] Continuing...\n"
+                ))
+                self.history.append({"role": "user", "content": continuation})
+                try:
+                    self._react_loop()
+                except KeyboardInterrupt:
+                    display.interrupted()
+                    print(display.yellow("\n[Auto mode] Interrupted by user.\n"))
+                    break
+
+            if self._auto_turn_count > 0:
+                print(display.yellow(
+                    f"\n[Auto mode] Stopped after {self._auto_turn_count} auto turns.\n"
+                ))
+                self._auto_turn_count = 0
 
     def _run_single_shot(self, query):
         if self.config.auto_skill:
@@ -1482,6 +1540,110 @@ Load ops-discipline skill for full diagnosis protocol.
         self._inject_context(query)
         self.history.append({"role": "user", "content": query})
         self._react_loop()
+
+    # ── Auto-continue logic ────────────────────────────────────────────
+
+    _AUTO_CONTINUE_JUDGE_PROMPT = (
+        "You are judging whether an AI agent should continue working or stop.\n\n"
+        "The agent's last response:\n---\n{last_response}\n---\n\n"
+        "Active plan status: {plan_status}\n"
+        "Auto turns so far: {auto_turns}/{max_turns}\n"
+        "Turns since last file write: {turns_since_write}\n\n"
+        "Should the agent continue to the next turn?\n"
+        "Answer CONTINUE if:\n"
+        "- There is clearly more work to do (plan steps remaining, ongoing implementation)\n"
+        "- The agent is making progress (reading files, writing code, running commands)\n\n"
+        "Answer STOP if:\n"
+        "- The task appears complete (all plan steps done, final verification passed)\n"
+        "- The agent is stuck or looping without progress\n"
+        "- The agent needs user input or a decision\n"
+        "- The agent explicitly said it's done or waiting\n\n"
+        "Reply with ONLY one word: CONTINUE or STOP"
+    )
+
+    def _should_auto_continue(self) -> bool:
+        if self._auto_turn_count >= self.config.max_auto_turns:
+            logger.info("Auto-continue: max turns reached (%d)", self.config.max_auto_turns)
+            return False
+
+        last_text = self._get_last_assistant_text()
+        if not last_text:
+            return False
+
+        # Fast path: explicit tags from agent
+        if "[TASK_COMPLETE]" in last_text:
+            logger.info("Auto-continue: TASK_COMPLETE tag")
+            return False
+        if "[NEED_USER_INPUT]" in last_text:
+            logger.info("Auto-continue: NEED_USER_INPUT tag")
+            return False
+
+        # Hard stagnation limit
+        if (self._auto_turn_count >= 5
+                and self._turn_count - self._last_write_turn >= 5):
+            logger.info("Auto-continue: hard stagnation (no writes in 5 turns)")
+            return False
+
+        # Plan completion check (cheap, no LLM call needed)
+        active_plan = self.task_plan.get_active()
+        if active_plan:
+            steps = active_plan.get("steps", [])
+            if steps and all(
+                s.get("status") in ("done", "skipped") for s in steps
+            ):
+                logger.info("Auto-continue: plan fully completed")
+                return False
+
+        # LLM judge fallback
+        return self._auto_continue_judge(last_text, active_plan)
+
+    def _auto_continue_judge(self, last_text: str, active_plan) -> bool:
+        plan_status = "No active plan"
+        if active_plan:
+            steps = active_plan.get("steps", [])
+            done = sum(1 for s in steps if s.get("status") in ("done", "skipped"))
+            plan_status = f"{done}/{len(steps)} steps done — {active_plan.get('title', '')}"
+
+        truncated = last_text[:2000] if len(last_text) > 2000 else last_text
+        prompt = self._AUTO_CONTINUE_JUDGE_PROMPT.format(
+            last_response=truncated,
+            plan_status=plan_status,
+            auto_turns=self._auto_turn_count,
+            max_turns=self.config.max_auto_turns,
+            turns_since_write=self._turn_count - self._last_write_turn,
+        )
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            result = self.provider.chat(messages, tools=[])
+            text = result.get("content") or ""
+            logger.info("Auto-continue judge: %s", text.strip()[:40])
+            return "CONTINUE" in text.upper()
+        except Exception as e:
+            logger.warning("Auto-continue judge failed: %s — defaulting to continue", e)
+            return True
+
+    def _get_last_assistant_text(self) -> str:
+        for m in reversed(self.history.messages):
+            if m.get("role") == "assistant":
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    return " ".join(
+                        str(c.get("text", "")) for c in content if isinstance(c, dict)
+                    )
+                return str(content)
+        return ""
+
+    def _generate_continuation_prompt(self) -> str:
+        last_user = ""
+        for m in reversed(self.history.messages):
+            if m.get("role") == "user":
+                c = m.get("content", "")
+                last_user = c if isinstance(c, str) else str(c)
+                break
+        has_cjk = any('一' <= ch <= '鿿' for ch in last_user)
+        if has_cjk:
+            return "继续。按照你的计划推进任务。"
+        return "Continue. Proceed with your plan."
 
     def _exit(self):
         atexit.unregister(self._atexit_hook)
@@ -2121,13 +2283,29 @@ Load ops-discipline skill for full diagnosis protocol.
                 "current_phase": self._current_phase,
                 "error_pattern_history": list(self._error_pattern_history),
                 "output_tokens": self._session_output_tokens,
+                "turn_count": self._turn_count,
+                "consecutive_train_failures": self._consecutive_train_failures,
+                "gates_unlocked": {
+                    "understanding": getattr(self, '_understanding_verified', False),
+                    "component_plan": getattr(self, '_component_plan_created', False),
+                    "imports": getattr(self, '_imports_verified', False),
+                    "reference_comparison": getattr(self, '_reference_comparison_planned', False),
+                    "failure_mode": getattr(self, '_failure_mode_analyzed', False),
+                    "sanity_checks": getattr(self, '_sanity_checks_passed', False),
+                    "config_model": getattr(self, '_config_model_verified', False),
+                    "env": getattr(self, '_env_verified', False),
+                    "component_integration": getattr(self, '_component_integration_verified', False),
+                },
+                "session_id": self._session_id,
+                "timestamp": time.time(),
             }
             state_path = os.path.join(self._workspace_manager._dir, ".agent_state.json")
             import json
             with open(state_path, "w") as f:
                 json.dump(state, f)
-            logger.info("Mid-turn autosave: %d files, phase=%s, verification=%s",
-                        len(self._files_read_this_session), self._current_phase, self._verification_stage)
+            logger.info("Mid-turn autosave: %d files, phase=%s, verification=%s, turn=%d",
+                        len(self._files_read_this_session), self._current_phase,
+                        self._verification_stage, self._turn_count)
         except Exception as e:
             logger.warning("Mid-turn autosave failed: %s", e)
 
@@ -2174,14 +2352,24 @@ Load ops-discipline skill for full diagnosis protocol.
         if self._consecutive_train_failures >= 2:
             threshold = 15  # Allow deeper investigation during debugging
 
+        # Soft hint at 5 reads — encourage memory write
+        if self._consecutive_reads == 5:
+            return (
+                "\n\n[AUTO-MEMORY HINT] You've read 5 files without recording findings. "
+                "Use memory_write to persist what you've learned so far — "
+                "file paths, patterns discovered, key decisions. "
+                "This protects against context compaction loss."
+            )
+
         if self._consecutive_reads >= threshold:
             self._consecutive_reads = 0
             return (
-                "\n\n[PROGRESS CHECK] You've made many consecutive read/shell calls "
-                "without recording any findings. Before continuing:\n"
-                "1. What specific question are you trying to answer?\n"
-                "2. Write what you've learned so far to memory_write.\n"
-                "3. Then continue with a focused goal."
+                "\n\n[PROGRESS CHECK — MANDATORY] You've made many consecutive read/shell calls "
+                "without recording any findings. You MUST:\n"
+                "1. memory_write: summarize what you've learned from these reads\n"
+                "2. State what specific question you're trying to answer\n"
+                "3. Then continue with a focused goal.\n"
+                "Unrecorded findings WILL be lost on context compaction."
             )
         return ""
 
@@ -2191,10 +2379,22 @@ Load ops-discipline skill for full diagnosis protocol.
             return result
         if self._is_quick_test_command(cmd):
             self._dry_run_passed = True
+            # Check if using synthetic data — remind about real data verification
+            uses_synthetic = bool(re.search(r'synthetic|/dev/null|mock.data|fake', cmd, re.I))
+            synthetic_note = ""
+            if uses_synthetic:
+                synthetic_note = (
+                    "\n\n[SYNTHETIC DATA NOTE] This dry-run used synthetic/mock data. "
+                    "Before full training with real data, you MUST verify:\n"
+                    "1. Real data loads without error (1 batch)\n"
+                    "2. Batch shapes/dtypes match what model expects\n"
+                    "3. Tokenization/preprocessing produces expected output\n"
+                    "Do NOT skip this — synthetic dry-run passing does NOT guarantee real data works."
+                )
             return result + (
                 "\n\n[DRY RUN COMPLETE] Verify: model loaded? data flowing? "
                 "no crashes? If OK, proceed to full run."
-            )
+            ) + synthetic_note
         if not self._dry_run_passed:
             return result + (
                 "\n\n[WARNING: NO DRY RUN] This is a full training run without "
@@ -2203,6 +2403,64 @@ Load ops-discipline skill for full diagnosis protocol.
                 "Consider stopping and running with --max-steps=2 first."
             )
         return result
+
+    def _check_kill_retry_loop(self, cmd):
+        """Detect kill+relaunch cycles. 3 kills in 20 minutes = forced audit."""
+        now = time.time()
+        is_kill = bool(re.search(r'pkill|kill\s+-9|killall', cmd))
+        is_launch = bool(self._TRAIN_LAUNCH_RE.search(cmd))
+
+        if is_kill:
+            self._kill_retry_timestamps.append(now)
+        if is_launch:
+            self._training_launch_timestamps.append(now)
+
+        # Keep only last 20 minutes
+        cutoff = now - 1200
+        self._kill_retry_timestamps = [t for t in self._kill_retry_timestamps if t > cutoff]
+        self._training_launch_timestamps = [t for t in self._training_launch_timestamps if t > cutoff]
+
+        if len(self._kill_retry_timestamps) >= 3 and len(self._training_launch_timestamps) >= 3:
+            self._kill_retry_timestamps.clear()
+            self._training_launch_timestamps.clear()
+            return (
+                "\n\n[KILL-RETRY LOOP DETECTED] You've killed and relaunched training 3+ times "
+                "in 20 minutes. This pattern wastes tokens and GPU time.\n"
+                "MANDATORY before next launch:\n"
+                "1. memory_write: record what's failing and why each attempt failed\n"
+                "2. Identify the SYSTEMIC issue (not just the symptom)\n"
+                "3. Consider: is the approach fundamentally wrong? Should you try:\n"
+                "   - Different parallelism (TP=1 instead of TP=2)?\n"
+                "   - Direct torchrun instead of wrapper?\n"
+                "   - Simpler model config first?\n"
+                "4. Only relaunch after addressing the root cause."
+            )
+        return ""
+
+    def _check_training_hang(self, cmd, result, elapsed):
+        """Detect training hang: launched but no output progress after timeout."""
+        if not self._TRAIN_LAUNCH_RE.search(cmd):
+            return ""
+        if elapsed < 120:
+            return ""
+        # Check if result shows hang indicators
+        hang_indicators = [
+            "before the start of training step" in result and "iteration" not in result.split("before the start")[-1],
+            "0%" in result and "utilization" in result.lower(),
+            elapsed > 180 and "iteration" not in result[-500:],
+        ]
+        if any(hang_indicators):
+            return (
+                "\n\n[TRAINING HANG DETECTED] Training appears hung:\n"
+                f"- Elapsed: {elapsed:.0f}s with no iteration progress\n"
+                "Likely causes:\n"
+                "1. NCCL deadlock (TP/PP communication issue) — try TP=1 first\n"
+                "2. Zombie CUDA contexts from previous runs — check nvidia-smi\n"
+                "3. rerun_state_machine all_reduce hang — known issue with TP>1\n"
+                "ACTION: Kill the process, then diagnose before relaunching.\n"
+                "Use: nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv"
+            )
+        return ""
 
     def _check_error_escalation(self, tool_name, arguments):
         """After error, require root cause before big changes."""
@@ -2230,13 +2488,15 @@ Load ops-discipline skill for full diagnosis protocol.
 
     def _check_context_pressure(self):
         """Force memory dump when context is getting full. Three-tier: 60%/75%/85%."""
-        total = self._session_input_tokens + self._session_output_tokens
-        max_ctx = self.config.max_context_tokens
-        if not max_ctx or max_ctx <= 0:
-            return ""
-        ratio = total / max_ctx
+        ratio = self.history.get_context_pressure()
 
         if ratio > 0.85:
+            self._pre_compaction_memory_dump()
+            self._update_snapshot()
+            # Set anchors so the summary preserves critical info
+            anchors = self._get_compaction_anchors()
+            if anchors:
+                self.history.set_compaction_anchors(anchors)
             self.history.force_compact(target_ratio=0.60)
             self._context_pressure_soft_warned = False
             self._context_pressure_hard_warned = False
@@ -2245,22 +2505,400 @@ Load ops-discipline skill for full diagnosis protocol.
         if ratio > 0.75 and not self._context_pressure_hard_warned:
             self._context_pressure_hard_warned = True
             return (
-                "\n\n[CONTEXT PRESSURE] You've used ~75% of context budget. "
-                "Write ALL key findings to memory NOW: what you've learned, "
-                "what files you've read, what's left to do. "
-                "After that, history will be auto-compacted to free space."
+                "\n\n[CONTEXT PRESSURE — CRITICAL] You've used ~75% of context budget.\n"
+                "You MUST write ALL key findings to memory NOW:\n"
+                "1. memory_write: errors encountered and solutions found\n"
+                "2. memory_write: current approach and what phase you're in\n"
+                "3. workspace_experiment: add_attempt with current progress\n"
+                "4. workspace_current: update next_steps\n"
+                "After that, history will be auto-compacted. Anything not saved WILL BE LOST."
             )
 
         if ratio > 0.60 and not self._context_pressure_soft_warned:
             self._context_pressure_soft_warned = True
             return (
-                "\n\n[CONTEXT BUDGET] You've used ~60% of context. "
-                "Start writing key findings to memory. "
-                "Avoid re-reading files you've already analyzed. "
-                "Use read_file with offset/limit for targeted reads."
+                "\n\n[CONTEXT BUDGET — 60%] Start persisting findings now.\n"
+                "Use memory_write for: discoveries, workarounds, decisions.\n"
+                "Use workspace_experiment for: attempt results.\n"
+                "Avoid re-reading files you've already analyzed."
             )
 
         return ""
+
+    def _pre_compaction_memory_dump(self):
+        """Auto-save critical context before compaction destroys it."""
+        try:
+            recent = self.history.messages[-20:]
+            errors_found = []
+            solutions_found = []
+            files_modified = []
+            current_approach = ""
+
+            for msg in recent:
+                text = ""
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+                elif msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "tool_result":
+                                r = block.get("content", "")
+                                if isinstance(r, str) and ("Error" in r or "Traceback" in r):
+                                    errors_found.append(r[:200])
+
+                if not text:
+                    continue
+
+                if "error" in text.lower() or "failed" in text.lower():
+                    for line in text.split("\n"):
+                        if any(kw in line.lower() for kw in ("error:", "failed:", "traceback", "fix:")):
+                            errors_found.append(line.strip()[:150])
+                if any(kw in text.lower() for kw in ("fixed by", "solution:", "workaround:", "resolved")):
+                    for line in text.split("\n"):
+                        if any(kw in line.lower() for kw in ("fixed", "solution", "workaround", "resolved")):
+                            solutions_found.append(line.strip()[:150])
+                if "write_file" in text or "edit_file" in text:
+                    import re as _re
+                    paths = _re.findall(r'["\']([/\w._-]+\.(py|yaml|sh))["\']', text)
+                    files_modified.extend(p[0] for p in paths[:5])
+                if "approach" in text.lower() or "strategy" in text.lower() or "plan" in text.lower():
+                    if len(text) < 500:
+                        current_approach = text[:300]
+
+            # Build checkpoint content
+            parts = []
+            if errors_found:
+                parts.append(f"Errors: {'; '.join(errors_found[:5])}")
+            if solutions_found:
+                parts.append(f"Solutions: {'; '.join(solutions_found[:5])}")
+            if files_modified:
+                parts.append(f"Files modified: {', '.join(set(files_modified)[:10])}")
+            if current_approach:
+                parts.append(f"Approach: {current_approach}")
+
+            parts.append(f"Files read this session: {len(self._files_read_this_session)}")
+            parts.append(f"Phase: {self._current_phase}, Verification: {self._verification_stage}")
+            parts.append(f"Turn: {self._turn_count}")
+
+            checkpoint_content = "\n".join(parts)
+
+            # Save to memory with high priority (survives TTL)
+            key = f"compaction_checkpoint_{int(time.time())}"
+            self.session_memory.put(
+                key, "context", checkpoint_content,
+                self._session_id,
+                task=self._workspace_manager.get_current_task(),
+                priority="high",
+            )
+
+            # Update workspace current
+            self._update_workspace_current_context(
+                context_update=f"Pre-compaction: {len(self._files_read_this_session)} files read, "
+                               f"phase={self._current_phase}, verification={self._verification_stage}",
+            )
+
+            # Add to experiment if active
+            exp = self._workspace_manager.get_current_experiment()
+            if exp:
+                self._workspace_manager.add_attempt(
+                    exp, "pre-compaction checkpoint",
+                    f"Turn {self._turn_count}: {checkpoint_content[:500]}"
+                )
+
+            logger.info("Pre-compaction memory dump: saved checkpoint with %d errors, %d solutions",
+                        len(errors_found), len(solutions_found))
+        except Exception as e:
+            logger.warning("Pre-compaction memory dump failed: %s", e)
+
+    def _update_workspace_current_context(self, context_update: str = "", next_steps: list = None):
+        """Incrementally update current.yaml with new context or next_steps."""
+        try:
+            current = self._workspace_manager.read_current() or {}
+            ctx = current.get("context", [])
+            if isinstance(ctx, str):
+                ctx = [ctx]
+            if context_update:
+                ctx.append(context_update)
+                # Keep last 10 context entries
+                ctx = ctx[-10:]
+            if next_steps is not None:
+                current["next_steps"] = next_steps
+            current["context"] = ctx
+            current["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._workspace_manager.write_current(current)
+        except Exception as e:
+            logger.warning("Failed to update workspace current: %s", e)
+
+    def _auto_update_workspace_on_progress(self, tool_name, arguments):
+        """Auto-update workspace current after significant progress events."""
+        try:
+            # After plan creation/update
+            if tool_name in ("plan_create", "plan_update"):
+                plan = self.task_plan.get_active()
+                if plan:
+                    pending = [s.get("text", "") for s in plan.get("steps", []) if s.get("status") == "pending"]
+                    self._update_workspace_current_context(
+                        context_update=f"Plan updated (turn {self._turn_count})",
+                        next_steps=pending[:5],
+                    )
+
+            # After verification stage advance
+            elif tool_name == "workspace_experiment":
+                action = arguments.get("action", "")
+                if action in ("advance_verification", "add_attempt"):
+                    self._update_workspace_current_context(
+                        context_update=f"Verification: {self._verification_stage} (turn {self._turn_count})",
+                    )
+
+            # After successful training launch
+            elif tool_name == "shell":
+                cmd = arguments.get("command", "")
+                if self._is_training_launch(cmd):
+                    self._update_workspace_current_context(
+                        context_update=f"Training launched (turn {self._turn_count}): {cmd[:100]}",
+                    )
+        except Exception as e:
+            logger.debug("Auto workspace update failed: %s", e)
+
+    # ── Auto-Persistence Layer ─────────────────────────────────────────
+
+    def _auto_persist_on_event(self, tool_name, arguments, result, error):
+        """Automatic persistence after key events — no agent decision needed."""
+        try:
+            cmd = arguments.get("command", "") if tool_name == "shell" else ""
+
+            # Training failure → auto-record
+            if tool_name == "shell" and self._is_training_launch(cmd):
+                if error or (result and ("Error" in result or "Traceback" in result)):
+                    self._auto_record_training_attempt(cmd, result, success=False)
+                elif result and ("iteration" in result.lower() or "loss" in result.lower()):
+                    self._auto_record_training_attempt(cmd, result, success=True)
+
+            # Kill command → auto-record
+            if tool_name == "shell" and re.search(r'pkill|kill\s+-?\d|killall', cmd):
+                self._auto_record_kill_event(cmd)
+
+            # File write to model code → auto-record
+            if tool_name in ("write_file", "edit_file") and not error:
+                path = arguments.get("path", "") or arguments.get("file_path", "")
+                if path and self._porting_mode and re.search(r'model|train|layer|attention|mlp|embed', path, re.I):
+                    self._auto_record_code_change(path)
+
+            # Plan step done → auto-add experiment attempt
+            if tool_name == "plan_update" and arguments.get("status") == "done":
+                self._auto_bind_plan_to_experiment(arguments)
+
+        except Exception as e:
+            logger.debug("Auto-persist failed: %s", e)
+
+    def _auto_record_training_attempt(self, cmd, result, success):
+        """Record training attempt to experiment and update snapshot."""
+        exp_name = self._workspace_manager.get_current_experiment()
+        if not exp_name:
+            return
+        if success:
+            # Extract first iteration info
+            lines = (result or "").split("\n")
+            info_lines = [l for l in lines if "iteration" in l.lower() or "loss" in l.lower()][:3]
+            summary = "\n".join(info_lines)[:200] if info_lines else "Training started successfully"
+            self._workspace_manager.add_attempt(exp_name, f"LAUNCH: {cmd[:80]}", f"SUCCESS: {summary}")
+        else:
+            # Extract error
+            err_lines = []
+            for line in (result or "").split("\n"):
+                if "error" in line.lower() or "traceback" in line.lower() or "assert" in line.lower():
+                    err_lines.append(line.strip())
+            error_summary = "\n".join(err_lines[-3:])[:200] if err_lines else "Unknown error"
+            self._workspace_manager.add_attempt(exp_name, f"LAUNCH: {cmd[:80]}", f"FAIL: {error_summary}")
+        self._update_snapshot()
+
+    def _auto_record_kill_event(self, cmd):
+        """Record kill event with inferred reason from recent context."""
+        reason = "unknown"
+        for msg in reversed(self.history.messages[-5:]):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", "")
+            text = content if isinstance(content, str) else " ".join(
+                b.get("text", "") for b in content if isinstance(b, dict)
+            )
+            for line in text.split("\n"):
+                if any(kw in line.lower() for kw in ("hang", "stuck", "oom", "error", "wrong", "fix", "retry")):
+                    reason = line.strip()[:150]
+                    break
+            if reason != "unknown":
+                break
+        exp_name = self._workspace_manager.get_current_experiment()
+        if exp_name:
+            self._workspace_manager.add_attempt(exp_name, f"KILL: {cmd[:80]}", f"Reason: {reason}")
+        self._update_snapshot()
+
+    def _auto_record_code_change(self, path):
+        """Record model code change to experiment."""
+        exp_name = self._workspace_manager.get_current_experiment()
+        if exp_name:
+            self._workspace_manager.add_attempt(
+                exp_name, f"CODE: modified {os.path.basename(path)}", f"File: {path}"
+            )
+
+    def _auto_bind_plan_to_experiment(self, arguments):
+        """When plan step is done, auto-add experiment attempt."""
+        step_id = arguments.get("step_id", "")
+        notes = arguments.get("notes", "done")
+        exp_name = self._workspace_manager.get_current_experiment()
+        if exp_name:
+            self._workspace_manager.add_attempt(
+                exp_name, f"Plan step {step_id} completed", notes[:200]
+            )
+        self._update_snapshot()
+
+    # ── Unified Snapshot ───────────────────────────────────────────────
+
+    def _update_snapshot(self):
+        """Generate and write unified snapshot from current state."""
+        try:
+            plan = self.task_plan.get_active() if hasattr(self, 'task_plan') else None
+            plan_progress = ""
+            current_step = ""
+            if plan:
+                steps = plan.get("steps", [])
+                done = sum(1 for s in steps if s.get("status") == "done")
+                total = len(steps)
+                plan_progress = f"{done}/{total} steps done"
+                doing = [s for s in steps if s.get("status") == "doing"]
+                if doing:
+                    current_step = doing[0].get("text", doing[0].get("title", ""))[:100]
+
+            # Get last 3 attempts from experiment
+            last_attempts = []
+            exp_name = self._workspace_manager.get_current_experiment()
+            if exp_name:
+                exp = self._workspace_manager.read_experiment(exp_name)
+                if exp:
+                    for a in (exp.get("attempts", []) or [])[-3:]:
+                        last_attempts.append({
+                            "change": a.get("change", "")[:100],
+                            "result": a.get("result", "")[:100],
+                        })
+
+            # Get key decisions from memory
+            key_decisions = []
+            decisions = [e for e in self.session_memory.list_entries()
+                         if e.get("type") == "decision" or e.get("priority") == "high"]
+            for d in decisions[-5:]:
+                key_decisions.append(d.get("content", "")[:120])
+
+            current = self._workspace_manager.read_current()
+            snapshot = {
+                "task": current.get("task", ""),
+                "status": current.get("status", "running"),
+                "phase": getattr(self, '_current_phase', 'unknown'),
+                "verification_stage": getattr(self, '_verification_stage', 'none'),
+                "plan_progress": plan_progress,
+                "current_step": current_step,
+                "last_3_attempts": last_attempts,
+                "key_decisions": key_decisions,
+                "current_errors": current.get("blockers", []),
+                "files_modified_recently": list(getattr(self, '_files_written_this_session', set()))[:10],
+                "next_action": current.get("next_steps", [""])[0] if current.get("next_steps") else "",
+                "turn_count": self._turn_count,
+            }
+            self._workspace_manager.write_snapshot(snapshot)
+        except Exception as e:
+            logger.debug("Snapshot update failed: %s", e)
+
+    def _get_compaction_anchors(self) -> list:
+        """Extract mandatory anchors for summary preservation."""
+        anchors = []
+        try:
+            plan = self.task_plan.get_active() if hasattr(self, 'task_plan') else None
+            if plan:
+                doing = [s for s in plan.get("steps", []) if s.get("status") == "doing"]
+                if doing:
+                    anchors.append(f"Current plan step: {doing[0].get('text', '')[:80]}")
+
+            entries = self.session_memory.list_entries()
+            high_pri = [e for e in entries if e.get("priority") == "high"]
+            for e in high_pri[-3:]:
+                anchors.append(f"Key [{e['key']}]: {e['content'][:80]}")
+
+            current = self._workspace_manager.read_current()
+            blockers = current.get("blockers", [])
+            if blockers:
+                anchors.append(f"Blocker: {blockers[-1][:80]}")
+
+            if hasattr(self, '_files_read_this_session') and self._files_read_this_session:
+                files_list = list(self._files_read_this_session)[:8]
+                anchors.append(f"Files already read: {', '.join(os.path.basename(f) for f in files_list)}")
+        except Exception:
+            pass
+        return anchors
+
+    def _format_snapshot_as_resume(self, snapshot: dict = None) -> str:
+        """Format snapshot as a resume hint for injection after compaction or session start."""
+        if snapshot is None:
+            snapshot = self._workspace_manager.read_snapshot()
+        if not snapshot:
+            # Fallback to current.yaml
+            try:
+                current = self._workspace_manager.read_current()
+            except Exception:
+                current = None
+            if not current:
+                return ""
+            task = current.get("task", "")
+            status = current.get("status", "")
+            if isinstance(task, dict):
+                status = task.get("status", status)
+                task_name = task.get("name", str(task))
+            else:
+                task_name = str(task) if task else ""
+            if not task_name or status in ("completed", "abandoned", ""):
+                return ""
+            return (
+                f"\n<system-hint>[SESSION RESUME] Task: {task_name} (status: {status})\n"
+                f"Run workspace_current and memory_read to load full state.</system-hint>\n"
+            )
+
+        parts = []
+        if snapshot.get("task"):
+            parts.append(f"Task: {snapshot['task']}")
+        if snapshot.get("status"):
+            parts.append(f"Status: {snapshot['status']}")
+        if snapshot.get("phase"):
+            parts.append(f"Phase: {snapshot['phase']}, Verification: {snapshot.get('verification_stage', 'none')}")
+        if snapshot.get("plan_progress"):
+            parts.append(f"Plan: {snapshot['plan_progress']}")
+        if snapshot.get("current_step"):
+            parts.append(f"Current step: {snapshot['current_step']}")
+        if snapshot.get("last_3_attempts"):
+            parts.append("Recent attempts:")
+            for a in snapshot["last_3_attempts"]:
+                parts.append(f"  - {a.get('change', '')} → {a.get('result', '')}")
+        if snapshot.get("key_decisions"):
+            parts.append("Key decisions:")
+            for d in snapshot["key_decisions"]:
+                parts.append(f"  - {d}")
+        if snapshot.get("current_errors"):
+            parts.append(f"Blockers: {snapshot['current_errors']}")
+        if snapshot.get("next_action"):
+            parts.append(f"Next action: {snapshot['next_action']}")
+        if snapshot.get("files_modified_recently"):
+            parts.append(f"Files modified: {', '.join(snapshot['files_modified_recently'][:5])}")
+
+        if not parts:
+            return ""
+        body = "\n  ".join(parts)
+        return (
+            f"\n<system-hint>[SESSION RESUME] Unified snapshot:\n  {body}\n\n"
+            f"RECOVERY: Do NOT re-read files already analyzed — check memory first. "
+            f"Continue from next_action above.</system-hint>\n"
+        )
 
     def _check_progress_checkpoint(self):
         """Force progress review every 10K output tokens."""
@@ -2481,11 +3119,885 @@ Load ops-discipline skill for full diagnosis protocol.
             "enters the model). The gate clears after you persist pipeline understanding."
         )
 
+    # ── Checkpoint verification gate ────────────────────────────────────
+
+    def _check_checkpoint_verified_gate(self, tool_name, arguments):
+        """Verify checkpoint after conversion before using it in training."""
+        if tool_name != "shell":
+            return ""
+
+        cmd = arguments.get("command", "")
+        if not self._is_training_launch(cmd):
+            return ""
+
+        # Check if checkpoint conversion happened recently (within last 20 tool calls)
+        recent_tools = list(self._recent_tool_calls)[-20:]
+        has_conversion = any(
+            "convert" in str(name).lower() and "checkpoint" in str(args).lower()
+            for name, args in recent_tools
+        )
+
+        if not has_conversion:
+            return ""  # No recent conversion, assume checkpoint is pre-verified
+
+        # Check if verification was done after conversion
+        has_verification = any(
+            ("torch.load" in str(args) or "state_dict" in str(args) or "verify" in str(name).lower())
+            and i > max(idx for idx, (n, a) in enumerate(recent_tools) if "convert" in str(n).lower())
+            for i, (name, args) in enumerate(recent_tools)
+        )
+
+        if has_verification:
+            return ""
+
+        # Extract checkpoint path from command
+        ckpt_match = re.search(r'--load[=\s]+([^\s]+)', cmd)
+        ckpt_path = ckpt_match.group(1) if ckpt_match else "<checkpoint_path>"
+
+        return f"""
+[CHECKPOINT VERIFICATION GATE]
+
+You just converted a checkpoint but haven't verified it before training. Checkpoint bugs waste 10+ minutes of model loading time.
+
+**Critical checks** (30 seconds, catches 90% of conversion bugs):
+
+```python
+import torch
+
+# 1. Reload and verify structure
+ckpt = torch.load("{ckpt_path}/mp_rank_00/model_optim_rng.pt", map_location="cpu")
+state = ckpt.get("model", ckpt)
+print(f"Checkpoint keys: {{len(state)}}")
+if len(state) == 0:
+    print("ERROR: Empty checkpoint!")
+
+# 2. Sample shapes and dtypes
+for k, v in list(state.items())[:5]:
+    print(f"  {{k}}: {{v.shape}} {{v.dtype}}")
+
+# 3. Verify norms (not random init)
+norms = [v.float().norm().item() for v in list(state.values())[:10]]
+print(f"Sample norms: {{norms}}")
+if all(0.01 < n < 0.1 for n in norms):
+    print("WARNING: Norms look like random init, not converted weights")
+
+# 4. Cross-check against model state_dict
+with torch.device("meta"):
+    model = build_model(config)  # Use your model builder
+model_keys = set(model.state_dict().keys())
+ckpt_keys = set(state.keys())
+missing = model_keys - ckpt_keys
+unexpected = ckpt_keys - model_keys
+shape_mismatch = {{k for k in model_keys & ckpt_keys if model.state_dict()[k].shape != state[k].shape}}
+
+print(f"Missing: {{len(missing)}}, Unexpected: {{len(unexpected)}}, Shape mismatch: {{len(shape_mismatch)}}")
+if missing or shape_mismatch:
+    print("ERROR: Key/shape mismatch detected!")
+    for k in list(missing)[:5]:
+        print(f"  Missing: {{k}}")
+    for k in list(shape_mismatch)[:5]:
+        print(f"  Shape: {{k}} model={{model.state_dict()[k].shape}} ckpt={{state[k].shape}}")
+```
+
+**Your decision**:
+- Run verification (recommended) — 30 seconds now saves 10+ minutes later
+- Skip if you've verified this exact conversion path before (state why)
+
+Think carefully: is this checkpoint conversion new or have you tested it before?
+"""
+
+    # ── Distributed training prerequisite gate ──────────────────────────
+
+    def _check_distributed_prerequisite_gate(self, tool_name, arguments):
+        """Inform about distributed training prerequisites, let LLM decide."""
+        if tool_name != "shell":
+            return ""
+
+        cmd = arguments.get("command", "")
+        if not self._is_training_launch(cmd):
+            return ""
+
+        # Extract parallelism
+        tp = self._extract_arg_value(cmd, r'--tensor-model-parallel-size[=\s]+(\d+)')
+        pp = self._extract_arg_value(cmd, r'--pipeline-model-parallel-size[=\s]+(\d+)')
+
+        if tp <= 1 and pp <= 1:
+            return ""  # Single GPU, no gate
+
+        # Check if single-GPU verification exists in recent history
+        recent_cmds = [args.get("command", "") for name, args in list(self._recent_tool_calls)[-30:] if name == "shell"]
+        has_single_gpu = any(
+            self._is_training_launch(c) and
+            self._extract_arg_value(c, r'--tensor-model-parallel-size[=\s]+(\d+)') <= 1 and
+            self._extract_arg_value(c, r'--pipeline-model-parallel-size[=\s]+(\d+)') <= 1
+            for c in recent_cmds
+        )
+
+        if has_single_gpu:
+            return ""  # Already verified single-GPU
+
+        # Try to extract model info from workspace or config
+        model_type = "unknown"
+        model_size = "unknown"
+        custom_components = []
+
+        try:
+            ws_state = self._workspace_manager.get_current()
+            if isinstance(ws_state, dict):
+                model_type = ws_state.get("model_type", "unknown")
+                model_size = ws_state.get("model_size", "unknown")
+                custom_components = ws_state.get("custom_components", [])
+        except:
+            pass
+
+        return f"""
+[DISTRIBUTED PREREQUISITE GATE]
+
+You're launching distributed training (TP={tp}, PP={pp}) without single-GPU verification.
+
+**Model context**:
+- Type: {model_type}
+- Size: {model_size}
+- Custom components: {custom_components if custom_components else "none detected"}
+
+**Why single-GPU verification matters**:
+When distributed training fails, it's hard to tell if the issue is:
+- Model/data/config problem (would fail on single-GPU too)
+- Parallelism implementation (TP sharding, PP stage assignment, NCCL)
+
+Single-GPU verification isolates the first category in minutes instead of hours.
+
+**Your options** (think about model characteristics):
+
+1. **Run single-GPU first** (recommended for):
+   - Dense models <30B params
+   - First time porting this architecture
+   - Custom layers that need TP implementation
+
+   For large models: use smaller variant (reduce num_layers in config) or smaller batch
+
+2. **Skip to distributed** (acceptable for):
+   - MoE models where single-GPU is impractical (routing needs ≥2 GPUs)
+   - Models >30B where even minimal config won't fit one GPU
+   - You've verified similar model architecture before
+   - This is iteration N of a working model (just config changes)
+
+3. **Verify components separately** (middle ground):
+   - Test custom layers with dummy model on single-GPU
+   - Then launch full distributed training
+
+**Decision required**: Choose an option and explain your reasoning. If skipping single-GPU, document why in workspace_experiment (action='add_attempt', change='Skip single-GPU verification', result='<your reason>').
+
+Don't rush this decision — distributed debugging is expensive.
+"""
+
+    # ── Phase 1 Gates: Pre-Implementation ──────────────────────────────
+
+    def _check_understanding_verification_gate(self, tool_name, arguments):
+        """A1: Before writing training code, verify agent understands data flow, model signature, parallelism."""
+        if self._understanding_verified or not self._porting_mode:
+            return ""
+        if tool_name not in ("write_file", "edit_file"):
+            return ""
+        path = arguments.get("path", "") or arguments.get("file_path", "")
+        if not re.search(r'train_.*\.py|get_batch|forward_step|pretrain_', path):
+            return ""
+        return """
+[UNDERSTANDING VERIFICATION GATE]
+
+**Context**: You're about to write training/model code, but haven't demonstrated understanding of the target system.
+
+**Why this gate exists**: Writing code without understanding leads to "implement everything then debug" — the #1 cause of wasted hours in model migration.
+
+**What you must do** — answer these 3 categories in workspace_experiment before writing code:
+
+1. **Data flow**: What is the exact input format? What preprocessing happens? What does get_batch return (keys, shapes, dtypes)?
+
+2. **Model signature**: What does the model's forward() expect? What does it return? What loss function is used?
+
+3. **Parallelism context**: What parallelism does FlagScale apply to this model type? Which layers get tensor-parallelized? How does the data pipeline handle DP?
+
+**Your options**:
+- Write answers in workspace_experiment (action='create' or action='add_attempt') — unlocks this gate
+- Skip if this is a trivial edit to existing working code (not a new implementation)
+
+**Decision required**: Write your understanding to workspace_experiment, then proceed with implementation.
+
+Prove you understand before you implement.
+"""
+
+    def _check_component_isolation_gate(self, tool_name, arguments):
+        """A3: For multi-component models, require component-by-component plan following data flow order."""
+        if self._component_plan_created or not self._porting_mode:
+            return ""
+        if tool_name != "write_file":
+            return ""
+        path = arguments.get("path", "")
+        if not re.search(r'train_.*\.py|pretrain_', path):
+            return ""
+
+        # Detect multi-component model from recent reads
+        recent_content = " ".join(str(args) for _, args in list(self._recent_tool_calls)[-30:])
+        multimodal_signals = sum(1 for kw in (
+            "vision", "vit", "clip", "siglip", "encoder", "decoder",
+            "vae", "diffusion", "moe", "expert", "router", "multimodal",
+            "image_processor", "visual", "audio", "speech"
+        ) if kw in recent_content.lower())
+
+        if multimodal_signals < 2:
+            self._component_plan_created = True  # Single-component model, skip
+            return ""
+
+        return """
+[COMPONENT ISOLATION PLAN GATE]
+
+**Context**: This appears to be a multi-component model (multimodal, MoE, or multi-encoder). You're about to write the training script without a component isolation plan.
+
+**Why this gate exists**: Multi-component models fail in subtle ways when all components are implemented simultaneously. A bug in Component A manifests as wrong output in Component C — impossible to debug without isolation.
+
+**What you must do** — create a plan (plan_create) with explicit component phases in DATA FLOW ORDER:
+
+```
+Phase 1: [First component in data flow] (e.g., ViT/encoder)
+  - Implement
+  - Verify forward (non-zero output, correct shape)
+  - Verify backward (non-zero gradients)
+
+Phase 2: [Next component] (e.g., LLM backbone)
+  - Implement
+  - Verify forward
+  - Verify backward
+
+Phase 3: [Integration]
+  - Connect components
+  - Verify end-to-end data flow
+  - Verify gradient flow through all components
+```
+
+**Your options**:
+- Create component plan via plan_create — unlocks this gate
+- Document in workspace_experiment why isolation isn't needed (e.g., all components already verified in FlagScale)
+
+**Decision required**: Create the component isolation plan before writing the training script.
+
+Data flows in one direction. Verify in that same direction.
+"""
+
+    def _check_failure_mode_analysis_gate(self, tool_name, arguments):
+        """B1: After writing training code, require failure mode analysis before first launch."""
+        if self._failure_mode_analyzed or not self._porting_mode:
+            return ""
+        if tool_name != "shell":
+            return ""
+        cmd = arguments.get("command", "")
+        if not self._is_training_launch(cmd):
+            return ""
+
+        # Check if training code was recently written
+        recent_writes = [
+            args for name, args in list(self._recent_tool_calls)[-20:]
+            if name in ("write_file", "edit_file")
+        ]
+        has_training_code = any(
+            re.search(r'train_|pretrain_|forward_step|get_batch', str(args))
+            for args in recent_writes
+        )
+        if not has_training_code:
+            return ""
+
+        return """
+[FAILURE MODE ANALYSIS GATE]
+
+**Context**: You just wrote training code and are about to launch. But you haven't analyzed what's most likely to go wrong.
+
+**Why this gate exists**: 80% of first-launch failures fall into predictable categories. Spending 2 minutes thinking about failure modes saves 20 minutes of debugging.
+
+**What you must do** — document in workspace_experiment (action='add_attempt'):
+
+1. **Top 3 most likely failure modes** for this specific model:
+   - What could go wrong? (e.g., "shape mismatch in cross-attention between ViT and LLM")
+   - How would you detect it? (e.g., "RuntimeError with shape info" or "loss = NaN")
+   - What's the fix? (e.g., "check projection layer dimensions")
+
+2. **One "what if I'm wrong" check**:
+   - What assumption are you least confident about?
+   - How can you verify it before launching?
+
+**Your options**:
+- Write failure mode analysis to workspace_experiment — unlocks this gate
+- Skip if this is a re-launch of previously working code (no new code written)
+
+**Decision required**: Document your failure mode analysis, then launch.
+
+Think before you run. Debug before you debug.
+"""
+
+    # ── Phase 2 Gates: Pre-Launch ────────────────────────────────────────
+
+    def _check_sanity_check_gate(self, tool_name, arguments):
+        """B2: Before first training launch, require 4 sanity checks."""
+        if self._sanity_checks_passed or not self._porting_mode:
+            return ""
+        if tool_name != "shell":
+            return ""
+        cmd = arguments.get("command", "")
+        if not self._is_training_launch(cmd):
+            return ""
+        if self._is_quick_test_command(cmd):
+            return ""  # Don't block dry-runs
+
+        # Only trigger on first real training launch
+        recent_launches = sum(
+            1 for name, args in list(self._recent_tool_calls)[-30:]
+            if name == "shell" and self._is_training_launch(str(args))
+            and not self._is_quick_test_command(str(args))
+        )
+        if recent_launches > 0:
+            return ""  # Already launched before, don't re-gate
+
+        return """
+[SANITY CHECK GATE]
+
+**Context**: First real training launch detected. Have you verified the 4 critical components?
+
+**Why this gate exists**: First launches fail 70%+ of the time. These 4 checks catch the most common issues in under 60 seconds total.
+
+**Checklist** (run each, document results):
+
+1. **Data check**: `python -c "from your_get_batch import get_batch; batch = get_batch(...); print({k: v.shape for k,v in batch.items()})"` — verify shapes match model expectations
+
+2. **Model init check**: `python -c "model = YourModel(config); print(sum(p.numel() for p in model.parameters()))"` — verify model builds without error
+
+3. **Config check**: Verify TP × PP × DP = world_size, and batch_size is divisible by DP
+
+4. **Checkpoint check** (if loading): Verify checkpoint keys match model state_dict keys (use the verification script from checkpoint gate)
+
+**Your options**:
+- Run all 4 checks (recommended for new models)
+- Run checks 1+3 only (acceptable if model init already verified via dry-run)
+- Skip all (only if this exact config+code ran successfully before)
+
+**Decision required**: Run the checks or explain why each skipped check is safe to skip.
+"""
+
+    def _check_config_model_consistency_gate(self, tool_name, arguments):
+        """B4: After generating config, verify config keys match model __init__ parameters."""
+        if self._config_model_verified or not self._porting_mode:
+            return ""
+        if tool_name != "shell":
+            return ""
+        cmd = arguments.get("command", "")
+        if not self._is_training_launch(cmd):
+            return ""
+
+        # Check if config was recently written
+        recent_writes = [
+            str(args) for name, args in list(self._recent_tool_calls)[-15:]
+            if name == "write_file" and re.search(r'\.yaml|\.yml|config', str(args))
+        ]
+        if not recent_writes:
+            return ""
+
+        return """
+[CONFIG-MODEL CONSISTENCY GATE]
+
+**Context**: You recently wrote a config file and are launching training. Config-model mismatches are a top-5 failure cause.
+
+**Why this gate exists**: YAML config keys must exactly match what the model's __init__ and argument parser expect. A typo or wrong key name silently uses defaults — causing subtle bugs that waste hours.
+
+**What you must do**:
+1. Read the model's `__init__` signature (or `add_model_args` function)
+2. Compare each config key against the expected parameter names
+3. Verify value types match (int vs str, list vs scalar)
+
+**Common mismatches to check**:
+- `hidden_size` vs `hidden_dim` vs `d_model`
+- `num_attention_heads` vs `n_heads` vs `num_heads`
+- `ffn_hidden_size` vs `intermediate_size` vs `d_ff`
+- `num_layers` vs `n_layers` vs `num_hidden_layers`
+- Boolean flags that default to False if misspelled
+
+**Your options**:
+- Verify manually (read model code, compare with config)
+- Run quick script: `python -c "import yaml; cfg = yaml.safe_load(open('config.yaml')); print(cfg.keys())"` then compare
+- Skip if using an existing verified config (no new keys added)
+
+**Decision required**: Confirm zero mismatches or explain each mismatch.
+"""
+
+    def _check_environment_consistency_gate(self, tool_name, arguments):
+        """C2: Before training launch, verify installed packages are from correct paths."""
+        if self._env_verified or not self._porting_mode:
+            return ""
+        if tool_name != "shell":
+            return ""
+        cmd = arguments.get("command", "")
+        if not self._is_training_launch(cmd):
+            return ""
+
+        # Only trigger once per session
+        self._env_verified = True
+
+        return """
+[ENVIRONMENT CONSISTENCY GATE]
+
+**Context**: About to launch training. Package version/path conflicts are a silent killer.
+
+**Common issue**: Megatron-LM-FL updates faster than FlagScale adapts. If you installed Megatron-LM-FL from `main` branch but FlagScale expects an older tag, you'll hit import errors or API mismatches that look like your code is wrong but are actually version drift.
+
+**Quick verification** (10 seconds):
+```python
+python -c "
+import megatron; print('megatron:', megatron.__file__)
+import transformer_engine; print('TE:', transformer_engine.__file__)
+try:
+    import flagscale; print('flagscale:', flagscale.__file__)
+except: pass
+"
+```
+
+**What to check**:
+- All paths should point to your current working environment
+- If FlagScale wrapper fails on imports: check FlagScale's install docs for the compatible Megatron-LM-FL tag, then `pip install git+...@<tag>` to roll back
+- If rolling back is impractical, use direct torchrun instead of the FlagScale wrapper
+
+**If paths are wrong**: `pip install -e .` in the correct directory, or adjust PYTHONPATH.
+
+This is informational — proceed with training, but investigate version compatibility if you get unexpected import or API errors.
+"""
+
+    def _check_component_integration_gate(self, tool_name, arguments):
+        """C4: Before full training with all components, verify each was tested individually."""
+        if self._component_integration_verified or not self._porting_mode:
+            return ""
+        if not self._component_plan_created:
+            return ""  # Only applies if component plan was required
+        if tool_name != "shell":
+            return ""
+        cmd = arguments.get("command", "")
+        if not self._is_training_launch(cmd):
+            return ""
+        if self._is_quick_test_command(cmd):
+            return ""
+
+        # Check verification stage — should be at least forward_aligned
+        if self._verification_stage in ("forward_aligned", "backward_ok", "distributed_ok", "full_training"):
+            self._component_integration_verified = True
+            return ""
+
+        return """
+[COMPONENT INTEGRATION GATE]
+
+**Context**: Launching full training with a multi-component model, but individual component verification is incomplete.
+
+**Why this gate exists**: When multiple components fail simultaneously, it's nearly impossible to isolate which one is broken. Verify each component works alone before combining.
+
+**What you must verify** (check workspace_experiment or logs for evidence):
+- Each component's forward pass produces non-zero output
+- Each component's backward pass produces non-zero gradients
+- Data flows correctly between components (shapes match at boundaries)
+
+**Your options**:
+- Show evidence of per-component verification (logs, workspace records)
+- Run quick per-component tests now before full launch
+- Skip if all components are standard FlagScale modules (already tested upstream)
+
+**Decision required**: Provide evidence of component verification or explain why it's safe to skip.
+"""
+
+    # ── Phase 3 Gates: Post-Launch (Informational) ───────────────────────
+
+    def _check_gradient_health(self, cmd, result):
+        """D1: After first iteration, check grad_norm is non-zero and finite."""
+        if not self._porting_mode:
+            return ""
+        if not self._is_training_launch(cmd):
+            return ""
+        if not result:
+            return ""
+
+        # Look for gradient info in output
+        grad_norm_match = re.search(r'grad.norm[:\s]+([0-9.eE+\-]+|nan|inf)', result, re.I)
+        if not grad_norm_match:
+            return ""
+
+        grad_val = grad_norm_match.group(1).lower()
+        issues = []
+
+        if grad_val in ("nan", "inf"):
+            issues.append(f"grad_norm is {grad_val} — likely exploding gradients or NaN in forward pass")
+        elif grad_val == "0.0" or grad_val == "0":
+            issues.append("grad_norm is 0 — model may not be receiving gradients (frozen params? detached tensor?)")
+        else:
+            try:
+                val = float(grad_val)
+                if val > 1000:
+                    issues.append(f"grad_norm={val} is very large — consider gradient clipping or lower learning rate")
+                elif val < 1e-10:
+                    issues.append(f"grad_norm={val} is near-zero — check if loss is connected to all parameters")
+            except ValueError:
+                pass
+
+        # Check zero_grad_ratio if present
+        zero_grad_match = re.search(r'zero.grad.*?([0-9.]+)%', result, re.I)
+        if zero_grad_match:
+            ratio = float(zero_grad_match.group(1))
+            if ratio > 50:
+                issues.append(f"zero_grad_ratio={ratio}% — over half of parameters have zero gradients")
+
+        if not issues:
+            return ""
+
+        return f"""
+[GRADIENT HEALTH CHECK — INFORMATIONAL]
+
+Issues detected in training output:
+{chr(10).join(f'- {issue}' for issue in issues)}
+
+**Common causes**:
+- NaN/Inf: dtype overflow (try bf16→fp32 for problematic layers), bad initialization, division by zero
+- Zero gradients: frozen parameters, detached tensors in forward, loss not connected to all components
+- Very large: missing gradient clipping, learning rate too high for model size
+
+**Suggested action**: Check which parameters have zero/abnormal gradients:
+```python
+for name, param in model.named_parameters():
+    if param.grad is not None:
+        print(f"{{name}}: grad_norm={{param.grad.norm().item():.6f}}")
+    else:
+        print(f"{{name}}: NO GRADIENT")
+```
+"""
+
+    def _check_loss_sanity(self, cmd, result):
+        """D2: After step 0 and step 10, check loss is reasonable."""
+        if not self._porting_mode:
+            return ""
+        if not result:
+            return ""
+
+        # Extract loss values
+        loss_matches = re.findall(r'(?:loss|lm.loss)[:\s]+([0-9.eE+\-]+)', result, re.I)
+        if not loss_matches:
+            return ""
+
+        issues = []
+        try:
+            losses = [float(l) for l in loss_matches[:10]]
+        except ValueError:
+            return ""
+
+        if not losses:
+            return ""
+
+        first_loss = losses[0]
+
+        # Check step 0 loss against expected random init value
+        # For random init: loss ≈ ln(vocab_size). Common vocab sizes: 32k→10.4, 64k→11.1, 128k→11.8, 256k→12.4
+        if first_loss > 20:
+            issues.append(f"Initial loss={first_loss:.2f} is unusually high (expected ~10-12 for random init with typical vocab)")
+        elif first_loss < 0.1:
+            issues.append(f"Initial loss={first_loss:.4f} is suspiciously low — possible data leak or label issue")
+        elif 0.1 < first_loss < 5 and len(losses) == 1:
+            # Could be checkpoint-loaded, which is fine
+            pass
+
+        # Check if loss is decreasing (if we have multiple values)
+        if len(losses) >= 3:
+            if all(losses[i] >= losses[i-1] for i in range(1, min(5, len(losses)))):
+                issues.append(f"Loss is not decreasing over first {len(losses)} steps: {losses[:5]} — check learning rate or data pipeline")
+            if any(l != l or l == float('inf') for l in losses):  # NaN check
+                issues.append("Loss contains NaN or Inf values — critical issue")
+
+        if not issues:
+            return ""
+
+        return f"""
+[LOSS SANITY CHECK — INFORMATIONAL]
+
+Issues detected:
+{chr(10).join(f'- {issue}' for issue in issues)}
+
+**Reference values**:
+- Random init (no checkpoint): loss ≈ ln(vocab_size) — typically 10-12
+- Pretrained checkpoint: loss should be much lower (2-5 typical)
+- If loss = ln(vocab_size) WITH checkpoint loading: checkpoint was NOT loaded correctly
+
+**If loss is not decreasing**:
+- Learning rate too low or too high
+- Data pipeline returning constant/wrong data
+- Model parameters frozen or not connected to optimizer
+- Wrong loss function for the task
+"""
+
+    def _check_component_gradient_flow(self, cmd, result):
+        """D3: For multi-component models, check all components receive gradients."""
+        if not self._porting_mode or not self._component_plan_created:
+            return ""
+        if not result:
+            return ""
+
+        # Look for component-specific gradient info
+        no_grad_components = re.findall(r'(vision|vit|encoder|decoder|vae|router|expert).*?grad.*?(?:None|0\.0)', result, re.I)
+        if no_grad_components:
+            components = list(set(c.lower() for c in no_grad_components))
+            return f"""
+[COMPONENT GRADIENT FLOW CHECK — INFORMATIONAL]
+
+Components with zero/missing gradients detected: {', '.join(components)}
+
+**This means**: These components are not learning. Possible causes:
+- Component output is detached from the computation graph (`.detach()` or `torch.no_grad()`)
+- Component is frozen (`requires_grad=False`) unintentionally
+- Loss function doesn't flow through this component
+- Projection layer between components breaks gradient flow
+
+**Verification**:
+```python
+# Add after loss.backward():
+for name, param in model.named_parameters():
+    if any(comp in name.lower() for comp in {components}):
+        has_grad = param.grad is not None and param.grad.norm() > 0
+        print(f"{{name}}: has_grad={{has_grad}}")
+```
+
+**Fix**: Ensure the forward pass maintains gradient flow through all components. Check for `.detach()`, `@torch.no_grad()`, or missing connections.
+"""
+        return ""
+
+    def _check_checkpoint_numerical_verification(self, cmd, result):
+        """D4: After checkpoint loading, verify tensor statistics match HF originals."""
+        if not self._porting_mode:
+            return ""
+        if not result:
+            return ""
+        # Trigger on checkpoint load indicators
+        if not re.search(r'(?:loaded|loading|checkpoint|ckpt).*(?:success|done|complete)|successfully loaded', result, re.I):
+            return ""
+        # Check if numerical verification was already done
+        if re.search(r'mean.*std.*match|tensor.*verification.*pass|numerical.*check.*ok', result, re.I):
+            return ""
+        return """
+[CHECKPOINT NUMERICAL VERIFICATION — ACTION REQUIRED]
+
+Checkpoint loaded, but numerical correctness is NOT verified.
+Key mapping alone does NOT guarantee correct loading — tensors can be transposed, permuted, or scaled differently.
+
+**MANDATORY verification** (add to your conversion/loading script):
+```python
+import torch
+# After loading converted checkpoint into Megatron model:
+# Compare a few key tensors against HF originals
+hf_state = torch.load("hf_model.pt", map_location="cpu")
+mg_state = model.state_dict()
+
+checks = [
+    ("embed_tokens", "language_model.embedding.word_embeddings.weight"),
+    ("layers.0.self_attn.q_proj", "decoder.layers.0.self_attention.linear_qkv.weight"),
+    # Add model-specific mappings
+]
+for hf_key, mg_key in checks:
+    hf_t = hf_state[hf_key]
+    mg_t = mg_state[mg_key]
+    # For TP-sharded: compare full tensor or first shard
+    print(f"{hf_key}: HF mean={hf_t.float().mean():.6f} std={hf_t.float().std():.6f}")
+    print(f"{mg_key}: MG mean={mg_t.float().mean():.6f} std={mg_t.float().std():.6f}")
+    assert torch.allclose(hf_t.float().mean(), mg_t.float().mean(), atol=1e-4), f"MISMATCH: {hf_key}"
+```
+
+**Why this matters**: In the Bagel migration, key mapping appeared correct but tensor shapes were wrong (QKV packed differently), causing silent numerical divergence.
+"""
+
+    def _check_gpu_zombie_escalation(self, cmd, result):
+        """Detect GPU zombie processes and provide escalation strategy."""
+        if not result:
+            return ""
+        # Trigger on nvidia-smi showing memory used but no active process, or CUDA OOM
+        zombie_indicators = [
+            re.search(r'CUDA out of memory', result, re.I),
+            re.search(r'RuntimeError.*CUDA.*OOM', result, re.I),
+            re.search(r'No running processes found.*MiB.*[1-9]', result),
+            re.search(r'memory.used.*[1-9]\d{3,}.*MiB.*\|\s*0%', result),
+        ]
+        if not any(zombie_indicators):
+            return ""
+        return """
+[GPU ZOMBIE DETECTED — ESCALATION STRATEGY]
+
+GPU memory is occupied but no active training process is running. This blocks all future launches.
+
+**Escalation steps** (try in order):
+1. `nvidia-smi` — identify PIDs using GPU memory
+2. `kill -9 <PID>` — kill specific zombie processes
+3. `fuser -v /dev/nvidia*` — find ALL processes holding GPU device files
+4. `fuser -k /dev/nvidia*` — force-kill all GPU-holding processes
+5. `python -c "import torch; torch.cuda.empty_cache()"` — release cached memory
+6. If still stuck: `nvidia-smi --gpu-reset -i <gpu_id>` (CAUTION: resets GPU state)
+7. Last resort: container/node restart may be needed
+
+**Prevention**: Always use `pkill -f torchrun` or `pkill -f python.*train` before relaunching.
+Avoid `kill -9` on the parent process without also killing children — orphaned workers hold GPU memory.
+"""
+
+    # ── Phase 4 Gates: Specialized ───────────────────────────────────────
+
+    def _check_import_verification_gate(self, tool_name, arguments):
+        """A4: Before writing train_*.py, verify critical imports resolve."""
+        if self._imports_verified or not self._porting_mode:
+            return ""
+        if tool_name != "write_file":
+            return ""
+        path = arguments.get("path", "")
+        if not re.search(r'train_.*\.py|pretrain_', path):
+            return ""
+
+        content = arguments.get("content", "")
+        # Extract imports from the file being written
+        imports = re.findall(r'^(?:from|import)\s+(\S+)', content, re.MULTILINE)
+        critical_imports = [
+            imp for imp in imports
+            if any(kw in imp for kw in ("megatron", "transformer_engine", "flagscale", "apex"))
+        ]
+
+        if not critical_imports:
+            return ""
+
+        import_list = "\n".join(f"  python -c \"import {imp.split('.')[0]}; print({imp.split('.')[0]}.__file__)\"" for imp in set(imp.split('.')[0] for imp in critical_imports))
+
+        return f"""
+[IMPORT VERIFICATION GATE]
+
+**Context**: Writing training script with critical infrastructure imports. Unresolved imports waste the entire first launch attempt.
+
+**Why this gate exists**: Import errors are the #1 cause of "launch, wait 30s for model load, crash" cycles. 5 seconds of verification prevents this.
+
+**Critical imports detected**:
+{chr(10).join(f'- {imp}' for imp in critical_imports[:10])}
+
+**Quick verification** (run before writing):
+```bash
+{import_list}
+```
+
+**Your options**:
+- Run import verification (recommended) — 5 seconds, catches path issues
+- Skip if you already verified these imports earlier in this session
+- Skip if using exact same imports as a working reference implementation
+
+**Decision required**: Verify imports resolve or explain why you're confident they will.
+"""
+
+    def _check_tp_compatibility_gate(self, tool_name, arguments):
+        """C3: Before TP>1 with custom layers, verify sharded_state_dict() exists."""
+        if not self._porting_mode:
+            return ""
+        if tool_name != "shell":
+            return ""
+        cmd = arguments.get("command", "")
+        if not self._is_training_launch(cmd):
+            return ""
+
+        # Check if TP > 1
+        tp = self._extract_arg_value(cmd, r'tensor.model.parallel.size[=\s]+(\d+)')
+        if tp <= 1:
+            tp = self._extract_arg_value(cmd, r'--tp[=\s]+(\d+)')
+        if tp <= 1:
+            return ""
+
+        # Check if custom layers were written recently
+        recent_writes = [
+            str(args) for name, args in list(self._recent_tool_calls)[-30:]
+            if name == "write_file" and re.search(r'model|layer|module|attention', str(args), re.I)
+        ]
+        has_custom_layers = any(
+            re.search(r'class.*Module|class.*Layer|class.*Attention', w)
+            for w in recent_writes
+        )
+
+        if not has_custom_layers:
+            return ""
+
+        return f"""
+[TP COMPATIBILITY GATE]
+
+**Context**: Launching with TP={tp} and custom layers detected. Custom layers need explicit tensor-parallel support.
+
+**Why this gate exists**: Custom layers without `sharded_state_dict()` or proper column/row parallel linear layers will either crash or silently produce wrong results with TP>1.
+
+**What to verify for each custom layer**:
+1. Does it use `ColumnParallelLinear` / `RowParallelLinear` instead of `nn.Linear`?
+2. Does it implement `sharded_state_dict()` for checkpoint save/load with TP?
+3. Are attention heads divisible by TP? (num_heads % TP == 0)
+4. Are hidden dimensions divisible by TP where needed?
+
+**Your options**:
+- Verify custom layers have TP support (grep for sharded_state_dict, ColumnParallelLinear)
+- Launch with TP=1 first to verify correctness, then add TP support
+- Skip if custom layers are thin wrappers around existing Megatron modules (they inherit TP support)
+
+**Decision required**: Verify TP compatibility or explain why custom layers are TP-safe.
+"""
+
+    def _check_reference_comparison_gate(self, tool_name, arguments):
+        """A2: When source model has runnable training, require comparison plan."""
+        if self._reference_comparison_planned or not self._porting_mode:
+            return ""
+        if tool_name != "write_file":
+            return ""
+        path = arguments.get("path", "")
+        if not re.search(r'train_.*\.py|pretrain_', path):
+            return ""
+
+        # Check if reference implementation exists (detected from reads)
+        recent_reads = " ".join(
+            str(args) for name, args in list(self._recent_tool_calls)[-30:]
+            if name == "read_file"
+        )
+        has_reference = any(
+            kw in recent_reads.lower()
+            for kw in ("huggingface", "transformers", "reference", "original", "source_model")
+        )
+
+        if not has_reference:
+            self._reference_comparison_planned = True  # No reference available
+            return ""
+
+        return """
+[REFERENCE COMPARISON STRATEGY GATE]
+
+**Context**: You've read a reference implementation and are writing the FlagScale version. Have you planned what to compare at each step?
+
+**Why this gate exists**: Without a comparison plan, you'll finish the port and have no way to verify correctness until full training — by which time bugs are hard to isolate.
+
+**What you must plan** (document in workspace_experiment or plan):
+
+1. **get_batch output comparison**: Same input → same batch tensors?
+2. **Forward output comparison**: Same input → same logits/loss (within fp tolerance)?
+3. **Gradient comparison** (optional): Same input → similar gradient norms?
+
+For each comparison point:
+- What input will you use? (same sample, same seed)
+- What tolerance is acceptable? (exact match? 1e-5? 1e-3?)
+- How will you run the reference? (HF script? saved tensors?)
+
+**Your options**:
+- Create comparison plan in workspace_experiment — unlocks this gate
+- Skip if no runnable reference exists (only config.json available)
+- Skip if this is a standard architecture with known-correct FlagScale implementation
+
+**Decision required**: Document your comparison strategy or explain why comparison isn't feasible.
+"""
+
+    def _extract_arg_value(self, cmd: str, pattern: str) -> int:
+        """Extract integer argument value from command."""
+        match = re.search(pattern, cmd)
+        return int(match.group(1)) if match else 1
+
     # ── Infinite loop / duplicate tool call detection ──────────────────
 
     _LOOP_DETECTION_WINDOW = 10
     _LOOP_DETECTION_THRESHOLD = 3
-    _AUTOSAVE_INTERVAL = 10  # Save state every N tool calls within a turn
+    _AUTOSAVE_INTERVAL = 5  # Save state every N tool calls within a turn
 
     def _get_tool_call_key(self, tool_name, arguments):
         """Generate a hashable key for a tool call.
@@ -2540,12 +4052,18 @@ Load ops-discipline skill for full diagnosis protocol.
         return ""
 
     def _check_duplicate_read(self, tool_name, arguments):
-        """Detect duplicate tool calls within one turn (cache hit)."""
+        """Detect duplicate tool calls — within-turn cache hit or cross-compaction re-read."""
         if tool_name == "read_file":
             path = arguments.get("path", "")
             if not path:
                 return None
             key = ("read_file", path)
+            # Within-turn cache hit: return cached content
+            if key in self._tool_call_cache:
+                return self._tool_call_cache[key]
+            # Cross-compaction re-read: file was read before but content was compacted away
+            if path in self._files_read_this_session and key not in self._tool_call_cache:
+                return None  # Allow the read but we'll add a note in post-processing
         elif tool_name == "memory_write":
             mem_key = arguments.get("key", "")
             if not mem_key:
@@ -2757,6 +4275,21 @@ Load ops-discipline skill for full diagnosis protocol.
                 self._last_train_failure_reasons.append(reason)
                 pattern = self._classify_error_pattern(result[:2000])
                 self._error_pattern_history.append(pattern)
+
+                # Auto-checkpoint training failure to memory
+                try:
+                    error_summary = self._extract_error_summary(result[:2000])
+                    self.session_memory.put(
+                        f"train_failure_{self._consecutive_train_failures}",
+                        "finding",
+                        f"Training failure #{self._consecutive_train_failures} "
+                        f"(pattern: {pattern}): {error_summary[:300]}. "
+                        f"Cmd: {cmd[:100]}",
+                        self._session_id,
+                        task=self._workspace_manager.get_current_task(),
+                    )
+                except Exception:
+                    pass
 
                 # For verification scripts: 2 failures → force audit (lower threshold)
                 if is_verification and self._consecutive_train_failures >= 2:
@@ -3308,6 +4841,38 @@ Load ops-discipline skill for full diagnosis protocol.
             display.warn("Data pipeline gate: must understand source→processing→model input chain first")
             return data_gate_warning
 
+        # Understanding verification gate — hard block training code writes until understanding proven
+        understanding_warning = self._check_understanding_verification_gate(tool_name, arguments)
+        if understanding_warning:
+            display.warn("Understanding verification gate: prove understanding before writing training code")
+            return understanding_warning
+
+        # Component isolation plan gate — hard block training script for multi-component models
+        component_plan_warning = self._check_component_isolation_gate(tool_name, arguments)
+        if component_plan_warning:
+            display.warn("Component isolation gate: create component plan before writing training script")
+            return component_plan_warning
+
+        # Import verification gate — strong warning before writing training script with unverified imports
+        import_warning = self._check_import_verification_gate(tool_name, arguments)
+
+        # Reference comparison strategy gate — strong warning before writing without comparison plan
+        reference_warning = self._check_reference_comparison_gate(tool_name, arguments)
+
+        # Checkpoint verification gate — strong warning before training with unverified checkpoint
+        ckpt_warning = self._check_checkpoint_verified_gate(tool_name, arguments)
+
+        # Distributed prerequisite gate — strong warning about single-GPU verification
+        dist_warning = self._check_distributed_prerequisite_gate(tool_name, arguments)
+
+        # Pre-launch gates — strong warnings before training launch
+        failure_mode_warning = self._check_failure_mode_analysis_gate(tool_name, arguments)
+        sanity_warning = self._check_sanity_check_gate(tool_name, arguments)
+        config_model_warning = self._check_config_model_consistency_gate(tool_name, arguments)
+        env_warning = self._check_environment_consistency_gate(tool_name, arguments)
+        tp_warning = self._check_tp_compatibility_gate(tool_name, arguments)
+        component_int_warning = self._check_component_integration_gate(tool_name, arguments)
+
         # Progress gate check
         progress_warning = self._check_progress_gate(tool_name)
 
@@ -3359,13 +4924,28 @@ Load ops-discipline skill for full diagnosis protocol.
         if tool_name == "read_file" and not error:
             path = arguments.get("path", "")
             if path:
+                was_already_read = path in self._files_read_this_session
                 self._files_read_this_session.add(path)
                 # Track reading categories for quality gate
                 for cat, pattern in self._PORTING_READ_CATEGORIES.items():
                     if pattern.search(path):
                         self._reading_categories.add(cat)
+                # Cross-compaction re-read note
+                if was_already_read:
+                    result = (
+                        f"[NOTE: You already read this file earlier. "
+                        f"If you're re-reading after context compaction, record key findings to memory.]\n\n"
+                        + result
+                    )
             if len(result) > self._READ_FILE_SUMMARY_THRESHOLD:
                 result = self._summarize_file_content(result, path)
+
+        # Track write operations for auto-continue stagnation detection
+        if tool_name in ("write_file", "edit_file") and not error:
+            self._last_write_turn = self._turn_count
+            path = arguments.get("path", "") or arguments.get("file_path", "")
+            if path:
+                self._files_written_this_session.add(path)
 
         # Track porting mode activation
         if tool_name == "load_skill" and not error:
@@ -3414,6 +4994,86 @@ Load ops-discipline skill for full diagnosis protocol.
                 if any(kw in content for kw in ("data pipeline", "data format", "preprocessing", "data flow")):
                     self._data_pipeline_understood = True
                     logger.info("Data pipeline understanding confirmed via plan_create")
+
+        # Track new gate unlocking conditions
+        if self._porting_mode and not error:
+            content = str(arguments.get("content", "")).lower() if tool_name in ("workspace_experiment", "memory_write") else ""
+            args_lower = str(arguments).lower()
+
+            # A1: Understanding verification — unlock when understanding documented
+            if not self._understanding_verified and tool_name == "workspace_experiment":
+                understanding_kws = ("data flow", "model signature", "forward()", "get_batch",
+                                     "parallelism", "input format", "output format", "loss function")
+                if sum(1 for kw in understanding_kws if kw in content) >= 3:
+                    self._understanding_verified = True
+                    logger.info("Understanding verification gate unlocked")
+
+            # A3: Component isolation plan — unlock when plan created
+            if not self._component_plan_created and tool_name == "plan_create":
+                component_kws = ("component", "phase", "isolat", "verify forward", "verify backward",
+                                 "integration", "data flow order")
+                if sum(1 for kw in component_kws if kw in args_lower) >= 2:
+                    self._component_plan_created = True
+                    logger.info("Component isolation plan gate unlocked")
+
+            # B1: Failure mode analysis — unlock when analysis documented
+            if not self._failure_mode_analyzed and tool_name == "workspace_experiment":
+                failure_kws = ("failure mode", "what could go wrong", "how to detect",
+                               "what if", "most likely", "risk")
+                if sum(1 for kw in failure_kws if kw in content) >= 2:
+                    self._failure_mode_analyzed = True
+                    logger.info("Failure mode analysis gate unlocked")
+
+            # B2: Sanity checks — unlock when checks documented
+            if not self._sanity_checks_passed and tool_name == "workspace_experiment":
+                sanity_kws = ("sanity check", "data check", "model init", "config check",
+                              "checkpoint check", "all checks passed", "verified")
+                if sum(1 for kw in sanity_kws if kw in content) >= 2:
+                    self._sanity_checks_passed = True
+                    logger.info("Sanity check gate unlocked")
+
+            # B4: Config-model consistency — unlock when verified
+            if not self._config_model_verified and tool_name in ("workspace_experiment", "shell"):
+                if tool_name == "workspace_experiment":
+                    config_kws = ("config", "model __init__", "parameter", "mismatch", "consistent", "match")
+                    if sum(1 for kw in config_kws if kw in content) >= 2:
+                        self._config_model_verified = True
+                        logger.info("Config-model consistency gate unlocked")
+                elif tool_name == "shell" and "mismatch" not in (result or "").lower():
+                    cmd = arguments.get("command", "")
+                    if re.search(r'python.*config.*model|python.*verify.*config', cmd, re.I):
+                        self._config_model_verified = True
+                        logger.info("Config-model consistency gate unlocked via verification script")
+
+            # C2: Environment consistency — unlock when verified
+            if not self._env_verified and tool_name == "shell":
+                cmd = arguments.get("command", "")
+                if re.search(r'python.*-c.*import.*__file__|pip show|conda list', cmd) and not error:
+                    self._env_verified = True
+                    logger.info("Environment consistency gate unlocked")
+
+            # C4: Component integration — unlock when documented
+            if not self._component_integration_verified and tool_name == "workspace_experiment":
+                int_kws = ("component.*verified", "per-component", "individual.*test",
+                           "all components", "integration verified")
+                if sum(1 for kw in int_kws if re.search(kw, content)) >= 1:
+                    self._component_integration_verified = True
+                    logger.info("Component integration gate unlocked")
+
+            # A4: Import verification — unlock when imports tested
+            if not self._imports_verified and tool_name == "shell":
+                cmd = arguments.get("command", "")
+                if re.search(r'python.*-c.*"import|python.*-c.*\'import', cmd) and not error:
+                    self._imports_verified = True
+                    logger.info("Import verification gate unlocked")
+
+            # A2: Reference comparison — unlock when plan created
+            if not self._reference_comparison_planned:
+                if tool_name in ("plan_create", "workspace_experiment"):
+                    ref_kws = ("comparison", "reference", "compare", "baseline", "align")
+                    if sum(1 for kw in ref_kws if kw in args_lower) >= 2:
+                        self._reference_comparison_planned = True
+                        logger.info("Reference comparison strategy gate unlocked")
 
         # Verification ladder stage advancement
         if self._porting_mode and tool_name == "shell" and not error:
@@ -3548,6 +5208,24 @@ Load ops-discipline skill for full diagnosis protocol.
             if ckpt_warn:
                 result = result + ckpt_warn
 
+        # Auto-memory hint after writing model/training code
+        if tool_name in ("write_file", "edit_file") and not error and self._porting_mode:
+            path = arguments.get("path", "") or arguments.get("file_path", "")
+            if re.search(r'train_|pretrain_|model|get_batch|forward_step|dataset', path):
+                result = result + (
+                    "\n\n[AUTO-MEMORY] You just wrote/edited model code. "
+                    "Record what you implemented and why with memory_write "
+                    "(key: what_was_implemented, type: finding). "
+                    "This ensures cross-session recovery if context is compacted."
+                )
+
+        # Auto-update workspace current after verification stage advance
+        if not error and self._porting_mode:
+            self._auto_update_workspace_on_progress(tool_name, arguments)
+
+        # Auto-persist key events (training, kills, code changes, plan steps)
+        self._auto_persist_on_event(tool_name, arguments, result, error)
+
         # Track error state for error-escalation gate
         self._last_tool_had_error = error
         if error:
@@ -3560,6 +5238,14 @@ Load ops-discipline skill for full diagnosis protocol.
         if tool_name == "shell":
             cmd = arguments.get("command", "")
             result = self._check_dry_run_gate(cmd, result)
+            # Kill-retry loop detection
+            kill_warn = self._check_kill_retry_loop(cmd)
+            if kill_warn:
+                result = result + kill_warn
+            # Training hang detection
+            hang_warn = self._check_training_hang(cmd, result, elapsed)
+            if hang_warn:
+                result = result + hang_warn
 
         # Phase transition gate — check AFTER execution, only for successful calls
         phase_warning = ""
@@ -3574,6 +5260,36 @@ Load ops-discipline skill for full diagnosis protocol.
                 display.warn(f"Auto-loaded skill based on error pattern")
 
         # Inject enforcement warnings (with user notifications)
+        if import_warning:
+            result = import_warning + "\n" + result
+            display.warn("Import verification gate: verify critical imports before writing training script")
+        if reference_warning:
+            result = reference_warning + "\n" + result
+            display.warn("Reference comparison gate: create comparison strategy before implementation")
+        if ckpt_warning:
+            result = ckpt_warning + "\n" + result
+            display.warn("Checkpoint verification gate: verify converted checkpoint before training")
+        if dist_warning:
+            result = dist_warning + "\n" + result
+            display.warn("Distributed prerequisite gate: consider single-GPU verification first")
+        if failure_mode_warning:
+            result = failure_mode_warning + "\n" + result
+            display.warn("Failure mode analysis gate: analyze failure modes before first launch")
+        if sanity_warning:
+            result = sanity_warning + "\n" + result
+            display.warn("Sanity check gate: run 4 critical checks before first real training")
+        if config_model_warning:
+            result = config_model_warning + "\n" + result
+            display.warn("Config-model consistency gate: verify config matches model parameters")
+        if env_warning:
+            result = env_warning + "\n" + result
+            display.warn("Environment consistency gate: verify package paths")
+        if tp_warning:
+            result = tp_warning + "\n" + result
+            display.warn("TP compatibility gate: verify custom layers support tensor parallelism")
+        if component_int_warning:
+            result = component_int_warning + "\n" + result
+            display.warn("Component integration gate: verify per-component before full training")
         if progress_warning:
             result = progress_warning + "\n" + result
             display.warn("Progress gate: too many tool calls without output")
@@ -3589,6 +5305,27 @@ Load ops-discipline skill for full diagnosis protocol.
         if phase_warning:
             result = phase_warning + "\n" + result
             display.warn("Phase transition: prerequisites not met for next phase")
+
+        # Post-launch informational gates (D1, D2, D3, D4) — append to training output
+        if tool_name == "shell" and not error:
+            cmd = arguments.get("command", "")
+            if self._is_training_launch(cmd) and result:
+                grad_info = self._check_gradient_health(cmd, result)
+                if grad_info:
+                    result = result + "\n" + grad_info
+                loss_info = self._check_loss_sanity(cmd, result)
+                if loss_info:
+                    result = result + "\n" + loss_info
+                component_grad_info = self._check_component_gradient_flow(cmd, result)
+                if component_grad_info:
+                    result = result + "\n" + component_grad_info
+                ckpt_info = self._check_checkpoint_numerical_verification(cmd, result)
+                if ckpt_info:
+                    result = result + "\n" + ckpt_info
+            # GPU zombie detection — applies to any shell command showing GPU issues
+            zombie_info = self._check_gpu_zombie_escalation(cmd, result)
+            if zombie_info:
+                result = result + "\n" + zombie_info
 
         # Track for next call's workaround detection
         cmd_key = arguments.get("command", "") if tool_name == "shell" else tool_name
@@ -3629,6 +5366,10 @@ Load ops-discipline skill for full diagnosis protocol.
             if re.search(pattern, cmd_lower):
                 return True
         return False
+
+    def _is_training_launch(self, cmd):
+        """Check if a command is a training launch command."""
+        return bool(self._TRAIN_LAUNCH_RE.search(cmd))
 
     def _append_tool_results(self, tool_results):
         """Append tool results, merging into one message for Anthropic compatibility."""

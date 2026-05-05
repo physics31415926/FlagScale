@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import time
 
 from typing import Dict, List, Optional
@@ -16,7 +17,7 @@ _TYPE_PRIORITY = {"finding": 0, "decision": 1, "todo": 2, "context": 3}
 class SessionMemory:
     """Incremental memory for cross-session continuity with TTL expiration."""
 
-    def __init__(self, memory_dir: str, ttl_days: int = 7):
+    def __init__(self, memory_dir: str, ttl_days: int = 30):
         self._dir = memory_dir
         self._ttl = ttl_days * 86400
         self._cleanup_expired()  # Clean up expired entries on init
@@ -41,12 +42,28 @@ class SessionMemory:
         if removed > 0:
             logger.info("Cleaned up %d expired memory entries", removed)
 
+    _KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,78}[a-z0-9]$")
+
+    @staticmethod
+    def sanitize_key(raw: str) -> str:
+        """Normalize a raw key to lowercase alphanumeric + underscores, max 80 chars."""
+        k = raw.lower().strip()
+        k = re.sub(r"[^a-z0-9]+", "_", k)
+        k = k.strip("_")
+        if len(k) > 80:
+            k = k[:80].rstrip("_")
+        return k
+
+    @classmethod
+    def is_valid_key(cls, key: str) -> bool:
+        return bool(cls._KEY_RE.match(key))
+
     def _entry_path(self, key: str) -> str:
-        safe_key = key.replace("/", "_").replace(" ", "_")
-        return os.path.join(self._dir, f"{safe_key}.yaml")
+        return os.path.join(self._dir, f"{key}.yaml")
 
     def get(self, key: str) -> Optional[dict]:
-        path = self._entry_path(key)
+        safe = self.sanitize_key(key) if not self.is_valid_key(key) else key
+        path = self._entry_path(safe)
         if not os.path.isfile(path):
             return None
         try:
@@ -55,33 +72,56 @@ class SessionMemory:
         except Exception:
             return None
         if not self._is_valid(entry):
-            self.delete(key)
+            self.delete(safe)
             return None
         return entry
 
-    def put(self, key: str, mem_type: str, content: str, session_id: str = "", task: str = ""):
+    def put(self, key: str, mem_type: str, content: str, session_id: str = "", task: str = "", priority: str = "normal", scope: str = "persistent"):
         os.makedirs(self._dir, exist_ok=True)
+        safe = self.sanitize_key(key) if not self.is_valid_key(key) else key
         entry = {
-            "key": key,
+            "key": safe,
             "type": mem_type,
             "content": content,
             "session_id": session_id,
             "task": task,
+            "priority": priority,
+            "scope": scope,
             "created": time.time(),
         }
-        path = self._entry_path(key)
+        path = self._entry_path(safe)
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(entry, f, allow_unicode=True, default_flow_style=False)
         return path
 
     def delete(self, key: str) -> bool:
-        path = self._entry_path(key)
+        safe = self.sanitize_key(key) if not self.is_valid_key(key) else key
+        path = self._entry_path(safe)
         if os.path.isfile(path):
             os.remove(path)
             return True
         return False
 
-    def list_entries(self) -> List[dict]:
+    def cleanup_session(self, session_id: str) -> int:
+        """Remove all session-scoped entries for a given session. Called at session end."""
+        if not os.path.isdir(self._dir):
+            return 0
+        count = 0
+        for fname in os.listdir(self._dir):
+            if not fname.endswith(".yaml"):
+                continue
+            path = os.path.join(self._dir, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    entry = yaml.safe_load(f)
+                if entry.get("scope") == "session" and entry.get("session_id") == session_id:
+                    os.remove(path)
+                    count += 1
+            except Exception:
+                continue
+        return count
+
+    def list_entries(self, scope_filter: str = "") -> List[dict]:
         if not os.path.isdir(self._dir):
             return []
         entries = []
@@ -93,19 +133,27 @@ class SessionMemory:
                 with open(path, "r", encoding="utf-8") as f:
                     entry = yaml.safe_load(f)
                 if self._is_valid(entry):
+                    if scope_filter and entry.get("scope", "persistent") != scope_filter:
+                        continue
                     entries.append(entry)
             except Exception:
                 continue
         return entries
 
-    def recent(self, max_tokens: int = 4000, task_filter: str = "") -> List[dict]:
+    def recent(self, max_tokens: int = 4000, task_filter: str = "", current_session_id: str = "") -> List[dict]:
         """Return entries within a token budget, prioritized by task relevance, type, then recency.
 
         If task_filter is provided, entries matching that task come first, then other entries.
         Priority within each group: finding > decision > todo > context.
         Within the same type, newest entries come first.
+        Session-scoped entries from other sessions are excluded.
         """
         entries = self.list_entries()
+        # Exclude session-scoped entries from other sessions
+        if current_session_id:
+            entries = [e for e in entries
+                       if e.get("scope", "persistent") != "session"
+                       or e.get("session_id") == current_session_id]
 
         if task_filter:
             # Split into task-matching and other entries
@@ -174,5 +222,7 @@ class SessionMemory:
         return count
 
     def _is_valid(self, entry: dict) -> bool:
+        if entry.get("priority") == "high":
+            return True
         created = entry.get("created", 0)
         return time.time() - created <= self._ttl

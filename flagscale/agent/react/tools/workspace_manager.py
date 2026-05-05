@@ -15,6 +15,7 @@ class WorkspaceManager:
         self._dir = workspace_dir or os.path.join(Path.home(), ".flagscale", "workspace_state")
         self._current_path = os.path.join(self._dir, "current.yaml")
         self._hardware_path = os.path.join(self._dir, "hardware.yaml")
+        self._snapshot_path = os.path.join(self._dir, "snapshot.yaml")
         self._experiments_dir = os.path.join(self._dir, "experiments")
 
     # ── Current State ───────────────────────────────────────────────────
@@ -62,10 +63,43 @@ class WorkspaceManager:
         current = self.read_current()
         return current.get("task", "")
 
+    def write_current(self, data: Dict) -> str:
+        """Write full current.yaml (used by auto-update mechanisms)."""
+        os.makedirs(self._dir, exist_ok=True)
+        try:
+            with open(self._current_path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            return "OK"
+        except Exception as e:
+            return f"ERROR: {e}"
+
     def get_current_experiment(self) -> str:
         """Get the current_experiment field from current.yaml. Returns empty string if not set."""
         current = self.read_current()
         return current.get("current_experiment", "")
+
+    # ── Snapshot ───────────────────────────────────────────────────────
+
+    def write_snapshot(self, snapshot: Dict) -> str:
+        """Write unified snapshot — single source of truth for session recovery."""
+        os.makedirs(self._dir, exist_ok=True)
+        snapshot["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(self._snapshot_path, "w", encoding="utf-8") as f:
+                yaml.dump(snapshot, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            return "OK"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    def read_snapshot(self) -> Dict:
+        """Read snapshot.yaml. Returns empty dict if not exists."""
+        if not os.path.isfile(self._snapshot_path):
+            return {}
+        try:
+            with open(self._snapshot_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
 
     # ── Hardware ────────────────────────────────────────────────────────
 

@@ -6,17 +6,18 @@ Launch and manage FlagScale distributed training runs with proper preflight chec
 
 1. **Connect to Server** — Use `conda run --prefix <env_path> <command>` for non-interactive shells
 2. **Check Environment** — Verify GPU availability (`nvidia-smi`), conda env, multi-node connectivity
-3. **Preflight Check** — 10 checks before launching:
+3. **Preflight Check** — checks before launching:
    - 3a. Core dependencies (torch, megatron, transformer_engine)
    - 3b. GPU availability
    - 3c. Data path validation
    - 3d. Topology freshness (optional)
    - 3e. **Dry run — HARD GATE** (2-step run at target parallelism)
-   - 3f. Config arithmetic (TP × PP × DP = world_size)
-   - 3g. Checkpoint compatibility
-   - 3h. Memory budget estimation
-   - 3i. **Data pipeline standalone test — HARD GATE**
-   - 3j. Checkpoint loading verification (step-0 loss check)
+   - 3f. **Launch script validation** — read source code (argument parser, launcher, existing examples) to validate config
+   - 3g. Config arithmetic (TP × PP × DP = world_size)
+   - 3h. Checkpoint compatibility
+   - 3i. Memory budget estimation
+   - 3j. **Data pipeline standalone test — HARD GATE**
+   - 3k. Checkpoint loading verification (step-0 loss check)
 4. **Start/Stop Training** — `flagscale train` CLI or legacy `python pretrain_*.py`
 5. **Monitor** — Log tailing, loss tracking, GPU utilization
 

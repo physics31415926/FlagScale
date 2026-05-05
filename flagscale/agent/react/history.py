@@ -9,9 +9,15 @@ logger = logging.getLogger(__name__)
 
 SUMMARIZE_PROMPT = (
     "Summarize the key conclusions, decisions, and findings from this conversation segment. "
-    "Focus on: what was tried, what worked, what failed and why, what was ruled out. "
-    "Be specific about technical details (function names, error messages, version numbers). "
-    "Keep the summary under 500 tokens."
+    "PRESERVE with high fidelity:\n"
+    "- File paths that were read or modified\n"
+    "- Error messages and their root causes\n"
+    "- Solutions and workarounds found\n"
+    "- Decisions made and their rationale\n"
+    "- Current approach/strategy and what phase we're in\n"
+    "- What was ruled out and why\n"
+    "Be specific about technical details (function names, error messages, version numbers, shapes). "
+    "Keep the summary under 1000 tokens."
 )
 
 COMPACTION_NOTICE = (
@@ -23,7 +29,7 @@ COMPACTION_NOTICE = (
     "</context-compacted>"
 )
 
-MAX_SUMMARY_TOKENS = 2000
+MAX_SUMMARY_TOKENS = 4000
 TRUNCATE_THRESHOLD = 2000
 KEEP_RECENT = 12  # Reduced from 20 to limit recent message token consumption
 AGING_WINDOW = 10
@@ -183,12 +189,17 @@ class HistoryManager:
         self._last_inflation_ratio = 1.0  # Preserve inflation ratio across compactions
         self._summarizer: Optional[Callable[[str], str]] = None
         self._accumulated_summary: str = ""
+        self._compaction_anchors: List[str] = []
         self._compaction_happened = False
         self._compaction_count = 0
 
     def set_summarizer(self, callback: Callable[[str], str]):
         """Inject LLM summarization callback. Signature: (text) -> summary_string."""
         self._summarizer = callback
+
+    def set_compaction_anchors(self, anchors: List[str]):
+        """Set anchors that MUST be preserved in the next compaction summary."""
+        self._compaction_anchors = anchors[:10]
 
     @property
     def messages(self) -> List[Dict[str, Any]]:
@@ -277,7 +288,8 @@ class HistoryManager:
         if new_estimated > local_target:
             to_drop, to_keep = _collect_droppable(result, local_target)
             if to_drop and self._summarizer:
-                summary_text = self._build_summary_input(to_drop)
+                summary_text = self._build_summary_input(to_drop, self._compaction_anchors)
+                self._compaction_anchors = []
                 try:
                     new_summary = self._summarizer(summary_text)
                     self._merge_summary(new_summary)
@@ -349,7 +361,8 @@ class HistoryManager:
             to_drop, to_keep = _collect_droppable(result, local_target)
 
             if to_drop and self._summarizer:
-                summary_text = self._build_summary_input(to_drop)
+                summary_text = self._build_summary_input(to_drop, self._compaction_anchors)
+                self._compaction_anchors = []
                 try:
                     new_summary = self._summarizer(summary_text)
                     self._merge_summary(new_summary)
@@ -383,7 +396,7 @@ class HistoryManager:
         self._compaction_count += 1
         return _validate_tool_pairs(list(self._messages))
 
-    def _build_summary_input(self, messages: List[Dict[str, Any]]) -> str:
+    def _build_summary_input(self, messages: List[Dict[str, Any]], anchors: Optional[List[str]] = None) -> str:
         """Build text input for the summarizer from messages about to be dropped."""
         parts = []
         for msg in messages:
@@ -392,10 +405,16 @@ class HistoryManager:
             if text.strip():
                 parts.append(f"[{role}] {text}")
         combined = "\n---\n".join(parts)
-        # Cap at ~8k tokens worth of text
         if len(combined) > 32000:
             combined = combined[:32000] + "\n[... truncated for summarization ...]"
-        return f"{SUMMARIZE_PROMPT}\n\n---\nConversation segment:\n{combined}"
+        anchor_section = ""
+        if anchors:
+            anchor_section = (
+                "\n\nMANDATORY ANCHORS — these MUST appear verbatim in your summary:\n"
+                + "\n".join(f"- {a}" for a in anchors[:10])
+                + "\n"
+            )
+        return f"{SUMMARIZE_PROMPT}{anchor_section}\n\n---\nConversation segment:\n{combined}"
 
     def _merge_summary(self, new_summary: str):
         """Merge new summary into accumulated summary, keeping total under limit."""

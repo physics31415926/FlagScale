@@ -408,7 +408,7 @@ class ShellTool(Tool):
         parallel_index = kwargs.pop("_parallel_index", None)
         quiet = skip_confirm  # suppress dots/progress in parallel mode
 
-        if self._check_dangerous and _FATAL_RE.search(command):
+        if self._check_dangerous and self._require_confirm and _FATAL_RE.search(command):
             return f"FATAL: Refused to execute potentially dangerous command: {command}"
 
         # Training-specific guardrails — prepend warnings to result

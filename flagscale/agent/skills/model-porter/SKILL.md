@@ -295,6 +295,29 @@ TE's `DotProductAttention` with `attn_mask_type="causal"` IGNORES any custom att
 - Padding/truncation that changes sequence length differently on different ranks → shape mismatch in all-reduce
 - Position IDs not accounting for CP sequence offset → wrong RoPE embeddings on non-zero CP ranks
 
+### Failure Pivot Discipline (MANDATORY)
+
+When a training launch or verification step fails, the agent MUST follow this escalation protocol:
+
+**2-strike rule**: If the same category of error occurs twice consecutively (e.g., two shape mismatches, two import errors, two NCCL timeouts), STOP fixing forward. Instead:
+
+1. **Pause execution** — do not attempt a 3rd fix of the same type
+2. **Root cause audit** — re-read the relevant source code (model forward, get_batch, config) end-to-end
+3. **Identify the systemic gap** — the repeated failure usually means a wrong assumption upstream, not a local bug
+4. **Report to user** — explain what you found and propose a different approach
+5. **Only proceed after confirming the new approach**
+
+**Error categories** (same category = same strike counter):
+- Shape/dimension errors (tensor size mismatch, broadcast failure)
+- Import/module errors (ModuleNotFoundError, AttributeError on module)
+- Parallelism errors (NCCL timeout, rank mismatch, hang)
+- Data pipeline errors (wrong batch format, missing keys, dtype mismatch)
+- Config errors (unknown argument, invalid value)
+
+**Why this matters**: In the Bagel migration, the agent attempted 4+ fixes for forward_step signature errors that all stemmed from one root cause (get_batch not implemented). Each fix took 10-20 minutes of GPU time. The 2-strike rule would have saved 2+ hours.
+
+**Anti-pattern to avoid**: "Let me try one more small fix" after 2 failures. This is the #1 time waster in migration tasks. The small fix is almost never the answer — the problem is upstream.
+
 ## Overview
 
 FlagScale supports models in three modes:
@@ -556,17 +579,45 @@ For models with significant architectural gaps (multiple unsupported components,
 
 Goal: The model runs correctly on a single GPU with the same forward/backward behavior as the source.
 
-Work items:
-1. **Component inventory**: List every architectural component in the source model. For each, classify as:
-   - `SUPPORTED`: exists in Megatron-LM-FL (use config flag)
-   - `ADAPTABLE`: close to an existing component (inherit and modify)
-   - `CUSTOM`: must be implemented from scratch
-2. **Custom entrypoint**: Create `train_<model>.py` with model builder, forward step, data pipeline
-3. **Custom layers/modules**: Implement CUSTOM components as Megatron `TransformerLayer` submodules or standalone modules
-4. **Checkpoint conversion**: `tools/checkpoint/<model>/` (args.py, ckpt.py, convert.py)
-5. **Forward alignment**: Verify logits match source model on identical input (Step 5)
-6. **Loss alignment**: Ensure all loss terms (lm_loss + auxiliary losses) match source (Step 5.3)
-7. **Single-GPU training**: Run a few iterations with DP=1, TP=1, PP=1, verify loss curve matches source
+**EXECUTION ORDER IS MANDATORY — follow the sequence below. Do NOT skip ahead.**
+
+The order is: data pipeline → model code → checkpoint → verification → training.
+Rationale: data flows through the entire system. If get_batch is wrong, every subsequent step debugs phantom errors. Implementing data pipeline first eliminates the #1 source of cascading failures in migration tasks.
+
+Work items (execute in this exact order):
+
+**Step 1.1 — Component inventory** (analysis only, no code yet):
+- List every architectural component in the source model. For each, classify as:
+  - `SUPPORTED`: exists in Megatron-LM-FL (use config flag)
+  - `ADAPTABLE`: close to an existing component (inherit and modify)
+  - `CUSTOM`: must be implemented from scratch
+
+**Step 1.2 — Data pipeline implementation** (MUST complete before Step 1.4):
+- **First**: Read existing `get_batch` implementations in FlagScale — look at `examples/<similar_model>/` and `flagscale/train/megatron/train_<similar>.py` to understand the pattern
+- **Then**: Read the Megatron dataloader code (`megatron/training/training.py`, `megatron/core/datasets/`) to understand how data flows from dataset to model
+- Implement `get_batch` / `get_batch_on_this_tp_rank` following the patterns you read
+- Test data pipeline standalone: load a batch, print shapes, verify it matches what the model's forward() expects
+- **GATE**: Do NOT proceed to Step 1.4 until data pipeline produces correct batches. Run standalone and confirm output shapes match model input signatures.
+
+**Step 1.3 — Custom layers/modules**:
+- Implement CUSTOM components as Megatron `TransformerLayer` submodules or standalone modules
+
+**Step 1.4 — Custom entrypoint** (requires Step 1.2 complete):
+- Create `train_<model>.py` with model builder, forward step
+- Wire the data pipeline from Step 1.2 into the entrypoint
+- The forward_step function MUST use the get_batch implemented in Step 1.2 — never use synthetic/random data as a substitute
+
+**Step 1.5 — Checkpoint conversion**:
+- `tools/checkpoint/<model>/` (args.py, ckpt.py, convert.py)
+
+**Step 1.6 — Forward alignment**:
+- Verify logits match source model on identical input (Step 5)
+
+**Step 1.7 — Loss alignment**:
+- Ensure all loss terms (lm_loss + auxiliary losses) match source (Step 5.3)
+
+**Step 1.8 — Single-GPU training**:
+- Run a few iterations with DP=1, TP=1, PP=1, verify loss curve matches source
 
 Deliverables: Working single-GPU training with verified forward/loss alignment.
 
@@ -1121,6 +1172,43 @@ Each stage catches different failure classes:
 - `forward_aligned`: shape errors, wrong attention implementation, broken projections
 - `backward_ok`: gradient computation errors, non-differentiable ops, memory issues
 - `distributed_ok`: NCCL hangs, TP split errors, PP stage assignment bugs
+
+---
+
+## Step 4.7: Pre-Launch Validation (MANDATORY before first training run)
+
+Before launching training for the first time, validate your config and launch script against the actual FlagScale/Megatron-LM-FL source code:
+
+**Read the source to understand what's expected:**
+
+1. **Argument parser** — Read `megatron/training/arguments.py` (or your model's custom argparse) to understand:
+   - Expected types and formats for each CLI flag
+   - Which arguments are required vs optional
+   - Valid value ranges and constraints
+   - How arguments interact (e.g., warmup_iters must be < train_iters)
+
+2. **Launcher code** — Read how FlagScale generates launch scripts (`flagscale/launcher/`) to understand:
+   - How config YAML maps to CLI arguments
+   - How parallelism settings translate to torchrun arguments
+   - What environment variables are set
+
+3. **Existing examples** — Read `examples/<similar_model>/conf/` to see:
+   - Working config structures for similar models
+   - How data paths are specified
+   - How parallelism is configured
+   - Common patterns for checkpoint, logging, and optimizer settings
+
+4. **Data pipeline code** — Trace how your `--data-path` or dataset config is consumed:
+   - Read the dataset class implementation
+   - Understand expected file formats and naming conventions
+   - Verify your paths match what the code expects
+
+5. **Checkpoint loading code** — If loading a checkpoint, read the checkpoint loading logic to understand:
+   - Expected directory structure
+   - How TP/PP affects checkpoint format
+   - What happens when TP/PP mismatch
+
+**The source code is the ground truth.** Don't rely on static checklists — they become stale. When in doubt about a config value, read the code that consumes it.
 
 ---
 

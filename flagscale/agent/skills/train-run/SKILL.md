@@ -193,7 +193,18 @@ Verify: correct GPU count (`--nproc_per_node`), correct entrypoint, all expected
 
 For third-party reproduction tasks (no FlagScale launcher): construct the full launch command, print it, and verify it manually before executing. Check: correct `--nproc_per_node`, correct `PYTHONPATH`, correct entrypoint script, all required CLI args present, no placeholder paths in any referenced config files.
 
-### 3f. Config Arithmetic Verification
+### 3f. Launch Script Validation (MANDATORY)
+
+Before launching, validate the generated launch script against the actual FlagScale source code:
+
+1. **Read the argument parser** — find how each CLI flag is parsed in the entrypoint (e.g., `megatron/training/arguments.py` or the model's custom argparse). Verify your config values match the expected types and formats defined there.
+2. **Read the launcher code** — understand how FlagScale generates and executes launch scripts. Check that your config produces the expected command structure.
+3. **Read existing examples** — look at `examples/<similar_model>/conf/` for reference configs. Compare your config structure, field names, and value formats against working examples.
+4. **Trace the data path** — follow how `--data-path` or equivalent is consumed by the dataloader code. Verify your paths match what the code expects (prefix format, file extensions, index files).
+
+The source code defines what's valid — not a static checklist. If you're unsure about a config value, read the code that consumes it.
+
+### 3g. Config Arithmetic Verification
 
 Before launching, verify ALL of the following. Do not skip any item:
 - `global_batch_size % (micro_batch_size × data_parallel_size) == 0`

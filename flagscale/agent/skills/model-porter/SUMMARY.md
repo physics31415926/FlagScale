@@ -18,9 +18,18 @@ Port HuggingFace/custom models to FlagScale (Megatron-LM-FL).
 2. **Architecture Matching** — Compare with Megatron's supported components. Find closest existing FlagScale model.
 3. **Determine Porting Path** — Mode A if all components match. Otherwise present Mode B vs Mode C to user with model-specific analysis.
 4. **Checkpoint Conversion** — Generate weight mapping, handle TP/PP sharding, verify key counts + shapes + norms.
+4.7. **Pre-Launch Validation** — Read FlagScale/Megatron source code to validate config against actual argument parsers, launcher code, and existing examples. Source code is ground truth, not static checklists.
 5. **Get Training Running** — 2-step dry run at target parallelism, verify loss is finite and decreasing.
 6. **Precision Alignment** — Compare loss/logits with HF reference.
 7. **Summary and Memory** — Record findings, decisions, and gotchas.
+
+## Critical Execution Order (Phase 1)
+
+**Data pipeline MUST come first**: get_batch → dataset → model code → training script.
+
+Rationale: If get_batch is wrong, every subsequent step debugs phantom errors. Read existing `examples/<similar_model>/` implementations to understand FlagScale patterns before writing your own.
+
+**2-Strike Pivot Rule**: After 2nd consecutive failure in same error category (shape/import/parallelism/data/config), STOP. Do root-cause audit instead of trying a 3rd incremental fix.
 
 ## Mode C Reference Implementation
 
@@ -39,10 +48,12 @@ Mode C uses `_hf_fsdp2` suffix: `train_<model>_hf_fsdp2.py`, `<model>_model_hf_f
 ## Key Gates (Engineering Enforced)
 
 - **Porting Path Gate**: Must confirm Mode B/C with user before writing porting code
+- **Data Pipeline Gate**: Must implement and verify get_batch BEFORE writing training scripts
 - **Reading Depth**: Must read ≥8 files before writing porting code
 - **Reading Quality**: Must cover 3/4 categories (source_model, megatron_base, existing_impl, checkpoint)
 - **Analysis Persistence**: Must persist analysis to workspace before coding
 - **Verification Ladder**: none → analysis → init_ok → forward_aligned → backward_ok → distributed_ok → full_training
+- **Pivot Rule**: 2 consecutive failures of same category → mandatory stop and root-cause audit
 
 ## Existing Model Examples
 
@@ -54,7 +65,11 @@ Mode C uses `_hf_fsdp2` suffix: `train_<model>_hf_fsdp2.py`, `<model>_model_hf_f
 
 ## Phased Migration Strategy
 
+Phase 1 execution order: component inventory → **data pipeline** → custom layers → entrypoint → checkpoint → verification → training.
+
 Mode C as Phase 0 → Mode B as Phase 1 → Scale up as Phase 2. De-risks native port by providing reference baseline.
+
+**Core principle**: Deep-read FlagScale/Megatron-LM-FL/TransformerEngine-FL source code to understand patterns before implementing. Source code is ground truth — not static checklists or remembered patterns.
 
 ## Related Skills
 

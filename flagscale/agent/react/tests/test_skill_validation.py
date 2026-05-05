@@ -23,6 +23,7 @@ EXPECTED_SKILLS = {
     "precision-alignment",
     "ops-discipline",
     "workspace-layout",
+    "parallel-strategy",
 }
 
 REQUIRED_FRONTMATTER_FIELDS = {"name", "description", "keywords"}

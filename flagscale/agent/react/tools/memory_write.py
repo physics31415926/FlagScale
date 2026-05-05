@@ -33,7 +33,7 @@ class MemoryWriteTool(Tool):
         "properties": {
             "key": {
                 "type": "string",
-                "description": "Short identifier for this memory (e.g. 'aquila70b_tp_oom', 'parallel_strategy_final', 'todo_test_ep').",
+                "description": "Short identifier, lowercase alphanumeric and underscores only, 2-80 chars (e.g. 'aquila70b_tp_oom', 'parallel_strategy_final'). NO error messages, hashes, or special characters.",
             },
             "type": {
                 "type": "string",
@@ -69,8 +69,25 @@ class MemoryWriteTool(Tool):
         content = kwargs["content"]
         supersedes = kwargs.get("supersedes", [])
         task = self._get_current_task()
+
+        from flagscale.agent.react.memory import SessionMemory
+
+        if not SessionMemory.is_valid_key(key):
+            sanitized = SessionMemory.sanitize_key(key)
+            if not sanitized or not SessionMemory.is_valid_key(sanitized):
+                return (
+                    f"ERROR: Invalid memory key '{key}'. "
+                    "Key must be 2-80 chars, lowercase alphanumeric and underscores only "
+                    "(e.g. 'bagel_tp_oom', 'parallel_strategy_final'). "
+                    "Do not use error messages, hashes, or special characters as keys."
+                )
+            return (
+                f"ERROR: Invalid memory key '{key}'. "
+                f"Suggested key: '{sanitized}'. "
+                "Key must be 2-80 chars, lowercase alphanumeric and underscores only."
+            )
+
         try:
-            # Delete superseded entries first
             deleted = []
             for old_key in supersedes:
                 if self._memory.delete(old_key):
