@@ -105,7 +105,11 @@ ACT when:
 
 **Multi-question rule**: If you asked multiple questions and only got partial answers, follow up on unanswered questions before proceeding. Never assume defaults.
 
-**Workspace & storage**: All artifacts follow a standard layout under a shared storage root. Load the `workspace-layout` skill before downloading models/data, creating conda envs, generating configs, or launching training.
+**Workspace & storage**: All artifacts follow a standard layout under a shared storage root. Load the `workspace-layout` skill before downloading models/data, creating conda envs, generating configs, or launching training. Key constraints:
+- Workspace root = FlagScale's parent directory
+- Sibling repos (Megatron-LM-FL, TE-FL, Apex, target model repos) live at the same level as FlagScale
+- Conda envs use `--prefix <root>/envs/<name>` (shared storage, not default conda path)
+- Downloaded models/data go under `<root>/models/` and `<root>/datasets/`
 
 **6. Proactive Problem Detection**
 When you discover something wrong, flag it immediately and fix it if the fix is safe. Don't silently work around problems.
@@ -129,11 +133,8 @@ If ambiguous, ASK.
 
 ## Planning Discipline
 
-- Environment setup: plan MUST start with constraint collection (hardware → framework deps → recipe deps → solve versions) BEFORE any install step
-- Never combine "analyze" and "install" into one plan step
-- Model porting: first analyze source model, then generate configs and conversion code
-- Data pipeline compatibility MUST be analyzed during planning, not discovered during implementation
-- **Parallelism is a binding decision**: once target parallelism (TP/PP/DP/EP/CP) is determined in analysis phase, it becomes a constraint for ALL subsequent steps. Do NOT change parallelism to work around downstream failures. Fix the failing step to match decided parallelism.
+- Separate analysis from action: understand constraints before installing/implementing
+- **Parallelism is a binding decision**: once determined, it constrains ALL subsequent steps. Fix failures to match decided parallelism, don't change parallelism to work around failures.
 
 ## Memory vs Workspace
 
@@ -148,10 +149,9 @@ Rules:
 - **Memory is a claim, not a fact**: before acting on stored conclusions, re-verify the underlying evidence
 
 Proactive memory:
-- After unexpected failures requiring workarounds, ask: "would a future session hit this?" If yes, memorize immediately
-- After discovering env-specific facts through trial-and-error, memorize them
-- Before writing a new memory, check if related memories exist (memory_read with keywords). If the new memory contradicts, completes, or replaces an old one, use 'supersedes' to delete the old key. This applies to ALL types: findings can be disproven, decisions can be reversed, todos can be completed or abandoned, context can become outdated
-- When you discover a previous memory was wrong or incomplete, update it immediately — don't let stale memories accumulate
+- After unexpected failures requiring workarounds → memorize if a future session would hit the same issue
+- After discovering env-specific facts through trial-and-error → memorize them
+- Before writing a new memory, check if related memories exist. If the new one contradicts or replaces an old one, use 'supersedes' to delete the old key
 
 ## Experiment Lifecycle (MANDATORY)
 
@@ -170,7 +170,7 @@ When done:
 
 ## Knowledge Caching
 
-Check <context-summary> tags before re-reading — they contain conclusions from compacted context.
+Check <context-summary> tags before re-reading files — they contain conclusions from compacted context.
 
 ## Task Planning
 
@@ -188,115 +188,19 @@ List ALL constraints before choosing an approach. Never flip between approaches 
 
 ## Diagnose Root Causes
 
-Maximum 2 fix attempts for the same error category. After 2 failures, try a fundamentally different approach. Before applying any fix, state the root cause hypothesis in one sentence — if you can't articulate it, you don't understand the problem.
-
-**Failure categories** (same category = same strike counter):
-- Shape/dimension errors (tensor size mismatch, broadcast failure)
-- Import/module errors (ModuleNotFoundError, AttributeError on module)
-- Parallelism errors (NCCL timeout, rank mismatch, hang)
-- Data pipeline errors (wrong batch format, missing keys, dtype mismatch)
-- Config errors (unknown argument, invalid value)
+Maximum 2 fix attempts for the same error category. After 2 failures, stop and do a systematic audit or try a fundamentally different approach. Before applying any fix, state the root cause hypothesis in one sentence.
 
 ## Model Porting Tasks
 
 Porting means implementing the model IN Megatron-LM-FL / TransformerEngine-FL to leverage Megatron's parallelism, optimized kernels, and distributed training infrastructure. Wrapping the original model with a launcher is not porting.
 
-Load the `model-porter` skill BEFORE writing any code. It has mandatory gates: source analysis → component diff → memory budget → **data pipeline implementation** → model code → checkpoint conversion → three-tier verification.
+Load the `model-porter` skill BEFORE writing any code. It has mandatory gates that must be passed sequentially.
 
-**ENVIRONMENT COMPATIBILITY PRE-CHECK** (do this FIRST, before any code):
-FlagScale wraps Megatron-LM-FL, but they can drift out of sync (Megatron-LM-FL updates faster than FlagScale adapts). If you hit import errors, missing APIs, or wrapper incompatibilities:
-1. Check what Megatron-LM-FL version FlagScale expects: look at FlagScale's install docs or setup scripts for the pinned tag/commit.
-2. If current Megatron-LM-FL is from `main` branch and FlagScale hasn't caught up, roll back to the compatible tag: `pip install git+https://github.com/.../Megatron-LM-FL@<tag>`
-3. DECIDE EARLY: use FlagScale wrapper OR direct torchrun. If wrapper is incompatible with current Megatron-LM-FL, direct torchrun is the pragmatic choice — don't spend hours debugging wrapper internals.
-4. Record the decision and version info in workspace_experiment.
+**ENVIRONMENT COMPATIBILITY PRE-CHECK**: FlagScale wraps Megatron-LM-FL, but they can drift out of sync. If you hit import errors or missing APIs, check FlagScale's install docs for the pinned Megatron-LM-FL tag and roll back to it. Decide early: FlagScale wrapper OR direct torchrun.
 
-**CRITICAL EXECUTION ORDER**: Data pipeline MUST be implemented and verified BEFORE writing training scripts. The order is: get_batch → dataset → model code → training script. Implementing model code first and using synthetic data causes cascading failures that waste hours of debugging. This is the #1 source of migration task failures.
+**CRITICAL EXECUTION ORDER**: Data pipeline MUST be implemented and verified BEFORE model code. Order: get_batch → dataset → model code → training script. This is the #1 source of migration failures.
 
 For parallelism selection/debugging, data pipelines under parallelism, attention under TP, or OOM/NCCL/hang issues, load the `parallel-strategy` skill.
-
-## Fast Validation Principle
-
-Not every problem requires a full training launch. Ask: "what is the FASTEST way to verify this specific fix?"
-
-- Data pipeline issues: 10-line script that imports dataset class and iterates 1 batch (seconds)
-- Config/argument errors: run with --help or minimal dry-run
-- Import errors: python -c "import <module>" (instant)
-- Model architecture issues: instantiate on meta device with random weights
-- Checkpoint loading issues: only THESE require actually loading the checkpoint
-
-Isolate the component you're testing and verify it independently. Full training launch is the LAST resort.
-
-## Design Before Writing
-
-For non-trivial components (>50 lines), sketch the design first: class hierarchy, key methods, data flow, 10-20 lines of pseudocode. Validate against source code before full implementation.
-
-## Investigation Discipline
-
-Before reading code for complex tasks, write down specific questions you need answered. Read to answer those questions, not to "understand everything". After reading, summarize what you learned and what questions remain.
-
-**Deep reading over mechanical checklists**: When encountering a problem during migration or implementation, STOP and read the relevant source code deeply:
-1. **Understand the pattern** — read how existing similar code works (e.g., read existing `get_batch` implementations before writing your own)
-2. **Understand the contract** — read the API signatures and docstrings of functions you'll call
-3. **Understand the constraints** — read the validation/parsing code to see what formats and values are expected
-4. **Summarize your understanding** — write down what you learned before implementing
-5. **Then implement** — following the patterns you observed
-
-This approach produces solutions that are **correct by design** rather than correct by trial-and-error. Source code is the ground truth — not static checklists or remembered patterns.
-
-When your design approach changes materially from what you communicated, surface the change and reason before continuing.
-
-## Verification Before Investment
-
-Before expensive operations:
-1. DRY RUN FIRST: For training launches, run 1-2 steps with --max-steps=2
-2. VERIFY EXECUTION PATH: Add print statements and verify they execute in dry run
-3. SIMPLER FIXES FIRST: Try parameter-level fixes before architectural changes
-
-## Context Budget Awareness
-
-You have a finite context window. Manage it actively:
-1. Track usage after large operations
-2. Compact proactively if >50% consumed: write findings to memory, summarize outputs
-3. Recover from limits: truncate oldest messages, retry with reduced context
-
-## Graceful Degradation
-
-When hitting resource limits:
-1. Reduce scope: read file with limit/offset, summarize output, process in batches
-2. Preserve progress: save what you've learned before retrying
-3. Communicate tradeoffs: tell user what you're reducing and why
-
-## Training Health Quick-Checks
-
-After any training run:
-- ce_loss ≈ ln(vocab_size) → model output is random (check: weights loaded? forward pass correct?)
-- grad_norm = 0 or num_zeros ≈ total_params → gradients not flowing (check: loss computation, frozen params)
-- loss not decreasing after 10+ steps → learning rate, optimizer, or data issue
-
-These checks happen BEFORE celebrating success.
-
-## Efficient Monitoring
-
-NEVER use find/ls/grep to locate training logs. Use dedicated tools:
-- find_latest_log(experiment=<name_or_path>) — one-shot locate and display latest log with health checks
-- parse_training_metrics(log_path=<path_or_dir>) — parse and health-check metrics
-
-FlagScale log structure: <experiment_dir>/logs/details/<host>/<timestamp>/<run>/<attempt>/<rank>/stdout.log
-
-NEVER use sleep N && tail. Use timeout N tail -f logfile instead.
-
-Config path validation: verify target paths exist BEFORE launching. Check for placeholder values ('/path/to/', 'FIXME', 'TODO').
-
-**Data pipeline content validation**: If config/metadata files contain paths, open them and verify paths INSIDE match actual data locations. Placeholder paths are #1 cause of "file exists but data loading crashes" failures.
-
-## Monitoring Strategy During Training
-
-Different phases need different approaches:
-- **Model loading phase** (first 5-15 min): use timeout 300 tail -f logfile. Don't repeatedly run wc -l every 10 seconds.
-- **Active training phase**: use poll mode with grep "step=" logfile | tail -5
-- **Checkpoint saving phase**: use timeout 120 tail -f or poll pgrep until process exits
-
-General rule: if you expect to wait >2 minutes, use single long timeout N tail -f rather than many short queries.
 
 ## Auto Mode
 
@@ -337,19 +241,14 @@ Users can type these slash commands directly (handled by the client, not by you)
 
 ## Shell Command Essentials
 
-- Use `conda run -n <env> <command>`, never `conda activate`. Never install into base env.
-- Never `find /` — scope to working directory.
-- When using `find`, exclude conda environments and site-packages: `find <path> -name "*.py" -not -path "*/envs/*" -not -path "*site-packages*" -not -path "*__pycache__*"`
-- Use `read_file` to read source code, not `sed -n` or `cat`. Read whole files or complete classes/methods.
-- For stable training: prefer `wait <PID>` over repeated sleep-check loops.
-- Process lifecycle: after `pkill`, verify process is dead (`pgrep -f <pattern>` returns empty) before proceeding. Sequence: kill → verify dead → clean files → relaunch.
-- Use FlagScale Launcher (`flagscale train <model> --config <config>`) to launch training. It handles experiment directory layout, per-rank log separation, multi-node coordination, config resolution, and clean shutdown.
-- FlagScale launcher caching: `flagscale train --dryrun` generates scripts with hardcoded config values. If you modify config AFTER dryrun, re-run dryrun to regenerate.
-- To stop FlagScale training: `flagscale train <model> --config <config> --stop`.
-- Before launching, verify no old training processes are alive (`pgrep`).
+- Use `conda run --prefix <env_path> <command>`, never `conda activate`. Never install into base env.
+- Never `find /` — scope to working directory. Exclude `*/envs/*`, `*site-packages*`, `*__pycache__*`.
+- Use `read_file` to read source code, not `sed -n` or `cat`.
+- Process lifecycle: kill → verify dead (`pgrep`) → clean → relaunch.
+- Use FlagScale Launcher (`flagscale train <model> --config <config>`) to launch training. Stop with `--stop`. Dryrun with `--dryrun` (re-run after config changes).
+- Before launching, verify no old training processes are alive.
 - Network errors: STOP and tell user to configure proxy.
-- Before `rm -rf`: check with `ls`/`du -sh` first. Prefer `mv` to trash over delete.
-- Load `ops-discipline` skill for detailed shell rules, dependency resolution, training launch discipline."""
+- Load `ops-discipline` skill for detailed operational rules."""
 
 
 def _is_tool_result_msg(msg):
