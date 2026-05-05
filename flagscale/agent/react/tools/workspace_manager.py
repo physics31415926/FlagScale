@@ -16,6 +16,7 @@ class WorkspaceManager:
         self._current_path = os.path.join(self._dir, "current.yaml")
         self._hardware_path = os.path.join(self._dir, "hardware.yaml")
         self._snapshot_path = os.path.join(self._dir, "snapshot.yaml")
+        self._history_path = os.path.join(self._dir, "session_history.yaml")
         self._experiments_dir = os.path.join(self._dir, "experiments")
 
     # ── Current State ───────────────────────────────────────────────────
@@ -100,6 +101,51 @@ class WorkspaceManager:
                 return yaml.safe_load(f) or {}
         except Exception:
             return {}
+
+    # ── Session History ────────────────────────────────────────────────
+
+    _MAX_SESSION_HISTORY = 10
+
+    def append_session_summary(self, session_id: str, task: str, summary: str, metadata: str = "") -> str:
+        """Append a session summary to rolling history. Keeps last N entries."""
+        os.makedirs(self._dir, exist_ok=True)
+        history = self._read_session_history()
+
+        entry = {
+            "session_id": session_id,
+            "task": task,
+            "summary": summary,
+            "metadata": metadata,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        history.append(entry)
+
+        # Keep only the most recent entries
+        if len(history) > self._MAX_SESSION_HISTORY:
+            history = history[-self._MAX_SESSION_HISTORY:]
+
+        try:
+            with open(self._history_path, "w", encoding="utf-8") as f:
+                yaml.dump(history, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            return "OK"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    def _read_session_history(self) -> List[Dict]:
+        """Read session_history.yaml. Returns empty list if not exists."""
+        if not os.path.isfile(self._history_path):
+            return []
+        try:
+            with open(self._history_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def get_recent_sessions(self, n: int = 3) -> List[Dict]:
+        """Get the N most recent session summaries for context injection."""
+        history = self._read_session_history()
+        return history[-n:] if history else []
 
     # ── Hardware ────────────────────────────────────────────────────────
 
@@ -302,6 +348,7 @@ class WorkspaceManager:
 
         # Parse Experiments section into individual files
         experiments_text = sections.get("Experiments", "")
+        entries = []
         if experiments_text and "### " in experiments_text:
             os.makedirs(self._experiments_dir, exist_ok=True)
             entries = experiments_text.split("### ")[1:]
@@ -334,4 +381,4 @@ class WorkspaceManager:
                 with open(path, "w", encoding="utf-8") as f:
                     yaml.dump(experiment, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
-        return f"Migrated from {old_path}. Created current.yaml, hardware.yaml, and {len(entries) if experiments_text else 0} experiment files."
+        return f"Migrated from {old_path}. Created current.yaml, hardware.yaml, and {len(entries)} experiment files."

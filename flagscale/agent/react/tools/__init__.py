@@ -39,3 +39,10 @@ class ToolRegistry:
         if fmt == "anthropic":
             return [t.to_anthropic_schema() for t in self._tools.values()]
         return [t.to_openai_schema() for t in self._tools.values()]
+
+    def to_schemas_filtered(self, fmt: str, tool_names: set) -> List[dict]:
+        """Return schemas only for the named tools (reduces token cost)."""
+        tools = [t for t in self._tools.values() if t.name in tool_names]
+        if fmt == "anthropic":
+            return [t.to_anthropic_schema() for t in tools]
+        return [t.to_openai_schema() for t in tools]

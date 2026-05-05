@@ -26,12 +26,14 @@ Detailed operational rules for infrastructure work. The system prompt covers pri
 
 ---
 
-## Reading strategy — minimize re-reads
+## Reading strategy — depth over speed
 
+- **Understand before implementing.** For complex tasks (env setup, config, training launch), read the relevant docs, example configs, and source code BEFORE writing anything. This is productive work, not wasted time.
 - **Read complete files, not fragments.** One complete read beats ten partial reads.
 - **First read: full file.** Note key line numbers. Subsequent reads: targeted ranges.
-- **Record key findings in workspace_state** so they survive context compaction.
+- **Record key findings in memory_write** so they survive context compaction.
 - **Never re-read a file you read in the last 5 turns** unless it was modified.
+- **Breadth matters:** for a training config, read at least: the getting-started doc, an existing example config, and the model's source code. For env setup, read install docs and version constraints.
 
 ---
 

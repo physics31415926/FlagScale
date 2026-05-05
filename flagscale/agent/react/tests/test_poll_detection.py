@@ -80,11 +80,23 @@ class TestDetectPollPattern(unittest.TestCase):
         assert agent._detect_poll_pattern()
 
     def test_different_commands(self):
+        """Different monitoring commands on the same log file DO trigger poll (fuzzy match)."""
         agent = self._make_agent()
         agent._recent_iters = [
             {"tool_name": "shell", "command": "wc -l log.txt", "output": "10",
              "llm_output_tokens": 50, "tool_elapsed": 0.2},
             {"tool_name": "shell", "command": "tail -5 log.txt", "output": "...",
+             "llm_output_tokens": 50, "tool_elapsed": 0.2},
+        ]
+        assert agent._detect_poll_pattern()
+
+    def test_unrelated_commands_no_poll(self):
+        """Completely unrelated commands should NOT trigger poll."""
+        agent = self._make_agent()
+        agent._recent_iters = [
+            {"tool_name": "shell", "command": "python train.py", "output": "started",
+             "llm_output_tokens": 50, "tool_elapsed": 0.2},
+            {"tool_name": "shell", "command": "nvidia-smi", "output": "GPU 0",
              "llm_output_tokens": 50, "tool_elapsed": 0.2},
         ]
         assert not agent._detect_poll_pattern()

@@ -88,20 +88,68 @@ def _age_message(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _age_tool_results(messages: List[Dict[str, Any]], keep_recent: int = AGING_WINDOW) -> List[Dict[str, Any]]:
-    """Proactively truncate old tool results to save context budget."""
+    """Proactively truncate old tool results to save context budget.
+
+    Skill-injection messages (identified by tool_call_id starting with 'auto_' or 'skill_')
+    are always truncated aggressively regardless of recency, since the LLM has already
+    absorbed their content in earlier iterations.
+    """
     if len(messages) <= keep_recent:
         return messages
     cutoff = len(messages) - keep_recent
     result = []
     for i, msg in enumerate(messages):
         if i >= cutoff:
-            result.append(msg)
+            # Even in the recent window, aggressively truncate skill messages
+            if _is_skill_injection(msg):
+                result.append(_truncate_skill_message(msg))
+            else:
+                result.append(msg)
             continue
         if msg.get("role") == "system":
             result.append(msg)
             continue
         result.append(_age_message(msg))
     return result
+
+
+def _is_skill_injection(msg: Dict[str, Any]) -> bool:
+    """Check if a message is a skill-injection tool_result."""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            tid = block.get("tool_use_id", "")
+            if tid.startswith("auto_") or tid.startswith("skill_"):
+                return True
+    return False
+
+
+def _truncate_skill_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace skill content with a minimal reference."""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return msg
+    new_blocks = []
+    for block in content:
+        if (isinstance(block, dict) and block.get("type") == "tool_result"
+                and (block.get("tool_use_id", "").startswith("auto_")
+                     or block.get("tool_use_id", "").startswith("skill_"))):
+            text = block.get("content", "")
+            # Extract just the skill name from the content
+            skill_ref = "[skill content already loaded — use read_file on SKILL.md if needed]"
+            if '<skill name="' in text:
+                import re as _re
+                m = _re.search(r'<skill name="([^"]+)"', text)
+                if m:
+                    skill_ref = f"[skill '{m.group(1)}' already loaded]"
+            new_blocks.append({**block, "content": skill_ref})
+        else:
+            new_blocks.append(block)
+    return {**msg, "content": new_blocks}
 
 
 def _message_tokens(msg: Dict[str, Any]) -> int:
@@ -310,6 +358,152 @@ class HistoryManager:
         self._messages.append(message)
         self._full_log.append(message)
 
+    def compact_intra_turn(self, keep_last: int = 4):
+        """Compress older messages within the current turn into a progress summary.
+
+        This is a lightweight, rule-based compression that runs without LLM calls.
+        It replaces older intermediate tool results with a structured summary,
+        keeping only the last `keep_last` messages for immediate context.
+
+        Should be called periodically (e.g., every 5 iterations) to prevent
+        unbounded history growth within a single turn.
+        """
+        # Find the start of the current turn (last real user message, not tool_result)
+        turn_start = self._find_turn_start()
+        turn_messages = self._messages[turn_start:]
+
+        if len(turn_messages) <= keep_last + 2:
+            return False  # Not enough messages to compress
+
+        to_compress = turn_messages[:-keep_last]
+        to_keep = turn_messages[-keep_last:]
+
+        # Don't compress if there's already a turn-progress marker in to_compress
+        for msg in to_compress:
+            content = msg.get("content", "")
+            if isinstance(content, str) and "<turn-progress>" in content:
+                # Already compressed this segment, just drop it and rebuild
+                to_compress = [m for m in to_compress
+                               if not (isinstance(m.get("content", ""), str)
+                                       and "<turn-progress>" in m.get("content", ""))]
+                break
+
+        if not to_compress:
+            return False
+
+        summary = self._extract_turn_progress(to_compress)
+        summary_msg = {
+            "role": "user",
+            "content": f"<turn-progress>\n{summary}\n</turn-progress>"
+        }
+
+        self._messages = self._messages[:turn_start] + [summary_msg] + to_keep
+        logger.info("Intra-turn compact: %d messages -> 1 summary + %d kept",
+                    len(turn_messages), keep_last)
+        return True
+
+    def _find_turn_start(self) -> int:
+        """Find the index of the last real user message (not a tool_result)."""
+        for i in range(len(self._messages) - 1, -1, -1):
+            msg = self._messages[i]
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            # Real user message = string content (not tool_result blocks)
+            if isinstance(content, str) and "<turn-progress>" not in content:
+                # Check it's not a system injection
+                if not content.startswith("[") and not content.startswith("<"):
+                    return i
+            # Also check for list content that's NOT tool_result
+            if isinstance(content, list):
+                has_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                )
+                if not has_tool_result:
+                    return i
+        return 0
+
+    @staticmethod
+    def _extract_turn_progress(messages: List[Dict[str, Any]]) -> str:
+        """Extract structured progress summary from messages without LLM."""
+        actions = []
+        findings = []
+        errors = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "assistant":
+                # Extract key decisions/statements from assistant text
+                if isinstance(content, str) and content.strip():
+                    lines = content.strip().splitlines()
+                    # Keep last meaningful line as the conclusion
+                    for line in reversed(lines):
+                        line = line.strip()
+                        if line and len(line) > 10 and not line.startswith("```"):
+                            findings.append(line[:150])
+                            break
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            tool_name = block.get("name", "")
+                            tool_input = block.get("input", {})
+                            if tool_name == "shell":
+                                cmd = tool_input.get("command", "")[:100]
+                                actions.append(f"shell: {cmd}")
+                            elif tool_name == "read_file":
+                                actions.append(f"read: {tool_input.get('path', '')}")
+                            elif tool_name == "monitor":
+                                f = tool_input.get("file", tool_input.get("command", ""))
+                                actions.append(f"monitor: {f}")
+                            else:
+                                actions.append(f"{tool_name}")
+
+            elif role == "user" and isinstance(content, list):
+                # Extract tool results
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        result_text = block.get("content", "")
+                        if isinstance(result_text, str):
+                            # Check for errors
+                            if any(kw in result_text for kw in
+                                   ("ERROR", "Error", "Traceback", "FAILED")):
+                                err_lines = result_text.strip().splitlines()
+                                errors.append(err_lines[-1][:150] if err_lines else "error")
+                            # Extract last few lines as context
+                            lines = result_text.strip().splitlines()
+                            if lines:
+                                last = lines[-1].strip()[:100]
+                                if last and "..." not in last:
+                                    findings.append(last)
+
+        # Build compact summary
+        parts = []
+        if actions:
+            # Deduplicate consecutive identical actions
+            deduped = []
+            for a in actions:
+                if not deduped or deduped[-1] != a:
+                    deduped.append(a)
+            parts.append("Actions: " + " → ".join(deduped[-8:]))
+        if errors:
+            parts.append("Errors: " + "; ".join(errors[-3:]))
+        if findings:
+            # Keep only last 3 unique findings
+            seen = set()
+            unique = []
+            for f in reversed(findings):
+                if f not in seen:
+                    seen.add(f)
+                    unique.append(f)
+                if len(unique) >= 3:
+                    break
+            parts.append("State: " + " | ".join(reversed(unique)))
+
+        return "\n".join(parts) if parts else "No significant progress recorded."
+
     def report_actual_tokens(self, input_tokens: int):
         """Feed back the actual input_tokens from the API response."""
         self._actual_input_tokens = input_tokens
@@ -319,8 +513,10 @@ class HistoryManager:
         self._messages = _age_tool_results(self._messages, keep_recent=AGING_WINDOW)
         estimated = sum(_message_tokens(m) for m in self._messages)
         actual = self._actual_input_tokens or 0
-        total = max(estimated, actual)
         inflation = self._get_inflation_ratio()
+        # Use inflation-adjusted estimate to predict real API cost
+        predicted = max(int(estimated * inflation), actual)
+        total = predicted
         self._last_compacted_from = None
         self._last_compacted_to = None
         self._compaction_happened = False
