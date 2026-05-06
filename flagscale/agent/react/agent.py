@@ -250,6 +250,7 @@ class ReactAgent:
         # Workspace manager — split into current.yaml + per-experiment files + hardware.yaml
         workspace_dir = os.path.join(Path.home(), ".flagscale", "workspace_state")
         self._workspace_manager = WorkspaceManager(workspace_dir)
+        self._workspace_manager.migrate_from_old_format()
         self.tool_registry.register(WorkspaceCurrentTool(self._workspace_manager))
         self.tool_registry.register(WorkspaceExperimentTool(self._workspace_manager))
         self.tool_registry.register(WorkspaceHardwareTool(self._workspace_manager))
@@ -276,6 +277,7 @@ class ReactAgent:
 
         self.history = HistoryManager(max_context_tokens=config.max_context_tokens)
         self.history.set_summarizer(self._summarize_for_compaction)
+        self.history.set_scorer(self._score_messages_for_compaction)
 
         self._turn_count = 0
         self._original_user_task = ""
@@ -292,6 +294,7 @@ class ReactAgent:
         self._consecutive_train_failures = 0
         self._last_train_failure_reasons = []
         self._error_pattern_history = []  # Track error patterns for smart escalation
+        self._recovery_from_failures = 0  # Set when training succeeds after failures
         self._kill_retry_timestamps = []  # Track kill+relaunch cycles
         self._training_launch_timestamps = []  # Track all training launches for hang detection
         self._context_pressure_soft_warned = False
@@ -368,6 +371,18 @@ class ReactAgent:
             if self._session_output_tokens:
                 self._auto_update_workspace_state()
                 self._archive_session()
+        except Exception:
+            pass
+        # Fallback: ensure session_history has at least a minimal entry
+        try:
+            if self._session_output_tokens and not getattr(self, '_session_history_written', False):
+                task = self._workspace_manager.get_current_task() or self._original_user_task or ""
+                self._workspace_manager.append_session_summary(
+                    session_id=self._session_id,
+                    task=task[:100],
+                    summary="(session interrupted before summary generation)",
+                    metadata=f"turns={self._turn_count}, tokens_out={self._session_output_tokens}",
+                )
         except Exception:
             pass
 
@@ -453,6 +468,10 @@ class ReactAgent:
         if current_exp:
             state_snapshot.append(f"Current experiment: {current_exp}")
 
+        # Training failure counter
+        if self._consecutive_train_failures > 0:
+            state_snapshot.append(f"consecutive_train_failures: {self._consecutive_train_failures}")
+
         state_block = "\n".join(state_snapshot) if state_snapshot else "(no critical state)"
 
         # Call LLM with enhanced prompt
@@ -465,6 +484,69 @@ class ReactAgent:
 
         # Append state snapshot to ensure it's preserved
         return f"{summary}\n\n[State at compaction: {state_block}]"
+
+    def _score_messages_for_compaction(self, messages):
+        """Call LLM to score messages by value for compaction drop priority.
+
+        Returns list of scores 0-10 (higher = more valuable to keep).
+        Only called during full compaction when there are enough candidates.
+        """
+        # Build compact representation of messages for scoring
+        descriptions = []
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "tool_use":
+                            parts.append(f"[tool_use: {block.get('name', '?')}({str(block.get('input', ''))[:80]})]")
+                        elif block.get("type") == "tool_result":
+                            text = str(block.get("content", ""))[:150]
+                            parts.append(f"[tool_result: {text}]")
+                        elif block.get("type") == "text":
+                            parts.append(block.get("text", "")[:150])
+                content_str = " ".join(parts)
+            else:
+                content_str = str(content)[:200]
+            descriptions.append(f"{i}: [{role}] {content_str}")
+
+        batch_text = "\n".join(descriptions)
+
+        prompt = (
+            "Score each message by its VALUE for an AI agent continuing a task. "
+            "Consider RE-READ COST: if this info is lost, will the agent need to re-execute "
+            "a command or re-read a file? High re-read cost = high value.\n\n"
+            "Score 0-10:\n"
+            "- 9-10: Errors, decisions, file content that's expensive to re-read\n"
+            "- 6-8: Useful context, reasoning, short conclusions\n"
+            "- 3-5: Repetitive monitoring, directory listings\n"
+            "- 0-2: Install logs, verbose build output, redundant checks\n\n"
+            f"Messages:\n{batch_text}\n\n"
+            "Reply with ONLY a comma-separated list of integer scores, one per message. "
+            "Example: 7,3,8,2,5"
+        )
+
+        scoring_messages = [
+            {"role": "system", "content": "You are a concise scorer. Output only the scores."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            response = self.provider.chat(scoring_messages, tools=[])
+            score_text = response.get("content", "").strip()
+            # Parse comma-separated scores
+            scores = [int(s.strip()) for s in score_text.split(",") if s.strip().isdigit()]
+            if len(scores) == len(messages):
+                return scores
+            # If count mismatch, pad or truncate
+            logger.warning("Scorer returned %d scores for %d messages, falling back", len(scores), len(messages))
+        except Exception as e:
+            logger.warning("LLM scorer failed: %s", e)
+
+        # Fallback: return empty to trigger heuristic in caller
+        return []
 
     def _restore_state_from_compaction(self):
         """Restore enforcement state from compaction summary after context compaction."""
@@ -549,6 +631,12 @@ class ReactAgent:
                 if files:
                     # Restore files (note: this is partial, only recent 10)
                     self._files_read_this_session.update(f.strip() for f in files.split(","))
+
+            elif line.startswith("consecutive_train_failures:"):
+                try:
+                    self._consecutive_train_failures = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
 
         logger.info("Restored state from compaction: phase=%s, stage=%s, files=%d, categories=%d",
                     self._current_phase, self._verification_stage,
@@ -1142,11 +1230,13 @@ Load ops-discipline skill for full diagnosis protocol.
         """Load current.yaml, hardware.yaml, and recent session history for system prompt injection."""
         parts = []
 
-        # Current state — always inject
+        # Current state — always inject (exclude recent_sessions to avoid duplication)
         current = self._workspace_manager.read_current()
         if current:
             import yaml as _yaml
-            parts.append("## Current State\n" + _yaml.dump(current, allow_unicode=True, default_flow_style=False, sort_keys=False).strip())
+            display_current = {k: v for k, v in current.items() if k != "recent_sessions"}
+            if display_current:
+                parts.append("## Current State\n" + _yaml.dump(display_current, allow_unicode=True, default_flow_style=False, sort_keys=False).strip())
 
         # Hardware — always inject
         hardware = self._workspace_manager.read_hardware()
@@ -1162,7 +1252,6 @@ Load ops-discipline skill for full diagnosis protocol.
                 ts = s.get("timestamp", "?")
                 task = s.get("task", "?")
                 summary = s.get("summary", "")
-                # Truncate each entry to keep context budget reasonable
                 if len(summary) > 150:
                     summary = summary[:147] + "..."
                 history_lines.append(f"- [{ts}] {task}: {summary}")
@@ -1828,7 +1917,8 @@ Load ops-discipline skill for full diagnosis protocol.
             )
             messages = [{"role": "user", "content": prompt}]
             response = self.provider.chat(messages, tools=[])
-            summary = (response.get("content") or "").strip()[:500]
+            raw = response.get("content") if isinstance(response, dict) else None
+            summary = raw.strip()[:500] if isinstance(raw, str) and raw.strip() else ""
         except Exception as e:
             logger.debug("LLM session summary failed: %s", e)
 
@@ -1839,15 +1929,7 @@ Load ops-discipline skill for full diagnosis protocol.
         if self._session_input_tokens or self._session_output_tokens:
             metadata += f", Tokens: {self._session_input_tokens}in/{self._session_output_tokens}out"
 
-        full_summary = f"{metadata}\n{summary}" if summary else metadata
-
-        # Update current.yaml
-        try:
-            self._workspace_manager.update_current(session_summary=full_summary)
-        except Exception as e:
-            logger.debug("Workspace current.yaml update skipped: %s", e)
-
-        # Append to session history (rolling, never overwritten)
+        # Append to recent_sessions in current.yaml
         try:
             self._workspace_manager.append_session_summary(
                 session_id=self._session_id,
@@ -1855,6 +1937,7 @@ Load ops-discipline skill for full diagnosis protocol.
                 summary=summary or "(no summary generated)",
                 metadata=metadata,
             )
+            self._session_history_written = True
         except Exception as e:
             logger.debug("Session history append skipped: %s", e)
 
@@ -1924,6 +2007,7 @@ Load ops-discipline skill for full diagnosis protocol.
                 os.remove(path)
         except Exception:
             pass
+        self._workspace_manager.clear_session_state()
 
     def _check_autosave(self):
         path = self._autosave_path()
@@ -2112,8 +2196,13 @@ Load ops-discipline skill for full diagnosis protocol.
 
     # Error pattern classification for smart escalation
     _ERROR_PATTERNS = {
+        "guardrail_warning": re.compile(r'\[GUARDRAIL\]|\[WARN:.*processes.*running\]', re.I),
         "import_error": re.compile(r'ModuleNotFoundError|ImportError|No module named', re.I),
-        "oom": re.compile(r'OutOfMemoryError|CUDA out of memory|OOM', re.I),
+        "runtime_extension_error": re.compile(
+            r'RuntimeError.*(?:extension|fused_|apex|transformer.engine|gradient_accumulation_fusion|'
+            r'flash_attn|CUDA.*not.*(?:compiled|available|built))', re.I),
+        "oom": re.compile(r'OutOfMemoryError|CUDA out of memory|torch\.cuda\.OutOfMemoryError|'
+                         r'\bOOM\b.*(?:killed|error|failed|crash)', re.I),
         "nccl_timeout": re.compile(r'NCCL.*timeout|NCCL.*hang|NCCL.*error', re.I),
         "shape_mismatch": re.compile(r'size mismatch|shape.*does not match|dimension.*mismatch', re.I),
         "checkpoint_load": re.compile(r'checkpoint.*not found|Failed to load|IncompatibleKeys|unexpected key', re.I),
@@ -2134,6 +2223,7 @@ Load ops-discipline skill for full diagnosis protocol.
     _ERROR_SKILL_MAP = {
         "nccl_timeout": "parallel-strategy",
         "oom": "parallel-strategy",
+        "runtime_extension_error": "env-setup",
         "shape_mismatch": "model-porter",
         "checkpoint_load": "model-porter",
         "config_error": "train-run",
@@ -2142,10 +2232,33 @@ Load ops-discipline skill for full diagnosis protocol.
     }
 
     def _classify_error_pattern(self, error_text):
-        """Classify error into pattern categories."""
+        """Classify error into pattern categories. Regex first, LLM fallback for unknown."""
         for pattern_name, pattern_re in self._ERROR_PATTERNS.items():
             if pattern_re.search(error_text):
                 return pattern_name
+        # LLM fallback for errors that don't match any regex
+        return self._llm_classify_error(error_text)
+
+    _ERROR_CLASSIFY_PROMPT = (
+        "Classify this training error into ONE category. Reply with ONLY the category name.\n"
+        "Categories: import_error, runtime_extension_error, oom, nccl_timeout, shape_mismatch, "
+        "checkpoint_load, data_pipeline, config_error, cuda_error, device_mismatch, "
+        "permission_error, disk_space, timeout, key_error, type_error, unknown\n\n"
+        "Error:\n{error_text}\n\nCategory:"
+    )
+
+    def _llm_classify_error(self, error_text):
+        """LLM fallback for error classification when regex patterns don't match."""
+        try:
+            prompt = self._ERROR_CLASSIFY_PROMPT.format(error_text=error_text[:500])
+            messages = [{"role": "user", "content": prompt}]
+            response = self.provider.chat(messages, tools=[])
+            raw = response.get("content", "") if isinstance(response, dict) else ""
+            category = raw.strip().lower().replace(" ", "_")
+            if category in self._ERROR_PATTERNS or category == "unknown":
+                return category
+        except Exception as e:
+            logger.debug("LLM error classification failed: %s", e)
         return "unknown"
 
     _CHECKPOINT_LOAD_RE = re.compile(
@@ -2192,6 +2305,27 @@ Load ops-discipline skill for full diagnosis protocol.
         "if you figured something out through trial-and-error, memorize it so the next session doesn't repeat the work.\n"
     )
 
+    _KNOWLEDGE_CAPTURE_HINT = (
+        "\n🧠 KNOWLEDGE CAPTURE: Training just SUCCEEDED after {n} consecutive failure(s). "
+        "You solved a real problem. Write the reusable knowledge to memory NOW:\n"
+        "  memory_write(key='<topic>', content='<what failed, root cause, exact fix>')\n"
+        "Only capture what a future session would need — not experiment-specific details.\n"
+        "Examples of good memory: version constraints, flag dependencies, env quirks, "
+        "install gotchas, config rules that aren't documented.\n"
+    )
+
+    _POST_LAUNCH_STDERR_HINT = (
+        "\n⚠️ POST-LAUNCH CHECK: Training process started but may crash within seconds. "
+        "DO NOT blindly monitor stdout for 300s. Instead:\n"
+        "1. Wait 10-15 seconds for processes to initialize\n"
+        "2. Use monitor tool with output_dir=<output_dir> — it auto-discovers logs AND scans stderr for errors\n"
+        "   Example: monitor(output_dir='outputs/qwen3_0_6b_dp_tp', duration=120)\n"
+        "3. Do NOT use raw 'find ... -exec tail' commands — they may find old logs from previous runs\n"
+        "4. If stderr shows errors (e.g., missing extensions, CUDA errors), the training has ALREADY FAILED — "
+        "don't waste time monitoring a dead process.\n"
+        "FlagScale log structure: outputs/<exp>/logs/details/host_*/timestamp/*/attempt_*/rank/stderr.log\n"
+    )
+
     _STALE_MEMORY_WARNING_TEMPLATE = (
         "\n⚠️ STALE MEMORIES: {count} memory entries are older than {days} days: {keys}. "
         "When you encounter these during work, verify they still hold. "
@@ -2201,24 +2335,12 @@ Load ops-discipline skill for full diagnosis protocol.
     # ── Checkpoint Capture ──────────────────────────────────────────────
 
     def _checkpoint_training_launch(self, cmd: str, result: str):
-        """Checkpoint: training launched successfully. Auto-record to experiment only.
+        """Checkpoint: training launched successfully.
 
-        Training launches are recorded in the experiment's attempt list, not in memory.
-        Memory is reserved for durable cross-session knowledge (workarounds, env quirks).
+        The attempt was already registered via the gate (add_attempt before launch).
+        Post-launch processing marks it as 'running'. Nothing to do here.
         """
-        current_exp = self._workspace_manager.get_current_experiment()
-        if not current_exp:
-            return ""
-
-        cmd_summary = cmd[:200] if len(cmd) <= 200 else cmd[:197] + "..."
-        warning = ""
-        try:
-            self._workspace_manager.add_attempt(current_exp, f"Training launched: {cmd_summary}", "Running...")
-        except Exception as e:
-            logger.warning("Failed to add experiment attempt: %s", e)
-            warning = f"\n⚠️ Experiment update failed: {e}. Attempt not recorded.\n"
-
-        return warning
+        return ""
 
     def _checkpoint_training_failure(self, cmd: str, result: str):
         """Checkpoint: training failed. Record to experiment only.
@@ -2240,36 +2362,38 @@ Load ops-discipline skill for full diagnosis protocol.
 
         return warning
 
-    def _checkpoint_workaround(self, tool_name: str, prev_error: str, curr_cmd: str):
-        """Checkpoint: workaround found. Save to memory with semantic key.
+    def _check_hydra_cache_stale(self, cmd: str) -> str:
+        """Check if config files were edited but hydra output dir still has old cache.
 
-        Workarounds are genuinely reusable cross-session knowledge.
-        Use a semantic key derived from the error so duplicates auto-merge.
+        FlagScale uses Hydra which caches resolved config in outputs/<exp>/hydra/.
+        If the user edited a config file and relaunches, the old hydra cache may be used.
         """
-        prev_summary = prev_error[:100] if len(prev_error) <= 100 else prev_error[:97] + "..."
-        cmd_summary = curr_cmd[:100] if len(curr_cmd) <= 100 else curr_cmd[:97] + "..."
-        content = f"Workaround: {tool_name} failed with [{prev_summary}], fixed by [{cmd_summary}]"
+        config_edits = [
+            f for f in self._files_written_this_session
+            if re.search(r'\.(yaml|yml)$', f) and re.search(r'conf|config|example', f, re.I)
+        ]
+        if not config_edits:
+            return ""
 
-        # Derive semantic key from error signature
-        error_words = re.sub(r'[^a-z0-9\s]', '', prev_error[:60].lower()).split()[:4]
-        semantic_key = "workaround_" + "_".join(error_words) if error_words else "workaround_unknown"
-        semantic_key = SessionMemory.sanitize_key(semantic_key)
+        # Try to extract output dir from the command
+        output_dir = ""
+        m = re.search(r'outputs/(\S+)', cmd)
+        if m:
+            output_dir = m.group(0)
+        else:
+            exp_name = self._workspace_manager.get_current_experiment()
+            if exp_name:
+                output_dir = f"outputs/{exp_name}"
 
-        task = self._workspace_manager.get_current_task()
-        warning = ""
-        try:
-            self.session_memory.put(
-                key=semantic_key,
-                mem_type="finding",
-                content=content,
-                session_id=self._session_id,
-                task=task,
-            )
-        except Exception as e:
-            logger.warning("Failed to save workaround to memory: %s", e)
-            warning = f"\n⚠️ Memory write failed: {e}. Workaround not recorded.\n"
+        if not output_dir:
+            return ""
 
-        return warning
+        return (
+            f"\n⚠️ HYDRA CACHE WARNING: You edited config files ({', '.join(os.path.basename(f) for f in config_edits[:3])}) "
+            f"but FlagScale may use cached config from a previous run in {output_dir}/hydra/. "
+            f"If the training fails with the SAME error as before, delete {output_dir}/hydra/ and relaunch. "
+            f"Or pass `--config-dir` to force Hydra to re-resolve.\n"
+        )
 
     def _checkpoint_new_error(self, error_signature: str, full_error: str):
         """Checkpoint: new unique error encountered.
@@ -2300,41 +2424,8 @@ Load ops-discipline skill for full diagnosis protocol.
         return "Unknown error"
 
     def _mid_turn_autosave(self):
-        """Save critical state mid-turn to survive crashes (OOM, SIGKILL)."""
-        try:
-            state = {
-                "files_read": list(self._files_read_this_session),
-                "reading_categories": list(self._reading_categories),
-                "verification_stage": self._verification_stage,
-                "current_phase": self._current_phase,
-                "error_pattern_history": list(self._error_pattern_history),
-                "output_tokens": self._session_output_tokens,
-                "turn_count": self._turn_count,
-                "consecutive_train_failures": self._consecutive_train_failures,
-                "gates_unlocked": {
-                    "understanding": getattr(self, '_understanding_verified', False),
-                    "component_plan": getattr(self, '_component_plan_created', False),
-                    "imports": getattr(self, '_imports_verified', False),
-                    "reference_comparison": getattr(self, '_reference_comparison_planned', False),
-                    "failure_mode": getattr(self, '_failure_mode_analyzed', False),
-                    "sanity_checks": getattr(self, '_sanity_checks_passed', False),
-                    "config_model": getattr(self, '_config_model_verified', False),
-                    "env": getattr(self, '_env_verified', False),
-                    "component_integration": getattr(self, '_component_integration_verified', False),
-                },
-                "session_id": self._session_id,
-                "timestamp": time.time(),
-            }
-            state_path = os.path.join(self._workspace_manager._dir, ".agent_state.json")
-            os.makedirs(os.path.dirname(state_path), exist_ok=True)
-            import json
-            with open(state_path, "w") as f:
-                json.dump(state, f)
-            logger.info("Mid-turn autosave: %d files, phase=%s, verification=%s, turn=%d",
-                        len(self._files_read_this_session), self._current_phase,
-                        self._verification_stage, self._turn_count)
-        except Exception as e:
-            logger.warning("Mid-turn autosave failed: %s", e)
+        """Save unified session state for crash recovery and compaction resume."""
+        self._save_session_state()
 
     def _record_verification_advance(self, new_stage, command_snippet):
         """Auto-record verification stage advancement to workspace experiment."""
@@ -2343,7 +2434,7 @@ Load ops-discipline skill for full diagnosis protocol.
             if exp_name:
                 change = f"Verification advanced to {new_stage}"
                 result = f"PASS — via: {command_snippet}"
-                self._workspace_manager.add_attempt(exp_name, change, result)
+                self._workspace_manager.add_event(exp_name, "verification", f"{change}: {result}")
                 logger.info("Auto-recorded verification advance: %s", new_stage)
         except Exception as e:
             logger.warning("Failed to auto-record verification advance: %s", e)
@@ -2397,6 +2488,9 @@ Load ops-discipline skill for full diagnosis protocol.
             # New file discovered — reset staleness counter
             self._reads_since_last_new_file = 0
             self._last_unique_file_count = current_unique
+        elif tool_name == "shell":
+            # Shell commands are exploratory — don't count toward staleness
+            pass
         else:
             self._reads_since_last_new_file += 1
 
@@ -2406,11 +2500,11 @@ Load ops-discipline skill for full diagnosis protocol.
         # === Intervention logic ===
 
         # Pattern 1: Re-reading without discovering anything new for a long time
-        stale_threshold = 12
+        stale_threshold = 25
         if self._porting_mode:
-            stale_threshold = 30  # Porting requires reading many source files
+            stale_threshold = 40  # Porting requires reading many source files
         elif self._consecutive_train_failures >= 2:
-            stale_threshold = 18  # More lenient during debugging
+            stale_threshold = 30  # More lenient during debugging
 
         if self._reads_since_last_new_file >= stale_threshold:
             self._progress_gate_triggers += 1
@@ -2450,7 +2544,7 @@ Load ops-discipline skill for full diagnosis protocol.
 
         # Pattern 3: Very long exploration without any checkpoint (safety net)
         # Only triggers if reading many unique files but never recording anything
-        reads_hard_cap = 60 if self._porting_mode else 40
+        reads_hard_cap = 80 if self._porting_mode else 60
         if self._consecutive_reads >= reads_hard_cap and self._progress_gate_triggers == 0:
             self._progress_gate_triggers += 1
             return (
@@ -2777,9 +2871,9 @@ Load ops-discipline skill for full diagnosis protocol.
             # Add to experiment if active
             exp = self._workspace_manager.get_current_experiment()
             if exp:
-                self._workspace_manager.add_attempt(
-                    exp, "pre-compaction checkpoint",
-                    f"Turn {self._turn_count}: {checkpoint_content[:500]}"
+                self._workspace_manager.add_event(
+                    exp, "checkpoint",
+                    f"Turn {self._turn_count}: {checkpoint_content[:300]}"
                 )
 
             logger.info("Pre-compaction memory dump: saved checkpoint with %d errors, %d solutions",
@@ -2869,24 +2963,22 @@ Load ops-discipline skill for full diagnosis protocol.
             logger.debug("Auto-persist failed: %s", e)
 
     def _auto_record_training_attempt(self, cmd, result, success):
-        """Record training attempt to experiment and update snapshot."""
+        """Record training result to the current pending attempt."""
         exp_name = self._workspace_manager.get_current_experiment()
         if not exp_name:
             return
         if success:
-            # Extract first iteration info
             lines = (result or "").split("\n")
             info_lines = [l for l in lines if "iteration" in l.lower() or "loss" in l.lower()][:3]
             summary = "\n".join(info_lines)[:200] if info_lines else "Training started successfully"
-            self._workspace_manager.add_attempt(exp_name, f"LAUNCH: {cmd[:80]}", f"SUCCESS: {summary}")
+            self._workspace_manager.update_last_attempt(exp_name, f"SUCCESS: {summary}")
         else:
-            # Extract error
             err_lines = []
             for line in (result or "").split("\n"):
                 if "error" in line.lower() or "traceback" in line.lower() or "assert" in line.lower():
                     err_lines.append(line.strip())
             error_summary = "\n".join(err_lines[-3:])[:200] if err_lines else "Unknown error"
-            self._workspace_manager.add_attempt(exp_name, f"LAUNCH: {cmd[:80]}", f"FAIL: {error_summary}")
+            self._workspace_manager.update_last_attempt(exp_name, f"FAIL: {error_summary}")
         self._update_snapshot()
 
     def _auto_record_kill_event(self, cmd):
@@ -2907,15 +2999,15 @@ Load ops-discipline skill for full diagnosis protocol.
                 break
         exp_name = self._workspace_manager.get_current_experiment()
         if exp_name:
-            self._workspace_manager.add_attempt(exp_name, f"KILL: {cmd[:80]}", f"Reason: {reason}")
+            self._workspace_manager.add_event(exp_name, "kill", f"{cmd[:80]} — reason: {reason}")
         self._update_snapshot()
 
     def _auto_record_code_change(self, path):
         """Record model code change to experiment."""
         exp_name = self._workspace_manager.get_current_experiment()
         if exp_name:
-            self._workspace_manager.add_attempt(
-                exp_name, f"CODE: modified {os.path.basename(path)}", f"File: {path}"
+            self._workspace_manager.add_event(
+                exp_name, "code_change", f"Modified {os.path.basename(path)} — {path}"
             )
 
     def _auto_bind_plan_to_experiment(self, arguments):
@@ -2924,19 +3016,29 @@ Load ops-discipline skill for full diagnosis protocol.
         notes = arguments.get("notes", "done")
         exp_name = self._workspace_manager.get_current_experiment()
         if exp_name:
-            self._workspace_manager.add_attempt(
-                exp_name, f"Plan step {step_id} completed", notes[:200]
+            self._workspace_manager.add_event(
+                exp_name, "plan_step", f"Step {step_id} completed: {notes[:200]}"
             )
         self._update_snapshot()
 
-    # ── Unified Snapshot ───────────────────────────────────────────────
+    # ── Unified Session State ──────────────────────────────────────────
 
     def _update_snapshot(self):
-        """Generate and write unified snapshot from current state."""
+        """Alias for backward compat — delegates to _save_session_state."""
+        self._save_session_state()
+
+    def _save_session_state(self):
+        """Save unified session state to session_state.json.
+
+        Combines crash recovery data (files_read, gates, error_patterns)
+        with compaction resume data (plan progress, last attempts, task context).
+        Single write, single file.
+        """
         try:
-            plan = self.task_plan.get_active() if hasattr(self, 'task_plan') else None
+            # Plan progress
             plan_progress = ""
             current_step = ""
+            plan = self.task_plan.get_active() if hasattr(self, 'task_plan') else None
             if plan:
                 steps = plan.get("steps", [])
                 done = sum(1 for s in steps if s.get("status") == "done")
@@ -2946,7 +3048,7 @@ Load ops-discipline skill for full diagnosis protocol.
                 if doing:
                     current_step = doing[0].get("text", doing[0].get("title", ""))[:100]
 
-            # Get last 3 attempts from experiment
+            # Last 3 attempts from experiment
             last_attempts = []
             exp_name = self._workspace_manager.get_current_experiment()
             if exp_name:
@@ -2958,15 +3060,9 @@ Load ops-discipline skill for full diagnosis protocol.
                             "result": a.get("result", "")[:100],
                         })
 
-            # Get key decisions from memory
-            key_decisions = []
-            decisions = [e for e in self.session_memory.list_entries()
-                         if e.get("type") == "decision" or e.get("priority") == "high"]
-            for d in decisions[-5:]:
-                key_decisions.append(d.get("content", "")[:120])
-
             current = self._workspace_manager.read_current()
-            snapshot = {
+            state = {
+                # Compaction resume fields
                 "task": self._original_user_task or current.get("task", ""),
                 "status": current.get("status", "running"),
                 "phase": getattr(self, '_current_phase', 'unknown'),
@@ -2974,15 +3070,35 @@ Load ops-discipline skill for full diagnosis protocol.
                 "plan_progress": plan_progress,
                 "current_step": current_step,
                 "last_3_attempts": last_attempts,
-                "key_decisions": key_decisions,
                 "current_errors": current.get("blockers", []),
                 "files_modified_recently": list(getattr(self, '_files_written_this_session', set()))[:10],
                 "next_action": current.get("next_steps", [""])[0] if current.get("next_steps") else "",
                 "turn_count": self._turn_count,
+                "iteration_count": getattr(self, '_turn_iteration_count', 0),
+                # Crash recovery fields
+                "files_read": list(self._files_read_this_session)[-50:],
+                "reading_categories": list(self._reading_categories),
+                "error_pattern_history": list(self._error_pattern_history),
+                "output_tokens": self._session_output_tokens,
+                "consecutive_train_failures": self._consecutive_train_failures,
+                "gates_unlocked": {
+                    "understanding": getattr(self, '_understanding_verified', False),
+                    "component_plan": getattr(self, '_component_plan_created', False),
+                    "imports": getattr(self, '_imports_verified', False),
+                    "reference_comparison": getattr(self, '_reference_comparison_planned', False),
+                    "failure_mode": getattr(self, '_failure_mode_analyzed', False),
+                    "sanity_checks": getattr(self, '_sanity_checks_passed', False),
+                    "config_model": getattr(self, '_config_model_verified', False),
+                    "env": getattr(self, '_env_verified', False),
+                    "component_integration": getattr(self, '_component_integration_verified', False),
+                },
+                "session_id": self._session_id,
             }
-            self._workspace_manager.write_snapshot(snapshot)
+            self._workspace_manager.write_session_state(state)
+            logger.info("Session state saved: phase=%s, verification=%s, turn=%d",
+                        self._current_phase, self._verification_stage, self._turn_count)
         except Exception as e:
-            logger.debug("Snapshot update failed: %s", e)
+            logger.debug("Session state save failed: %s", e)
 
     def _get_compaction_anchors(self) -> list:
         """Extract mandatory anchors for summary preservation."""
@@ -3039,9 +3155,9 @@ Load ops-discipline skill for full diagnosis protocol.
         return anchors
 
     def _format_snapshot_as_resume(self, snapshot: dict = None) -> str:
-        """Format snapshot as a resume hint for injection after compaction or session start."""
+        """Format session state as a resume hint for injection after compaction or session start."""
         if snapshot is None:
-            snapshot = self._workspace_manager.read_snapshot()
+            snapshot = self._workspace_manager.read_session_state()
         if not snapshot:
             # Fallback to current.yaml
             try:
@@ -3079,10 +3195,6 @@ Load ops-discipline skill for full diagnosis protocol.
             parts.append("Recent attempts:")
             for a in snapshot["last_3_attempts"]:
                 parts.append(f"  - {a.get('change', '')} → {a.get('result', '')}")
-        if snapshot.get("key_decisions"):
-            parts.append("Key decisions:")
-            for d in snapshot["key_decisions"]:
-                parts.append(f"  - {d}")
         if snapshot.get("current_errors"):
             parts.append(f"Blockers: {snapshot['current_errors']}")
         if snapshot.get("next_action"):
@@ -3625,6 +3737,66 @@ Phase 3: [Integration]
 
 Data flows in one direction. Verify in that same direction.
 """
+
+    def _check_experiment_gate(self, tool_name, arguments):
+        """Hard block: reject training launch without a pending attempt.
+
+        Two-level check:
+        1. Experiment must exist (create first)
+        2. A pending attempt must exist (add_attempt before each launch)
+        """
+        if tool_name != "shell":
+            return ""
+        cmd = arguments.get("command", "")
+        if not self._TRAIN_LAUNCH_RE.search(cmd):
+            return ""
+        if self._is_quick_test_command(cmd):
+            return ""
+
+        # Check 1: experiment registered?
+        current_exp = self._workspace_manager.get_current_experiment()
+        if not current_exp and not self._experiment_registered:
+            return (
+                "[EXPERIMENT GATE — COMMAND NOT EXECUTED]\n\n"
+                "Training launch BLOCKED. No experiment registered.\n\n"
+                "You MUST do the following before this command can run:\n"
+                "1. workspace_experiment(action='create',\n"
+                "     name='<descriptive_name>',\n"
+                "     purpose='<why this experiment>',\n"
+                "     hypothesis='<expected outcome and why>',\n"
+                "     base_config={<initial config: model, TP, DP, batch_size, etc.>},\n"
+                "     base_dir='<initial log directory>'\n"
+                "   )\n"
+                "2. workspace_experiment(action='add_attempt',\n"
+                "     name='<same name>',\n"
+                "     change='initial run',\n"
+                "     config={<this run's full config>},\n"
+                "     output_dir='<unique output dir for this run>'\n"
+                "   )\n"
+                "3. Then re-run the training command.\n\n"
+                "ALL fields are REQUIRED. No empty values.\n"
+                f"Blocked command: {cmd[:200]}\n"
+            )
+
+        # Check 2: pending attempt exists?
+        exp_name = current_exp or self._workspace_manager.find_latest_experiment()
+        if exp_name and not self._workspace_manager.has_pending_attempt(exp_name):
+            return (
+                "[EXPERIMENT GATE — COMMAND NOT EXECUTED]\n\n"
+                "Training launch BLOCKED. No pending attempt for this run.\n\n"
+                "Before EACH training launch, you MUST register an attempt:\n"
+                "  workspace_experiment(action='add_attempt',\n"
+                f"    name='{exp_name}',\n"
+                "    change='<what you changed since last attempt>',\n"
+                "    config={<this run's full config: model, TP, DP, batch_size, key flags>},\n"
+                "    output_dir='<UNIQUE output dir for THIS run — must differ from previous attempts>'\n"
+                "  )\n\n"
+                "ALL fields REQUIRED. output_dir must be unique across all attempts.\n"
+                "Then re-run the training command.\n"
+                f"Blocked command: {cmd[:200]}\n"
+            )
+
+        return ""
 
     def _check_failure_mode_analysis_gate(self, tool_name, arguments):
         """B1: After writing training code, require failure mode analysis before first launch."""
@@ -4541,83 +4713,91 @@ For each comparison point:
     def _track_training_failures(self, tool_calls, results):
         """Track consecutive training failures with pattern-based escalation."""
         for tc, result in zip(tool_calls, results):
-            if tc["name"] != "shell":
-                continue
-            cmd = tc["arguments"].get("command", "")
-            if not self._TRAIN_CMD_RE.search(cmd):
-                continue
+            tool_name = tc["name"]
 
-            # Distinguish verification scripts from full training
-            is_verification = bool(re.search(r'verify|dryrun|test_model', cmd, re.I))
+            # Shell commands: check if it's a training command
+            if tool_name == "shell":
+                cmd = tc["arguments"].get("command", "")
+                if not self._TRAIN_CMD_RE.search(cmd):
+                    continue
+                is_verification = bool(re.search(r'verify|dryrun|test_model', cmd, re.I))
+                if self._TRAIN_FAIL_RE.search(result[:2000]):
+                    self._consecutive_train_failures += 1
+                    reason = result[:200].split('\n')[0]
+                    self._last_train_failure_reasons.append(reason)
+                    pattern = self._classify_error_pattern(result[:2000])
+                    self._error_pattern_history.append(pattern)
+                    self._record_and_escalate_failure(cmd, result, pattern, is_verification)
+                else:
+                    self._recovery_from_failures = self._consecutive_train_failures
+                    self._consecutive_train_failures = 0
+                    self._last_train_failure_reasons.clear()
+                    self._error_pattern_history.clear()
 
-            if self._TRAIN_FAIL_RE.search(result[:2000]):
-                self._consecutive_train_failures += 1
-                reason = result[:200].split('\n')[0]
-                self._last_train_failure_reasons.append(reason)
-                pattern = self._classify_error_pattern(result[:2000])
-                self._error_pattern_history.append(pattern)
+            # Monitor results: check for process death or stderr errors
+            elif tool_name == "monitor":
+                if any(kw in result[:500] for kw in ("process_dead", "stderr_error", "process DEAD")):
+                    self._consecutive_train_failures += 1
+                    reason = result[:200].split('\n')[0]
+                    self._last_train_failure_reasons.append(reason)
+                    pattern = self._classify_error_pattern(result[:2000])
+                    self._error_pattern_history.append(pattern)
+                    cmd = tc["arguments"].get("command", "") or tc["arguments"].get("output_dir", "monitor")
+                    self._record_and_escalate_failure(cmd, result, pattern, False)
+                elif any(kw in result[:500] for kw in ("target_reached", "success")) and self._consecutive_train_failures > 0:
+                    self._recovery_from_failures = self._consecutive_train_failures
+                    self._consecutive_train_failures = 0
+                    self._last_train_failure_reasons.clear()
+                    self._error_pattern_history.clear()
 
-                # Auto-checkpoint training failure to memory
-                try:
-                    error_summary = self._extract_error_summary(result[:2000])
-                    self.session_memory.put(
-                        f"train_failure_{self._consecutive_train_failures}",
-                        "finding",
-                        f"Training failure #{self._consecutive_train_failures} "
-                        f"(pattern: {pattern}): {error_summary[:300]}. "
-                        f"Cmd: {cmd[:100]}",
-                        self._session_id,
-                        task=self._workspace_manager.get_current_task(),
-                    )
-                except Exception:
-                    pass
-
-                # For verification scripts: 2 failures → force audit (lower threshold)
-                if is_verification and self._consecutive_train_failures >= 2:
-                    escalation = (
-                        f"\n\n[VERIFICATION FAILURE AUDIT] {self._consecutive_train_failures} consecutive "
-                        f"verification script failures detected.\n"
-                        f"STOP incremental fixes. Perform systematic audit:\n"
-                        f"1. Read the COMPLETE API contract (init signature, forward kwargs, return types)\n"
-                        f"2. List ALL shape/dtype/key assumptions in your code\n"
-                        f"3. Verify EACH assumption against the framework code\n"
-                        f"4. Fix ALL issues at once, then run\n"
-                        f"Recent failures:\n"
-                    )
-                    for i, r in enumerate(self._last_train_failure_reasons[-3:], 1):
-                        escalation += f"  {i}. {r}\n"
-                    self.history.append({"role": "user", "content": escalation})
-
-                # Same pattern twice → force root cause analysis (earlier than generic escalation)
-                elif (len(self._error_pattern_history) >= 2
-                        and self._error_pattern_history[-1] == self._error_pattern_history[-2]
-                        and self._error_pattern_history[-1] != "unknown"):
-                    escalation = (
-                        f"\n\n[ERROR PATTERN REPEAT] Same error pattern '{pattern}' occurred twice consecutively.\n"
-                        f"STOP incremental fixes. Required actions:\n"
-                        f"1. State the ROOT CAUSE in one sentence (not the symptom)\n"
-                        f"2. List ALL assumptions that led to this approach\n"
-                        f"3. Propose a FUNDAMENTALLY DIFFERENT approach\n"
-                        f"4. If you can't identify root cause, ASK the user\n"
-                        f"Recent failures:\n"
-                    )
-                    for i, r in enumerate(self._last_train_failure_reasons[-3:], 1):
-                        escalation += f"  {i}. {r}\n"
-                    self.history.append({"role": "user", "content": escalation})
-
-                elif self._consecutive_train_failures >= 3:
-                    escalation = (
-                        f"\n\n[ESCALATION] {self._consecutive_train_failures} consecutive training failures detected. "
-                        f"STOP and report to the user. Summarize all attempts and failures before continuing.\n"
-                        f"Recent failure reasons:\n"
-                    )
-                    for i, r in enumerate(self._last_train_failure_reasons[-5:], 1):
-                        escalation += f"  {i}. {r}\n"
-                    self.history.append({"role": "user", "content": escalation})
             else:
-                self._consecutive_train_failures = 0
-                self._last_train_failure_reasons.clear()
-                self._error_pattern_history.clear()
+                continue
+
+    def _record_and_escalate_failure(self, cmd, result, pattern, is_verification):
+        """Record a training failure and escalate if pattern repeats."""
+
+        # For verification scripts: 2 failures → force audit (lower threshold)
+        if is_verification and self._consecutive_train_failures >= 2:
+            escalation = (
+                f"\n\n[VERIFICATION FAILURE AUDIT] {self._consecutive_train_failures} consecutive "
+                f"verification script failures detected.\n"
+                f"STOP incremental fixes. Perform systematic audit:\n"
+                f"1. Read the COMPLETE API contract (init signature, forward kwargs, return types)\n"
+                f"2. List ALL shape/dtype/key assumptions in your code\n"
+                f"3. Verify EACH assumption against the framework code\n"
+                f"4. Fix ALL issues at once, then run\n"
+                f"Recent failures:\n"
+            )
+            for i, r in enumerate(self._last_train_failure_reasons[-3:], 1):
+                escalation += f"  {i}. {r}\n"
+            self.history.append({"role": "user", "content": escalation})
+
+        # Same pattern twice → force root cause analysis (earlier than generic escalation)
+        elif (len(self._error_pattern_history) >= 2
+                and self._error_pattern_history[-1] == self._error_pattern_history[-2]
+                and self._error_pattern_history[-1] != "unknown"):
+            escalation = (
+                f"\n\n[ERROR PATTERN REPEAT] Same error pattern '{pattern}' occurred twice consecutively.\n"
+                f"STOP incremental fixes. Required actions:\n"
+                f"1. State the ROOT CAUSE in one sentence (not the symptom)\n"
+                f"2. List ALL assumptions that led to this approach\n"
+                f"3. Propose a FUNDAMENTALLY DIFFERENT approach\n"
+                f"4. If you can't identify root cause, ASK the user\n"
+                f"Recent failures:\n"
+            )
+            for i, r in enumerate(self._last_train_failure_reasons[-3:], 1):
+                escalation += f"  {i}. {r}\n"
+            self.history.append({"role": "user", "content": escalation})
+
+        elif self._consecutive_train_failures >= 3:
+            escalation = (
+                f"\n\n[ESCALATION] {self._consecutive_train_failures} consecutive training failures detected. "
+                f"STOP and report to the user. Summarize all attempts and failures before continuing.\n"
+                f"Recent failure reasons:\n"
+            )
+            for i, r in enumerate(self._last_train_failure_reasons[-5:], 1):
+                escalation += f"  {i}. {r}\n"
+            self.history.append({"role": "user", "content": escalation})
 
     def _run_poll_mode(self, command, last_output, tool_call_id):
         """Execute poll loop locally without LLM calls. Returns (output, count, elapsed, reason, routine_changes).
@@ -4803,10 +4983,11 @@ For each comparison point:
 
             self._record_iteration(response["tool_calls"], results, output_tok, tool_elapsed_list)
 
-            # Intra-turn sliding window: compress old intermediate results every 5 iterations
-            if iteration > 0 and iteration % 5 == 0:
-                if self.history.compact_intra_turn(keep_last=4):
-                    logger.info("Intra-turn compaction at iteration %d", iteration)
+            # Intra-turn compaction: only when context pressure is genuinely high
+            if iteration > 0 and self.history.get_context_pressure() > 0.60:
+                if self.history.compact_intra_turn(keep_last=6):
+                    logger.info("Intra-turn compaction at iteration %d (pressure=%.2f)",
+                                iteration, self.history.get_context_pressure())
 
             # Track consecutive training launch failures
             self._track_training_failures(response["tool_calls"], results)
@@ -5046,6 +5227,19 @@ For each comparison point:
             return [result]
 
         self._consecutive_single_tool_calls = 0
+
+        # Dedup identical tool calls within batch
+        seen_calls = {}
+        dedup_indices = set()
+        for i, tc in enumerate(tool_calls):
+            key = (tc["name"], json.dumps(tc.get("arguments", {}), sort_keys=True))
+            if key in seen_calls:
+                dedup_indices.add(i)
+            else:
+                seen_calls[key] = i
+        if dedup_indices:
+            logger.info("Deduped %d identical tool calls in batch", len(dedup_indices))
+
         # Gate checks for parallel calls — count all read-only tools toward progress gate
         # and block the entire batch if gates fire
         for tc in tool_calls:
@@ -5061,6 +5255,10 @@ For each comparison point:
                         self._last_unique_file_count = len(self._files_read_this_session) + 1
                     else:
                         self._reads_since_last_new_file += 1
+                elif name == "shell":
+                    # Shell commands are exploratory — only count toward staleness
+                    # if the command looks like a repeat (same prefix as recent commands)
+                    pass
                 else:
                     self._reads_since_last_new_file += 1
             elif name in self._PRODUCTIVE_TOOLS:
@@ -5081,11 +5279,11 @@ For each comparison point:
                 return [plan_block] * len(tool_calls)
 
         # Check progress gate (staleness-based) for parallel path
-        stale_threshold = 12
+        stale_threshold = 25
         if self._porting_mode:
-            stale_threshold = 30
+            stale_threshold = 40
         elif self._consecutive_train_failures >= 2:
-            stale_threshold = 18
+            stale_threshold = 30
         if self._reads_since_last_new_file >= stale_threshold + 8:
             has_plan = self.task_plan.get_active() is not None
             if not has_plan:
@@ -5116,11 +5314,15 @@ For each comparison point:
                             denied.add(i)
 
         results = [None] * len(tool_calls)
+        skip_indices = denied | dedup_indices
         to_run = [
-            (i, tc) for i, tc in enumerate(tool_calls) if i not in denied
+            (i, tc) for i, tc in enumerate(tool_calls) if i not in skip_indices
         ]
         for i in denied:
             results[i] = "DENIED: User declined to execute this command."
+        for i in dedup_indices:
+            orig = seen_calls[(tool_calls[i]["name"], json.dumps(tool_calls[i].get("arguments", {}), sort_keys=True))]
+            results[i] = f"[DEDUP: identical to call #{orig + 1} in this batch, skipped]"
 
         # Show all tool names upfront, then one spinner for the batch
         tool_summaries = []
@@ -5240,6 +5442,12 @@ For each comparison point:
         if component_plan_warning:
             display.warn("Component isolation gate: create component plan before writing training script")
             return component_plan_warning
+
+        # Experiment registry gate — HARD BLOCK training launch without experiment entry
+        exp_gate_warning = self._check_experiment_gate(tool_name, arguments)
+        if exp_gate_warning:
+            display.warn("Experiment gate: HARD BLOCK — register experiment before launching training")
+            return exp_gate_warning
 
         # Import verification gate — strong warning before writing training script with unverified imports
         import_warning = self._check_import_verification_gate(tool_name, arguments)
@@ -5585,20 +5793,25 @@ For each comparison point:
                     and not error):
                 self._dry_run_passed = True
 
-            # Experiment registry gate: warn if training launched without entry
+            # Post-launch gates (command already executed at this point)
             if (self._TRAIN_LAUNCH_RE.search(cmd)
                     and not self._is_quick_test_command(cmd)):
-                if not self._experiment_registered:
-                    result = self._EXPERIMENT_GATE_WARNING + result
-                    display.warn("Training launched without experiment entry!")
                 # Dry-run gate: warn if checkpoint-loading run without prior dry-run
                 if (self._CHECKPOINT_LOAD_RE.search(cmd)
                         and not self._dry_run_passed):
                     result = self._DRY_RUN_WARNING + result
                     display.warn("Checkpoint-loading training launched without prior dry-run!")
-                # Reset after each launch — next launch needs its own entry/dry-run
+                # Hydra cache warning: if config was edited, old hydra output may be stale
+                hydra_warn = self._check_hydra_cache_stale(cmd)
+                if hydra_warn:
+                    result = hydra_warn + result
+                # Reset after each launch — next launch needs new attempt
                 self._experiment_registered = False
                 self._dry_run_passed = False
+                # Mark pending attempt as "running" so next launch requires new add_attempt
+                exp_name = self._workspace_manager.get_current_experiment()
+                if exp_name and self._workspace_manager.has_pending_attempt(exp_name):
+                    self._workspace_manager.update_last_attempt(exp_name, "running")
             # Remind to update experiment record when training fails
             if (self._TRAIN_LAUNCH_RE.search(cmd)
                     and not self._is_quick_test_command(cmd)
@@ -5613,6 +5826,8 @@ For each comparison point:
                     and not self._is_quick_test_command(cmd)
                     and not error):
                 result = result + self._TRAINING_MEMORY_HINT
+                # Inject stderr check hint for FlagScale-style launches
+                result = result + self._POST_LAUNCH_STDERR_HINT
                 # Checkpoint: auto-record training launch
                 ckpt_warn = self._checkpoint_training_launch(cmd, result)
                 if ckpt_warn:
@@ -5622,6 +5837,12 @@ For each comparison point:
             if annotations:
                 header = "\n".join(f"[{a}]" for a in annotations)
                 result = header + "\n" + result
+
+        # Knowledge capture: training recovered after failures
+        if self._recovery_from_failures > 0:
+            result = result + self._KNOWLEDGE_CAPTURE_HINT.format(n=self._recovery_from_failures)
+            self._recovery_from_failures = 0
+
         if error and result:
             raw = result.split('\n')[0].replace("ERROR:", "").strip()
             detail = (raw[:57] + "...") if len(raw) > 60 else raw
@@ -5632,12 +5853,6 @@ For each comparison point:
                 and self._last_tool_call[0] == tool_name
                 and self._last_tool_call[2]):
             result = result + self._WORKAROUND_MEMORY_HINT
-            # Checkpoint: auto-record workaround
-            prev_cmd = self._last_tool_call[1]
-            curr_cmd = arguments.get("command", "") if tool_name == "shell" else str(arguments)[:200]
-            ckpt_warn = self._checkpoint_workaround(tool_name, prev_cmd, curr_cmd)
-            if ckpt_warn:
-                result = result + ckpt_warn
 
         # Checkpoint: new unique error
         if error and tool_name == "shell":

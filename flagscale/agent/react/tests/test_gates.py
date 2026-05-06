@@ -21,7 +21,7 @@ class TestProgressGate:
 
     def test_normal_threshold_soft_warning(self):
         gate = ProgressGate()
-        gate.reads_since_last_new_file = 12
+        gate.reads_since_last_new_file = 25
         gate.last_unique_file_count = 5
 
         state = {"porting_mode": False, "has_plan": False,
@@ -32,7 +32,7 @@ class TestProgressGate:
 
     def test_normal_threshold_hard_block(self):
         gate = ProgressGate()
-        gate.reads_since_last_new_file = 20
+        gate.reads_since_last_new_file = 33
         gate.last_unique_file_count = 5
 
         state = {"porting_mode": False, "has_plan": False,
@@ -43,19 +43,19 @@ class TestProgressGate:
 
     def test_porting_mode_higher_threshold(self):
         gate = ProgressGate()
-        gate.reads_since_last_new_file = 20
+        gate.reads_since_last_new_file = 30
         gate.last_unique_file_count = 5
 
         state = {"porting_mode": True, "has_plan": True,
                  "files_read_count": 5, "consecutive_train_failures": 0}
         msg, block = gate.check("read_file", {"path": "/a.py"}, state)
-        # In porting mode, threshold is 30, so 21 reads should NOT trigger
+        # In porting mode, threshold is 40, so 31 reads should NOT trigger
         assert msg == ""
         assert not block
 
     def test_porting_mode_triggers_at_30(self):
         gate = ProgressGate()
-        gate.reads_since_last_new_file = 30
+        gate.reads_since_last_new_file = 40
         gate.last_unique_file_count = 5
 
         state = {"porting_mode": True, "has_plan": True,
@@ -66,13 +66,13 @@ class TestProgressGate:
 
     def test_debugging_mode_threshold(self):
         gate = ProgressGate()
-        gate.reads_since_last_new_file = 15
+        gate.reads_since_last_new_file = 25
         gate.last_unique_file_count = 5
 
         state = {"porting_mode": False, "has_plan": False,
                  "files_read_count": 5, "consecutive_train_failures": 2}
         msg, block = gate.check("read_file", {"path": "/a.py"}, state)
-        # Debugging threshold is 18, so 16 should NOT trigger
+        # Debugging threshold is 30, so 26 should NOT trigger
         assert msg == ""
         assert not block
 
@@ -89,26 +89,26 @@ class TestProgressGate:
 
     def test_hard_cap_safety_net(self):
         gate = ProgressGate()
-        gate.consecutive_reads = 40
+        gate.consecutive_reads = 60
         gate.triggers = 0
-        gate.last_unique_file_count = 40
+        gate.last_unique_file_count = 60
 
         state = {"porting_mode": False, "has_plan": True,
-                 "files_read_count": 40, "consecutive_train_failures": 0}
+                 "files_read_count": 60, "consecutive_train_failures": 0}
         msg, block = gate.check("read_file", {"path": "/a.py"}, state)
         assert "CHECKPOINT SUGGESTION" in msg
         assert not block
 
-    def test_porting_hard_cap_is_60(self):
+    def test_porting_hard_cap_is_80(self):
         gate = ProgressGate()
-        gate.consecutive_reads = 45
+        gate.consecutive_reads = 65
         gate.triggers = 0
-        gate.last_unique_file_count = 45
+        gate.last_unique_file_count = 65
 
         state = {"porting_mode": True, "has_plan": True,
-                 "files_read_count": 45, "consecutive_train_failures": 0}
+                 "files_read_count": 65, "consecutive_train_failures": 0}
         msg, block = gate.check("read_file", {"path": "/a.py"}, state)
-        # Porting hard cap is 60, so 46 should NOT trigger
+        # Porting hard cap is 80, so 66 should NOT trigger
         assert msg == ""
         assert not block
 

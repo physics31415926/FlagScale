@@ -88,11 +88,11 @@ class ProgressGate(Gate):
             self.reads_since_last_new_file += 1
 
         # Threshold selection based on mode
-        stale_threshold = 12
+        stale_threshold = 25
         if porting_mode:
-            stale_threshold = 30
+            stale_threshold = 40
         elif debugging:
-            stale_threshold = 18
+            stale_threshold = 30
 
         # Pattern 1: Staleness
         if self.reads_since_last_new_file >= stale_threshold:
@@ -122,7 +122,7 @@ class ProgressGate(Gate):
                 ), False
 
         # Pattern 2: Very long exploration without checkpoint (safety net)
-        reads_hard_cap = 60 if porting_mode else 40
+        reads_hard_cap = 80 if porting_mode else 60
         if self.consecutive_reads >= reads_hard_cap and self.triggers == 0:
             self.triggers += 1
             return (

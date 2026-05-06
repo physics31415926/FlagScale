@@ -9,7 +9,7 @@ class WorkspaceCurrentTool(Tool):
         "Read or update current.yaml (current task state). "
         "This file tracks: task (what you're working on), status (running/blocked/completed), "
         "current_experiment (name of active experiment), blockers (list of issues), "
-        "next_steps (list of actions), context (list of key facts), session_summary (LLM-generated at session end). "
+        "next_steps (list of actions), context (list of key facts). "
         "Use 'read' to see current state. Use 'update' to modify specific fields. "
         "Use 'set_task' at session start to define the task."
     )

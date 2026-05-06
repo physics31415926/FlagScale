@@ -8,16 +8,22 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 SUMMARIZE_PROMPT = (
-    "Summarize the key conclusions, decisions, and findings from this conversation segment. "
+    "Summarize this conversation segment for an AI agent that will continue working on the same task. "
+    "Think about RE-READ COST: if a piece of information is lost, will the agent need to re-execute "
+    "a command or re-read a file to recover it? If yes, that information MUST be in the summary.\n\n"
     "PRESERVE with high fidelity:\n"
-    "- File paths that were read or modified\n"
-    "- Error messages and their root causes\n"
-    "- Solutions and workarounds found\n"
-    "- Decisions made and their rationale\n"
-    "- Current approach/strategy and what phase we're in\n"
-    "- What was ruled out and why\n"
-    "Be specific about technical details (function names, error messages, version numbers, shapes). "
-    "Keep the summary under 1000 tokens."
+    "- File paths read AND their key content (structure, config values, version numbers)\n"
+    "- Error messages, root causes, and what fixed them\n"
+    "- Environment state: what's installed, what versions, what paths\n"
+    "- Decisions made and their rationale (especially version choices, architecture choices)\n"
+    "- What was tried and failed (so the agent doesn't retry)\n"
+    "- Current approach/strategy and what phase we're in\n\n"
+    "DO NOT preserve:\n"
+    "- Verbose install/build logs (just the outcome)\n"
+    "- Repetitive monitoring output (just the conclusion)\n"
+    "- Directory listings (just the key paths found)\n\n"
+    "Be specific: include exact version numbers, exact paths, exact error messages. "
+    "Keep the summary under 1500 tokens."
 )
 
 COMPACTION_NOTICE = (
@@ -31,7 +37,7 @@ COMPACTION_NOTICE = (
 
 MAX_SUMMARY_TOKENS = 4000
 TRUNCATE_THRESHOLD = 2000
-KEEP_RECENT = 12  # Reduced from 20 to limit recent message token consumption
+KEEP_RECENT = 16
 AGING_WINDOW = 10
 AGING_THRESHOLD = 800
 
@@ -62,13 +68,52 @@ def _smart_truncate(content: str, max_chars: int = 600) -> str:
     return content[:max_chars] + f"\n[... truncated, {len(content)} chars total]"
 
 
+def _classify_content_value(content: str) -> str:
+    """Classify tool result content by its re-read cost / information density.
+
+    Returns: 'high', 'medium', or 'low'
+    - high: file contents, configs, errors — expensive to re-obtain, dense info
+    - medium: directory listings, grep results — moderate density
+    - low: install logs, build output, repetitive monitoring — low density
+    """
+    lower = content[:600].lower()
+
+    # Errors are always high value
+    if any(kw in content for kw in ("Error", "ERROR", "Traceback", "FAILED", "Exception")):
+        return "high"
+
+    # Install/build logs are low value
+    if any(kw in lower for kw in ("installing", "collecting", "downloading",
+                                   "successfully installed", "requirement already",
+                                   "building wheel", "running setup")):
+        return "low"
+
+    # File content (read_file results, cat output) — high value
+    # Heuristic: contains code-like patterns or structured data
+    if any(kw in lower for kw in ("import ", "def ", "class ", "from ", "---\n",
+                                   "\"type\":", "{", "}", "export ", "#include")):
+        return "high"
+
+    # Directory listings — medium value
+    lines = content.splitlines()
+    if len(lines) > 5 and sum(1 for l in lines[:10] if l.strip().startswith(("/", "./"))) > 5:
+        return "medium"
+
+    # Default: medium
+    return "medium"
+
+
 def _age_message(msg: Dict[str, Any]) -> Dict[str, Any]:
-    """Truncate a single message's tool results if they're large."""
+    """Truncate a single message's tool results based on content value.
+
+    High-value content (file contents, errors) gets a generous limit.
+    Low-value content (install logs) gets aggressively truncated.
+    """
     content = msg.get("content", "")
 
     if isinstance(content, str) and len(content) > AGING_THRESHOLD:
         if msg.get("role") == "tool":
-            return {**msg, "content": _smart_truncate(content)}
+            return {**msg, "content": _value_aware_truncate(content)}
 
     if isinstance(content, list):
         new_blocks = []
@@ -77,7 +122,7 @@ def _age_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             if (isinstance(block, dict) and block.get("type") == "tool_result"
                     and isinstance(block.get("content", ""), str)
                     and len(block["content"]) > AGING_THRESHOLD):
-                new_blocks.append({**block, "content": _smart_truncate(block["content"])})
+                new_blocks.append({**block, "content": _value_aware_truncate(block["content"])})
                 changed = True
             else:
                 new_blocks.append(block)
@@ -85,6 +130,26 @@ def _age_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             return {**msg, "content": new_blocks}
 
     return msg
+
+
+def _value_aware_truncate(content: str) -> str:
+    """Truncate based on content value classification."""
+    value = _classify_content_value(content)
+
+    if value == "high":
+        # Generous limit: keep structure visible
+        return _smart_truncate(content, max_chars=1500)
+    elif value == "low":
+        # Aggressive: just outcome
+        lines = content.splitlines()
+        if len(lines) > 6:
+            head = "\n".join(lines[:2])
+            tail = "\n".join(lines[-3:])
+            return f"{head}\n[... {len(lines) - 5} lines of output ...]\n{tail}"
+        return _smart_truncate(content, max_chars=300)
+    else:
+        # Medium: standard truncation
+        return _smart_truncate(content, max_chars=800)
 
 
 def _age_tool_results(messages: List[Dict[str, Any]], keep_recent: int = AGING_WINDOW) -> List[Dict[str, Any]]:
@@ -236,6 +301,7 @@ class HistoryManager:
         self._actual_input_tokens = None
         self._last_inflation_ratio = 1.0  # Preserve inflation ratio across compactions
         self._summarizer: Optional[Callable[[str], str]] = None
+        self._scorer: Optional[Callable[[List[Dict[str, Any]]], List[int]]] = None
         self._accumulated_summary: str = ""
         self._compaction_anchors: List[str] = []
         self._compaction_happened = False
@@ -244,6 +310,14 @@ class HistoryManager:
     def set_summarizer(self, callback: Callable[[str], str]):
         """Inject LLM summarization callback. Signature: (text) -> summary_string."""
         self._summarizer = callback
+
+    def set_scorer(self, callback: Callable[[List[Dict[str, Any]]], List[int]]):
+        """Inject LLM scoring callback for drop priority.
+
+        Signature: (messages) -> list of scores (0-10, higher = more valuable to keep).
+        Called during full compaction to decide which messages to drop first.
+        """
+        self._scorer = callback
 
     def set_compaction_anchors(self, anchors: List[str]):
         """Set anchors that MUST be preserved in the next compaction summary."""
@@ -334,7 +408,7 @@ class HistoryManager:
 
         new_estimated = sum(_message_tokens(m) for m in result)
         if new_estimated > local_target:
-            to_drop, to_keep = _collect_droppable(result, local_target)
+            to_drop, to_keep = _collect_droppable(result, local_target, scorer=self._scorer)
             if to_drop and self._summarizer:
                 summary_text = self._build_summary_input(to_drop, self._compaction_anchors)
                 self._compaction_anchors = []
@@ -358,49 +432,168 @@ class HistoryManager:
         self._messages.append(message)
         self._full_log.append(message)
 
-    def compact_intra_turn(self, keep_last: int = 4):
-        """Compress older messages within the current turn into a progress summary.
+    def compact_intra_turn(self, keep_last: int = 6):
+        """Graduated in-place compression of older tool results.
 
-        This is a lightweight, rule-based compression that runs without LLM calls.
-        It replaces older intermediate tool results with a structured summary,
-        keeping only the last `keep_last` messages for immediate context.
+        Instead of replacing all old messages with a lossy summary, this method
+        truncates individual tool results based on their content type and value.
+        Messages are preserved (the agent still sees WHAT it did and WHAT it found),
+        but verbose output is trimmed to key lines.
 
-        Should be called periodically (e.g., every 5 iterations) to prevent
-        unbounded history growth within a single turn.
+        This avoids the re-read problem: the agent retains enough context to know
+        what files contain and what commands produced, without needing to re-execute.
+
+        Only called when context pressure > 0.60.
         """
-        # Find the start of the current turn (last real user message, not tool_result)
         turn_start = self._find_turn_start()
         turn_messages = self._messages[turn_start:]
 
         if len(turn_messages) <= keep_last + 2:
-            return False  # Not enough messages to compress
-
-        to_compress = turn_messages[:-keep_last]
-        to_keep = turn_messages[-keep_last:]
-
-        # Don't compress if there's already a turn-progress marker in to_compress
-        for msg in to_compress:
-            content = msg.get("content", "")
-            if isinstance(content, str) and "<turn-progress>" in content:
-                # Already compressed this segment, just drop it and rebuild
-                to_compress = [m for m in to_compress
-                               if not (isinstance(m.get("content", ""), str)
-                                       and "<turn-progress>" in m.get("content", ""))]
-                break
-
-        if not to_compress:
             return False
 
-        summary = self._extract_turn_progress(to_compress)
-        summary_msg = {
-            "role": "user",
-            "content": f"<turn-progress>\n{summary}\n</turn-progress>"
-        }
+        # Target: reduce pressure to ~0.45 of budget
+        current_tokens = sum(_message_tokens(m) for m in self._messages)
+        target_tokens = int(self.max_context_tokens * 0.45)
+        tokens_to_free = current_tokens - target_tokens
+        if tokens_to_free <= 0:
+            return False
 
-        self._messages = self._messages[:turn_start] + [summary_msg] + to_keep
-        logger.info("Intra-turn compact: %d messages -> 1 summary + %d kept",
-                    len(turn_messages), keep_last)
-        return True
+        # Only compress messages BEFORE the keep_last window
+        compress_end = len(self._messages) - keep_last
+        compress_start = turn_start
+        if compress_end <= compress_start:
+            return False
+
+        freed = 0
+        # Pass 1: Compress low-value results (install logs, ls, find, repetitive output)
+        for i in range(compress_start, compress_end):
+            if freed >= tokens_to_free:
+                break
+            freed += self._compress_message_graduated(i, level=1)
+
+        # Pass 2: If still need more, compress medium-value results (file contents, shell output)
+        if freed < tokens_to_free:
+            for i in range(compress_start, compress_end):
+                if freed >= tokens_to_free:
+                    break
+                freed += self._compress_message_graduated(i, level=2)
+
+        if freed > 0:
+            logger.info("Intra-turn graduated compact: freed ~%d tokens from %d messages",
+                        freed, compress_end - compress_start)
+        return freed > 0
+
+    def _compress_message_graduated(self, idx: int, level: int) -> int:
+        """Compress a single message in-place at the given aggressiveness level.
+
+        Level 1: Only compress clearly low-value content (install logs, directory listings)
+        Level 2: Also compress file contents and shell output to key lines
+
+        Returns estimated tokens freed.
+        """
+        msg = self._messages[idx]
+        old_tokens = _message_tokens(msg)
+        content = msg.get("content", "")
+
+        if msg.get("role") == "assistant":
+            # Assistant reasoning is cheap and valuable — never compress at level 1
+            if level >= 2 and isinstance(content, list):
+                new_blocks = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if len(text) > 800:
+                            # Keep first and last paragraphs of long reasoning
+                            lines = text.splitlines()
+                            if len(lines) > 10:
+                                kept = lines[:4] + ["[...]"] + lines[-4:]
+                                new_blocks.append({**block, "text": "\n".join(kept)})
+                            else:
+                                new_blocks.append(block)
+                        else:
+                            new_blocks.append(block)
+                    else:
+                        new_blocks.append(block)
+                self._messages[idx] = {**msg, "content": new_blocks}
+            return old_tokens - _message_tokens(self._messages[idx])
+
+        # Tool result messages
+        if isinstance(content, list):
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    inner = block.get("content", "")
+                    if isinstance(inner, str) and len(inner) > 300:
+                        compressed = self._compress_tool_result(inner, level)
+                        new_blocks.append({**block, "content": compressed})
+                    else:
+                        new_blocks.append(block)
+                else:
+                    new_blocks.append(block)
+            self._messages[idx] = {**msg, "content": new_blocks}
+        elif isinstance(content, str) and len(content) > 300 and msg.get("role") == "tool":
+            self._messages[idx] = {**msg, "content": self._compress_tool_result(content, level)}
+
+        return old_tokens - _message_tokens(self._messages[idx])
+
+    @staticmethod
+    def _compress_tool_result(content: str, level: int) -> str:
+        """Compress a tool result string based on content type and level.
+
+        Preserves enough information to avoid re-reads:
+        - File paths and structure are always kept
+        - Error messages are always kept in full
+        - Verbose output (install logs, build output) is aggressively trimmed
+        """
+        lines = content.splitlines()
+        num_lines = len(lines)
+
+        # Never compress short content
+        if num_lines <= 8 or len(content) <= 400:
+            return content
+
+        # Always preserve errors fully
+        has_error = any(kw in content for kw in
+                       ("Error", "ERROR", "Traceback", "FAILED", "fatal", "Exception"))
+        if has_error:
+            if num_lines <= 30:
+                return content
+            # Keep error context: first 5 + last 15 lines (error usually at end)
+            head = "\n".join(lines[:5])
+            tail = "\n".join(lines[-15:])
+            return f"{head}\n[... {num_lines - 20} lines omitted ...]\n{tail}"
+
+        # Detect content type and compress accordingly
+        content_lower = content[:500].lower()
+
+        # Install/build logs — very low value, keep only outcome
+        if level >= 1 and any(kw in content_lower for kw in
+                              ("installing", "collecting", "downloading",
+                               "successfully installed", "requirement already",
+                               "building wheel", "running setup", "compiling")):
+            # Keep first 2 lines (command) + last 3 lines (result)
+            head = "\n".join(lines[:2])
+            tail = "\n".join(lines[-3:])
+            return f"{head}\n[... {num_lines - 5} lines of install/build output ...]\n{tail}"
+
+        # Directory listings (find/ls output) — keep paths but trim
+        if level >= 1 and num_lines > 20 and all(
+            l.strip().startswith(("/", "./", "total ")) or not l.strip()
+            for l in lines[:10] if l.strip()
+        ):
+            # Keep first 15 and last 5 paths
+            head = "\n".join(lines[:15])
+            tail = "\n".join(lines[-5:])
+            return f"{head}\n[... {num_lines - 20} more entries ...]\n{tail}"
+
+        # Level 2: General long output — keep head + tail
+        if level >= 2:
+            if num_lines > 20:
+                head = "\n".join(lines[:8])
+                tail = "\n".join(lines[-8:])
+                return f"{head}\n[... {num_lines - 16} lines omitted ...]\n{tail}"
+
+        return content
 
     def _find_turn_start(self) -> int:
         """Find the index of the last real user message (not a tool_result)."""
@@ -510,7 +703,9 @@ class HistoryManager:
 
     def get_messages(self) -> List[Dict[str, Any]]:
         """Return messages, compacting with LLM summary if over budget."""
-        self._messages = _age_tool_results(self._messages, keep_recent=AGING_WINDOW)
+        # Only age old tool results when context pressure is meaningful.
+        # With a 200K budget, aggressively truncating at 10% usage causes
+        # the agent to re-read files it already read — a net token loss.
         estimated = sum(_message_tokens(m) for m in self._messages)
         actual = self._actual_input_tokens or 0
         inflation = self._get_inflation_ratio()
@@ -520,6 +715,15 @@ class HistoryManager:
         self._last_compacted_from = None
         self._last_compacted_to = None
         self._compaction_happened = False
+
+        # Pressure-gated aging: only truncate old tool results when approaching budget
+        pressure = total / self.max_context_tokens if self.max_context_tokens > 0 else 0
+        if pressure > 0.50:
+            self._messages = _age_tool_results(self._messages, keep_recent=AGING_WINDOW)
+            estimated = sum(_message_tokens(m) for m in self._messages)
+            predicted = max(int(estimated * inflation), actual)
+            total = predicted
+
         if total <= self.max_context_tokens:
             return _validate_tool_pairs(list(self._messages))
 
@@ -554,7 +758,7 @@ class HistoryManager:
         if new_estimated > local_target:
             logger.info("Still over target after truncation (%d tokens, local_target=%d), summarizing and dropping",
                         new_estimated, local_target)
-            to_drop, to_keep = _collect_droppable(result, local_target)
+            to_drop, to_keep = _collect_droppable(result, local_target, scorer=self._scorer)
 
             if to_drop and self._summarizer:
                 summary_text = self._build_summary_input(to_drop, self._compaction_anchors)
@@ -782,34 +986,128 @@ def _validate_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return result
 
 
-def _collect_droppable(messages: List[Dict[str, Any]], budget: int):
+def _collect_droppable(messages: List[Dict[str, Any]], budget: int,
+                       scorer: Optional[Callable] = None):
     """Separate messages into (to_drop, to_keep) lists to fit within budget.
 
-    Keeps system messages and recent messages. Drops oldest non-system messages
-    in proper pairs (assistant+tool_result together).
+    If a scorer callback is available, uses LLM-based value scoring to drop
+    low-value messages first (regardless of age). Falls back to FIFO if no scorer.
+
+    Keeps system messages and context-summary messages unconditionally.
     """
     total = sum(_message_tokens(m) for m in messages)
     if total <= budget:
         return [], messages
 
-    to_drop = []
-    to_keep = list(messages)
-    i = 0
-    while i < len(to_keep) and total > budget:
-        if to_keep[i].get("role") == "system":
-            i += 1
-            continue
-
-        if (to_keep[i].get("role") == "assistant" and _has_tool_use(to_keep[i])
-                and i + 1 < len(to_keep) and _is_tool_result(to_keep[i + 1])):
-            total -= _message_tokens(to_keep[i]) + _message_tokens(to_keep[i + 1])
-            to_drop.append(to_keep.pop(i))
-            to_drop.append(to_keep.pop(i))
-        elif _is_tool_result(to_keep[i]):
-            total -= _message_tokens(to_keep[i])
-            to_drop.append(to_keep.pop(i))
+    # Identify droppable candidates (not system, not context-summary)
+    candidates = []  # (index, msg, tokens)
+    protected = []   # (index, msg) — always kept
+    for i, msg in enumerate(messages):
+        content = msg.get("content", "")
+        is_system = msg.get("role") == "system"
+        is_summary = isinstance(content, str) and content.startswith("<context-summary>")
+        if is_system or is_summary:
+            protected.append((i, msg))
         else:
-            total -= _message_tokens(to_keep[i])
-            to_drop.append(to_keep.pop(i))
+            candidates.append((i, msg, _message_tokens(msg)))
+
+    if not candidates:
+        return [], messages
+
+    # Score candidates: LLM if available, else heuristic
+    if scorer and len(candidates) > 4:
+        try:
+            candidate_msgs = [c[1] for c in candidates]
+            scores = scorer(candidate_msgs)
+            if len(scores) == len(candidates):
+                # Attach scores
+                scored = [(candidates[j][0], candidates[j][1], candidates[j][2], scores[j])
+                          for j in range(len(candidates))]
+            else:
+                scored = [(c[0], c[1], c[2], _heuristic_score(c[1])) for c in candidates]
+        except Exception as e:
+            logger.warning("Scorer failed, falling back to heuristic: %s", e)
+            scored = [(c[0], c[1], c[2], _heuristic_score(c[1])) for c in candidates]
+    else:
+        scored = [(c[0], c[1], c[2], _heuristic_score(c[1])) for c in candidates]
+
+    # Sort by score ascending (drop lowest-value first)
+    scored.sort(key=lambda x: (x[3], x[0]))
+
+    # Drop until we're under budget, respecting tool_use/tool_result pairs
+    to_drop_indices = set()
+    tokens_freed = 0
+    tokens_to_free = total - budget
+
+    for idx, msg, tokens, score in scored:
+        if tokens_freed >= tokens_to_free:
+            break
+        # If this is an assistant with tool_use, also drop the paired tool_result
+        if msg.get("role") == "assistant" and _has_tool_use(msg):
+            pair_idx = idx + 1
+            pair_tokens = 0
+            if pair_idx < len(messages) and _is_tool_result(messages[pair_idx]):
+                pair_tokens = _message_tokens(messages[pair_idx])
+                to_drop_indices.add(pair_idx)
+            to_drop_indices.add(idx)
+            tokens_freed += tokens + pair_tokens
+        elif _is_tool_result(msg):
+            # Check if the preceding assistant is already being dropped
+            if idx - 1 >= 0 and messages[idx - 1].get("role") == "assistant":
+                to_drop_indices.add(idx - 1)
+                tokens_freed += _message_tokens(messages[idx - 1])
+            to_drop_indices.add(idx)
+            tokens_freed += tokens
+        else:
+            to_drop_indices.add(idx)
+            tokens_freed += tokens
+
+    to_drop = [messages[i] for i in sorted(to_drop_indices)]
+    to_keep = [messages[i] for i in range(len(messages)) if i not in to_drop_indices]
 
     return to_drop, to_keep
+
+
+def _heuristic_score(msg: Dict[str, Any]) -> int:
+    """Score a message's value heuristically (0-10, higher = more valuable).
+
+    Used as fallback when LLM scorer is unavailable.
+    """
+    content = _extract_text(msg)
+    if not content:
+        return 1
+
+    # Errors are high value (agent needs to remember what failed)
+    if any(kw in content for kw in ("Error", "ERROR", "Traceback", "FAILED", "Exception")):
+        return 9
+
+    # Decisions and reasoning from assistant are high value
+    if msg.get("role") == "assistant":
+        if any(kw in content for kw in ("because", "decision", "approach", "strategy",
+                                         "found that", "discovered", "the issue is")):
+            return 8
+        return 5
+
+    # Tool results — score by content type
+    lower = content[:500].lower()
+
+    # Install/build logs — low value
+    if any(kw in lower for kw in ("installing", "collecting", "downloading",
+                                   "successfully installed", "building wheel")):
+        return 2
+
+    # File content — high value (expensive to re-read)
+    if any(kw in lower for kw in ("import ", "def ", "class ", "from ", "---\n",
+                                   "export ", "#include", "\"type\":")):
+        return 7
+
+    # Directory listings — medium
+    lines = content.splitlines()
+    if len(lines) > 5 and sum(1 for l in lines[:10] if l.strip().startswith(("/", "./"))) > 5:
+        return 4
+
+    # Short results (likely conclusions) — medium-high
+    if len(content) < 200:
+        return 6
+
+    return 4

@@ -1,5 +1,13 @@
-"""Workspace manager — manages current state, experiments, and hardware info."""
+"""Workspace manager — manages current state, session state, experiments, and hardware info.
 
+File layout under ~/.flagscale/workspace_state/:
+  current.yaml       — cross-session persistent state (task, context, current_experiment, recent_sessions)
+  session_state.json — ephemeral in-session state (crash recovery + compaction resume)
+  hardware.yaml      — hardware info (GPUs, driver, etc.)
+  experiments/       — per-experiment YAML files
+"""
+
+import json
 import os
 import time
 from pathlib import Path
@@ -9,17 +17,18 @@ import yaml
 
 
 class WorkspaceManager:
-    """Manages workspace state split into current.yaml, hardware.yaml, and per-experiment files."""
+    """Manages workspace state: current.yaml, session_state.json, hardware.yaml, experiments/."""
+
+    _MAX_RECENT_SESSIONS = 3
 
     def __init__(self, workspace_dir: str = ""):
         self._dir = workspace_dir or os.path.join(Path.home(), ".flagscale", "workspace_state")
         self._current_path = os.path.join(self._dir, "current.yaml")
         self._hardware_path = os.path.join(self._dir, "hardware.yaml")
-        self._snapshot_path = os.path.join(self._dir, "snapshot.yaml")
-        self._history_path = os.path.join(self._dir, "session_history.yaml")
+        self._session_state_path = os.path.join(self._dir, "session_state.json")
         self._experiments_dir = os.path.join(self._dir, "experiments")
 
-    # ── Current State ───────────────────────────────────────────────────
+    # ── Current State (cross-session persistent) ───────────────────────
 
     def read_current(self) -> Dict:
         """Read current.yaml. Returns empty dict if not exists."""
@@ -34,16 +43,15 @@ class WorkspaceManager:
     def update_current(self, **kwargs) -> str:
         """Update specific fields in current.yaml.
 
-        Supported fields: task, status, current_experiment, blockers, next_steps, context, session_summary.
+        Supported fields: task, status, current_experiment, blockers, next_steps, context.
         """
         os.makedirs(self._dir, exist_ok=True)
         current = self.read_current()
 
         for key, value in kwargs.items():
-            if key in ("task", "status", "current_experiment", "session_summary"):
+            if key in ("task", "status", "current_experiment"):
                 current[key] = value
             elif key in ("blockers", "next_steps", "context"):
-                # These are lists
                 if not isinstance(value, list):
                     return f"ERROR: {key} must be a list"
                 current[key] = value
@@ -60,7 +68,7 @@ class WorkspaceManager:
             return f"ERROR: Failed to update current.yaml: {e}"
 
     def get_current_task(self) -> str:
-        """Get the task field from current.yaml. Returns empty string if not set."""
+        """Get the task field from current.yaml."""
         current = self.read_current()
         return current.get("task", "")
 
@@ -75,77 +83,80 @@ class WorkspaceManager:
             return f"ERROR: {e}"
 
     def get_current_experiment(self) -> str:
-        """Get the current_experiment field from current.yaml. Returns empty string if not set."""
+        """Get the current_experiment field from current.yaml."""
         current = self.read_current()
         return current.get("current_experiment", "")
 
-    # ── Snapshot ───────────────────────────────────────────────────────
-
-    def write_snapshot(self, snapshot: Dict) -> str:
-        """Write unified snapshot — single source of truth for session recovery."""
-        os.makedirs(self._dir, exist_ok=True)
-        snapshot["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            with open(self._snapshot_path, "w", encoding="utf-8") as f:
-                yaml.dump(snapshot, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-            return "OK"
-        except Exception as e:
-            return f"ERROR: {e}"
-
-    def read_snapshot(self) -> Dict:
-        """Read snapshot.yaml. Returns empty dict if not exists."""
-        if not os.path.isfile(self._snapshot_path):
-            return {}
-        try:
-            with open(self._snapshot_path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
-        except Exception:
-            return {}
-
-    # ── Session History ────────────────────────────────────────────────
-
-    _MAX_SESSION_HISTORY = 10
+    # ── Recent Sessions (stored in current.yaml) ──────────────────────
 
     def append_session_summary(self, session_id: str, task: str, summary: str, metadata: str = "") -> str:
-        """Append a session summary to rolling history. Keeps last N entries."""
+        """Append a session summary to current.yaml's recent_sessions list. Keeps last N."""
         os.makedirs(self._dir, exist_ok=True)
-        history = self._read_session_history()
+        current = self.read_current()
 
         entry = {
             "session_id": session_id,
-            "task": task,
-            "summary": summary,
+            "task": task[:100],
+            "summary": summary[:150] if summary else "",
             "metadata": metadata,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        history.append(entry)
 
-        # Keep only the most recent entries
-        if len(history) > self._MAX_SESSION_HISTORY:
-            history = history[-self._MAX_SESSION_HISTORY:]
+        recent = current.get("recent_sessions", [])
+        if not isinstance(recent, list):
+            recent = []
+        recent.append(entry)
+        if len(recent) > self._MAX_RECENT_SESSIONS:
+            recent = recent[-self._MAX_RECENT_SESSIONS:]
+        current["recent_sessions"] = recent
+        current["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
         try:
-            with open(self._history_path, "w", encoding="utf-8") as f:
-                yaml.dump(history, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            with open(self._current_path, "w", encoding="utf-8") as f:
+                yaml.dump(current, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
             return "OK"
         except Exception as e:
             return f"ERROR: {e}"
 
-    def _read_session_history(self) -> List[Dict]:
-        """Read session_history.yaml. Returns empty list if not exists."""
-        if not os.path.isfile(self._history_path):
-            return []
-        try:
-            with open(self._history_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-                return data if isinstance(data, list) else []
-        except Exception:
-            return []
-
     def get_recent_sessions(self, n: int = 3) -> List[Dict]:
-        """Get the N most recent session summaries for context injection."""
-        history = self._read_session_history()
-        return history[-n:] if history else []
+        """Get the N most recent session summaries from current.yaml."""
+        current = self.read_current()
+        recent = current.get("recent_sessions", [])
+        if not isinstance(recent, list):
+            return []
+        return recent[-n:]
+
+    # ── Session State (ephemeral, in-session only) ─────────────────────
+
+    def write_session_state(self, state: Dict) -> str:
+        """Write session_state.json — unified crash recovery + compaction resume state."""
+        os.makedirs(self._dir, exist_ok=True)
+        state["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        state["generated_ts"] = time.time()
+        try:
+            with open(self._session_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            return "OK"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    def read_session_state(self) -> Dict:
+        """Read session_state.json. Returns empty dict if not exists."""
+        if not os.path.isfile(self._session_state_path):
+            return {}
+        try:
+            with open(self._session_state_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def clear_session_state(self):
+        """Remove session_state.json (called at session end or new session start)."""
+        try:
+            if os.path.isfile(self._session_state_path):
+                os.remove(self._session_state_path)
+        except Exception:
+            pass
 
     # ── Hardware ────────────────────────────────────────────────────────
 
@@ -175,8 +186,13 @@ class WorkspaceManager:
         safe_name = name.replace("/", "_").replace(" ", "_")
         return os.path.join(self._experiments_dir, f"{safe_name}.yaml")
 
-    def create_experiment(self, name: str, purpose: str, hypothesis: str, config: Dict, exp_dir: str) -> str:
-        """Create a new experiment file."""
+    def create_experiment(self, name: str, purpose: str, hypothesis: str, base_config: Dict, base_dir: str) -> str:
+        """Create a new experiment file.
+
+        base_config: initial/baseline config for this experiment.
+        base_dir: initial log directory for this experiment.
+        Subsequent attempts record their own config and output_dir.
+        """
         os.makedirs(self._experiments_dir, exist_ok=True)
         path = self._experiment_path(name)
 
@@ -187,9 +203,10 @@ class WorkspaceManager:
             "name": name,
             "purpose": purpose,
             "hypothesis": hypothesis,
-            "config": config,
-            "dir": exp_dir,
+            "base_config": base_config,
+            "base_dir": base_dir,
             "attempts": [],
+            "events": [],
             "status": "running",
             "root_cause": None,
             "learnings": [],
@@ -199,6 +216,7 @@ class WorkspaceManager:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 yaml.dump(experiment, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            self.update_current(current_experiment=name)
             return f"Experiment '{name}' created."
         except Exception as e:
             return f"ERROR: Failed to create experiment: {e}"
@@ -214,17 +232,44 @@ class WorkspaceManager:
         except Exception:
             return None
 
-    def add_attempt(self, name: str, change: str, result: str) -> str:
-        """Append an attempt to an experiment."""
+    def find_latest_experiment(self) -> str:
+        """Find the most recently modified experiment file. Returns name or empty string."""
+        if not os.path.isdir(self._experiments_dir):
+            return ""
+        try:
+            files = [f for f in os.listdir(self._experiments_dir) if f.endswith(".yaml")]
+            if not files:
+                return ""
+            latest = max(files, key=lambda f: os.path.getmtime(os.path.join(self._experiments_dir, f)))
+            return latest.replace(".yaml", "")
+        except Exception:
+            return ""
+
+    def add_attempt(self, name: str, change: str, output_dir: str, config: Optional[Dict] = None, result: str = "") -> str:
+        """Append an attempt to an experiment.
+
+        Each attempt records: what changed, where output goes, config for this run.
+        Result starts empty (pending) and gets filled by update_last_attempt.
+        """
         exp = self.read_experiment(name)
         if not exp:
             return f"ERROR: Experiment '{name}' not found."
+
+        # Enforce unique output_dir across all attempts
+        existing_dirs = [a.get("output_dir", "") for a in exp.get("attempts", [])]
+        if output_dir in existing_dirs:
+            return (
+                f"ERROR: output_dir '{output_dir}' already used by a previous attempt.\n"
+                "Each attempt MUST have a unique output_dir. Use a timestamp or attempt number suffix."
+            )
 
         attempt_id = len(exp.get("attempts", [])) + 1
         attempt = {
             "id": attempt_id,
             "change": change,
-            "result": result,
+            "config": config or {},
+            "output_dir": output_dir,
+            "result": result or "pending",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         exp.setdefault("attempts", []).append(attempt)
@@ -238,17 +283,14 @@ class WorkspaceManager:
             return f"ERROR: Failed to add attempt: {e}"
 
     def update_last_attempt(self, name: str, result: str) -> str:
-        """Update the result of the last attempt."""
+        """Update the result of the most recent attempt."""
         exp = self.read_experiment(name)
         if not exp:
             return f"ERROR: Experiment '{name}' not found."
-
         attempts = exp.get("attempts", [])
         if not attempts:
-            return f"ERROR: No attempts in experiment '{name}'."
-
+            return f"ERROR: No attempts in '{name}'."
         attempts[-1]["result"] = result
-
         try:
             path = self._experiment_path(name)
             with open(path, "w", encoding="utf-8") as f:
@@ -256,6 +298,41 @@ class WorkspaceManager:
             return f"Last attempt in '{name}' updated."
         except Exception as e:
             return f"ERROR: Failed to update attempt: {e}"
+
+    def has_pending_attempt(self, name: str) -> bool:
+        """Check if the latest attempt is still pending (no result yet)."""
+        exp = self.read_experiment(name)
+        if not exp:
+            return False
+        attempts = exp.get("attempts", [])
+        if not attempts:
+            return False
+        return attempts[-1].get("result") == "pending"
+
+    def add_event(self, name: str, event_type: str, detail: str) -> str:
+        """Append a lightweight event to the experiment's event log.
+
+        Events are non-training actions: code changes, kills, verification steps, etc.
+        They don't have config/output_dir — those are for attempts (actual training runs).
+        """
+        exp = self.read_experiment(name)
+        if not exp:
+            return f"ERROR: Experiment '{name}' not found."
+
+        event = {
+            "type": event_type,
+            "detail": detail[:300],
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        exp.setdefault("events", []).append(event)
+
+        try:
+            path = self._experiment_path(name)
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(exp, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            return f"Event '{event_type}' recorded."
+        except Exception as e:
+            return f"ERROR: Failed to add event: {e}"
 
     def finalize_experiment(self, name: str, status: str, root_cause: Optional[str], learnings: List[str]) -> str:
         """Finalize an experiment with status, root_cause, and learnings."""
@@ -266,119 +343,69 @@ class WorkspaceManager:
         exp["status"] = status
         exp["root_cause"] = root_cause
         exp["learnings"] = learnings
+        exp["finalized"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
         try:
             path = self._experiment_path(name)
             with open(path, "w", encoding="utf-8") as f:
                 yaml.dump(exp, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-            return f"Experiment '{name}' finalized with status '{status}'."
+            return f"Experiment '{name}' finalized as '{status}'."
         except Exception as e:
             return f"ERROR: Failed to finalize experiment: {e}"
 
     def list_experiments(self) -> List[Dict]:
-        """List all experiments (name + status only)."""
+        """List all experiments with basic info."""
         if not os.path.isdir(self._experiments_dir):
             return []
-
-        experiments = []
-        for fname in sorted(os.listdir(self._experiments_dir)):
-            if not fname.endswith(".yaml"):
-                continue
-            path = os.path.join(self._experiments_dir, fname)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    exp = yaml.safe_load(f)
-                    experiments.append({
-                        "name": exp.get("name", fname[:-5]),
-                        "status": exp.get("status", "unknown"),
-                    })
-            except Exception:
-                continue
-        return experiments
-
-    # ── Migration ───────────────────────────────────────────────────────
-
-    def migrate_from_markdown(self, old_path: str) -> str:
-        """Migrate from old workspace_state.md to new structure."""
-        if not os.path.isfile(old_path):
-            return "ERROR: Old workspace_state.md not found."
-
+        results = []
         try:
-            with open(old_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            return f"ERROR: Failed to read old file: {e}"
+            for f in sorted(os.listdir(self._experiments_dir)):
+                if not f.endswith(".yaml"):
+                    continue
+                path = os.path.join(self._experiments_dir, f)
+                with open(path, "r", encoding="utf-8") as fh:
+                    exp = yaml.safe_load(fh) or {}
+                results.append({
+                    "name": exp.get("name", f.replace(".yaml", "")),
+                    "status": exp.get("status", "unknown"),
+                    "attempts": len(exp.get("attempts", [])),
+                    "created": exp.get("created", ""),
+                })
+        except Exception:
+            pass
+        return results
 
-        # Parse sections
-        sections = {}
-        lines = content.split("\n")
-        current_section = None
-        current_lines = []
+    # ── Migration ──────────────────────────────────────────────────────
 
-        for line in lines:
-            if line.startswith("## "):
-                if current_section:
-                    sections[current_section] = "\n".join(current_lines).strip()
-                current_section = line[3:].strip()
-                current_lines = []
-            else:
-                current_lines.append(line)
+    def migrate_from_old_format(self):
+        """Migrate old session_history.yaml and .agent_state.json/snapshot.yaml to new format."""
+        migrated = []
 
-        if current_section:
-            sections[current_section] = "\n".join(current_lines).strip()
+        # Migrate session_history.yaml → current.yaml recent_sessions
+        old_history = os.path.join(self._dir, "session_history.yaml")
+        if os.path.isfile(old_history):
+            try:
+                with open(old_history, "r", encoding="utf-8") as f:
+                    history = yaml.safe_load(f) or []
+                if isinstance(history, list) and history:
+                    current = self.read_current()
+                    recent = history[-self._MAX_RECENT_SESSIONS:]
+                    current["recent_sessions"] = recent
+                    self.write_current(current)
+                    migrated.append("session_history.yaml → current.yaml:recent_sessions")
+                os.remove(old_history)
+            except Exception:
+                pass
 
-        # Create current.yaml from Session Summary
-        summary = sections.get("Session Summary", "")
-        current = {
-            "task": "Migrated from old workspace_state.md",
-            "status": "unknown",
-            "session_summary": summary,
-            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        os.makedirs(self._dir, exist_ok=True)
-        with open(self._current_path, "w", encoding="utf-8") as f:
-            yaml.dump(current, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        # Remove old .agent_state.json and snapshot.yaml (superseded by session_state.json)
+        old_agent_state = os.path.join(self._dir, ".agent_state.json")
+        old_snapshot = os.path.join(self._dir, "snapshot.yaml")
+        for old_file in (old_agent_state, old_snapshot):
+            if os.path.isfile(old_file):
+                try:
+                    os.remove(old_file)
+                    migrated.append(f"removed {os.path.basename(old_file)}")
+                except Exception:
+                    pass
 
-        # Create hardware.yaml from Hardware section
-        hardware_text = sections.get("Hardware", "")
-        if hardware_text:
-            hardware = {"info": hardware_text}
-            with open(self._hardware_path, "w", encoding="utf-8") as f:
-                yaml.dump(hardware, f, allow_unicode=True, default_flow_style=False)
-
-        # Parse Experiments section into individual files
-        experiments_text = sections.get("Experiments", "")
-        entries = []
-        if experiments_text and "### " in experiments_text:
-            os.makedirs(self._experiments_dir, exist_ok=True)
-            entries = experiments_text.split("### ")[1:]
-            for entry in entries:
-                lines = entry.split("\n")
-                first_line = lines[0].strip()
-                # Extract name from "exp_name (status)" format
-                if "(" in first_line:
-                    name = first_line.split("(")[0].strip()
-                    status = first_line.split("(")[1].rstrip(")").strip()
-                else:
-                    name = first_line
-                    status = "unknown"
-
-                exp_content = "\n".join(lines[1:]).strip()
-                experiment = {
-                    "name": name,
-                    "purpose": "Migrated from old workspace_state.md",
-                    "hypothesis": "",
-                    "config": {},
-                    "dir": "",
-                    "attempts": [],
-                    "status": status,
-                    "root_cause": None,
-                    "learnings": [],
-                    "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "migrated_content": exp_content,
-                }
-                path = self._experiment_path(name)
-                with open(path, "w", encoding="utf-8") as f:
-                    yaml.dump(experiment, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-
-        return f"Migrated from {old_path}. Created current.yaml, hardware.yaml, and {len(entries)} experiment files."
+        return migrated

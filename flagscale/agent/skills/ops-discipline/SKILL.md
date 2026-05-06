@@ -60,6 +60,27 @@ Detailed operational rules for infrastructure work. The system prompt covers pri
 - After launch, IMMEDIATELY check logs (within 30 seconds) for startup errors.
 - If training fails within first 100 iterations → config or environment issue, not training issue.
 
+## FlagScale log structure and error detection
+
+FlagScale logs are organized per-rank under the output directory:
+```
+outputs/<exp>/logs/details/host_<N>_<hostname>/<timestamp>/<run_id>/attempt_<N>/<rank>/
+  ├── stdout.log   (training metrics, progress)
+  └── stderr.log   (errors, warnings, stack traces)
+```
+
+**Critical rule: ALWAYS check stderr.log files after launch.**
+- Training can appear "running" (wandb init, imports) while actually crashing on rank > 0.
+- Errors like missing APEX, TransformerEngine, flash_attn show up ONLY in stderr.log.
+- Use: `find outputs/<exp>/logs -name 'stderr.log' -newer <ref_file> -exec tail -5 {} +`
+- Or use the monitor tool with `output_dir=outputs/<exp>` to auto-scan all stderr files.
+
+**Don't monitor stdout for 300s when stderr already has the answer.**
+- Wait 10-15 seconds after launch
+- Check stderr.log for ALL ranks (not just rank 0)
+- If stderr shows errors → training is DEAD, act on the error immediately
+- Common stderr-only errors: APEX not installed correctly, gradient_accumulation_fusion requires fused kernels, flash_attn version mismatch
+
 ## Trust nothing, verify everything
 
 - After `pip install X`: `python -c "import X; print(X.__version__)"`.
@@ -75,9 +96,25 @@ Detailed operational rules for infrastructure work. The system prompt covers pri
 ## Dependency chain awareness
 
 - When skipping/removing ANY component, IMMEDIATELY scan configs for parameters that depend on it.
-- After modifying config files, check if the build system caches old configs.
+- After modifying config files, check if the build system caches old configs (e.g., Hydra caches resolved config in `outputs/<exp>/hydra/`).
 - Think in dependency chains: A → B → C. If C changes, trace impact forward.
 - CUDA/cuDNN conflicts: system LD_LIBRARY_PATH often has older cuDNN than PyTorch expects. Fix: prepend PyTorch's bundled nvidia/cudnn/lib.
+
+## APEX installation modes
+
+APEX has two install modes with VERY different capabilities:
+- **Pure Python** (`pip install apex` or `pip install -v --no-build-isolation --no-cuda-ext .`): Only provides Python utilities (amp, normalization wrappers). Does NOT provide fused CUDA kernels.
+- **Full CUDA** (`pip install -v --no-build-isolation .` with CUDA toolkit): Provides fused kernels: `fused_weight_gradient_mlp_cuda`, `fused_adam`, `fused_layer_norm_cuda`, etc.
+
+**If APEX is installed pure-python:**
+- `gradient_accumulation_fusion: true` will CRASH (requires `fused_weight_gradient_mlp_cuda`)
+- `bias_gelu_fusion: true` may crash (requires fused kernels)
+- FusedAdam optimizer unavailable
+
+**Action when pure-python APEX detected:**
+1. Disable ALL fusion flags that require APEX CUDA: `gradient_accumulation_fusion: false`, `bias_gelu_fusion: false`
+2. OR install APEX with CUDA extensions (requires matching CUDA toolkit version)
+3. Verify: `python -c "import fused_weight_gradient_mlp_cuda"` — if ImportError, it's pure-python
 
 ## Dependency resolution — constraint solving, then one-shot install
 
