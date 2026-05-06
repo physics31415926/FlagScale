@@ -16,7 +16,7 @@ class TestSystemPromptCore:
     def test_core_prompt_has_all_placeholders(self):
         placeholders = [
             "{skills}", "{cwd}", "{plan_context}", "{memory_context}",
-            "{workspace_context}", "{situational_context}",
+            "{situational_context}",
             "{optional_sections}", "{skill_context}",
         ]
         for p in placeholders:
@@ -28,7 +28,6 @@ class TestSystemPromptCore:
             cwd="/tmp",
             plan_context="",
             memory_context="",
-            workspace_context="",
             situational_context="",
             optional_sections="",
             skill_context="",
@@ -38,11 +37,10 @@ class TestSystemPromptCore:
 
     def test_core_prompt_no_unescaped_braces(self):
         """Ensure regex patterns like {4-7} are properly escaped as {{4-7}}."""
-        # This should not raise KeyError
         try:
             SYSTEM_PROMPT_CORE.format(
                 skills="", cwd="", plan_context="", memory_context="",
-                workspace_context="", situational_context="",
+                situational_context="",
                 optional_sections="", skill_context="",
             )
         except (KeyError, ValueError) as e:

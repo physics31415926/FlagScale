@@ -24,6 +24,7 @@ EXPECTED_SKILLS = {
     "ops-discipline",
     "workspace-layout",
     "parallel-strategy",
+    "debug-strategy",
 }
 
 REQUIRED_FRONTMATTER_FIELDS = {"name", "description", "keywords"}

@@ -33,7 +33,15 @@ class MemoryWriteTool(Tool):
         "properties": {
             "key": {
                 "type": "string",
-                "description": "Short identifier, lowercase alphanumeric and underscores only, 2-80 chars (e.g. 'aquila70b_tp_oom', 'parallel_strategy_final'). NO error messages, hashes, or special characters.",
+                "description": (
+                    "Short identifier following naming convention: <scope>_<topic>[_<detail>]. "
+                    "Scope = model name (bagel_, qwen3_), framework (flagscale_, megatron_, te_), "
+                    "or env/tool (env_, cuda_, nccl_). "
+                    "Examples: 'bagel_architecture_overview', 'flagscale_native_backend_pattern', "
+                    "'megatron_pipeline_knowledge', 'env_apex_build_fix'. "
+                    "Lowercase alphanumeric and underscores only, 2-80 chars. "
+                    "NO error messages, hashes, or special characters."
+                ),
             },
             "type": {
                 "type": "string",
@@ -53,14 +61,11 @@ class MemoryWriteTool(Tool):
         "required": ["key", "type", "content"],
     }
 
-    def __init__(self, memory, session_id: str = "", workspace_manager=None):
+    def __init__(self, memory, session_id: str = ""):
         self._memory = memory
         self._session_id = session_id
-        self._workspace_manager = workspace_manager
 
     def _get_current_task(self) -> str:
-        if self._workspace_manager:
-            return self._workspace_manager.get_current_task()
         return ""
 
     def execute(self, **kwargs) -> str:

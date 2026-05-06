@@ -116,10 +116,11 @@ class TestMonitorTool:
         # Should timeout since output doesn't change
         assert "timeout" in result
 
-    def test_error_both_file_and_command(self):
+    def test_both_file_and_command_accepted(self):
         tool = MonitorTool()
-        result = tool.execute(file="/tmp/x", command="echo y")
-        assert "ERROR" in result
+        result = tool.execute(file="/tmp/nonexistent_xyz", command="echo y", duration=2, interval=1)
+        # No longer an error — tool accepts both; just check it runs
+        assert "ERROR" not in result or "No such file" in result
 
     def test_error_neither_file_nor_command(self):
         tool = MonitorTool()

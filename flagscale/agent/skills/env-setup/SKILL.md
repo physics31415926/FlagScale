@@ -216,6 +216,18 @@ python -c "import apex; print('Apex OK')"
 
 **Common issue**: CUDA version mismatch between system nvcc and PyTorch's CUDA. If Apex build fails with version check error, report the exact error to the user — do NOT modify Apex source code.
 
+**IMPORTANT: Pure-Python vs CUDA Extensions**
+
+Apex has two install modes:
+- **Full install** (with `APEX_CUDA_EXT=1`): Compiles CUDA extensions for fused kernels. Required for `gradient_accumulation_fusion`, fused Adam, fused layer norm, etc.
+- **Pure-Python install** (without CUDA flags or `pip install apex`): Only Python wrappers, NO fused kernels. Many Megatron features silently fall back to slower paths or fail with `RuntimeError: ... requires APEX CUDA extensions`.
+
+**If you see `gradient_accumulation_fusion requires APEX CUDA extensions`**: Apex was installed in pure-Python mode. You must either:
+1. Reinstall with CUDA extensions (recommended): use the build command above with `APEX_CUDA_EXT=1`
+2. OR disable ALL fusion flags at once: `gradient_accumulation_fusion: false`, `bias_gelu_fusion: false`, `bias_swiglu_fusion: false` — and note the performance impact
+
+Never disable just one fusion flag — if APEX CUDA extensions are missing, ALL fused kernels are unavailable.
+
 ### 4d. Flash-Attention 2
 
 **CRITICAL**: Always use `--no-deps` when installing flash-attn. Without it, pip may upgrade PyTorch to an incompatible version, causing cascading failures (triton mismatch, CUDA version conflicts). The PyTorch version was already pinned in Step 3 — do not let flash-attn override it.
@@ -226,6 +238,8 @@ cd {deps_dir}/flash-attention
 FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=4 \
     pip install --no-build-isolation --no-deps . -v
 ```
+
+**CUDA toolkit vs driver version**: Flash-attn compilation requires the CUDA **toolkit** version (nvcc) to match PyTorch's CUDA version, NOT the driver version. Check with `nvcc --version` (toolkit) vs `nvidia-smi` (driver). If nvcc is missing or wrong version, install the matching CUDA toolkit or set `CUDA_HOME` to the correct path.
 
 After installing, verify PyTorch was NOT changed:
 ```bash

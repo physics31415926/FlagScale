@@ -132,7 +132,8 @@ def _training_guardrails(command: str) -> list:
         )
 
     # GPU pre-check for training launches
-    if _FLAGSCALE_TRAIN_RE.search(cleaned) and '--dryrun' not in cleaned and '--stop' not in cleaned:
+    is_dryrun = any(p in cleaned.lower() for p in ['--dryrun', '--dry-run', '--dry_run', 'action=dryrun', 'action=dry_run', 'action=dry-run'])
+    if _FLAGSCALE_TRAIN_RE.search(cleaned) and not is_dryrun and '--stop' not in cleaned:
         try:
             gpu_check = subprocess.run(
                 "nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null",
@@ -156,7 +157,7 @@ def _training_guardrails(command: str) -> list:
             pass
 
     # Check for stale processes before training launch
-    if _FLAGSCALE_TRAIN_RE.search(cleaned) and '--stop' not in cleaned and '--dryrun' not in cleaned:
+    if _FLAGSCALE_TRAIN_RE.search(cleaned) and '--stop' not in cleaned and not is_dryrun:
         try:
             proc_check = subprocess.run(
                 "pgrep -c -f 'torchrun|train_' 2>/dev/null",

@@ -424,6 +424,8 @@ class HistoryManager:
         # Keep _actual_input_tokens to preserve inflation ratio memory
         self._compaction_count += 1
         final_estimated = sum(_message_tokens(m) for m in self._messages)
+        self._last_compacted_from = estimated
+        self._last_compacted_to = final_estimated
         logger.info("Force compact done: %d -> %d estimated tokens (≈%d real)",
                     estimated, final_estimated, int(final_estimated * inflation))
         return True

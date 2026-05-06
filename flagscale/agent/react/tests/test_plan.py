@@ -35,7 +35,7 @@ class TestCreate:
         p2 = tp.create("Plan 2", ["B"])
         assert tp.get_active()["id"] == p2["id"]
         old = tp._load(p1["id"])
-        assert old["status"] == "abandoned"
+        assert old["status"] == "paused"
 
 
 class TestUpdateStep:

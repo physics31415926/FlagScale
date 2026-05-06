@@ -29,6 +29,8 @@ CONTEXT_LIMIT_KEYWORDS = (
     "prompt is too long",
     "input is too long",
     "request too large",
+    "超过供应商限制",
+    "输入内容超过",
 )
 
 

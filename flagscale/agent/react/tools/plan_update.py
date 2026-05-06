@@ -14,8 +14,8 @@ class PlanUpdateTool(Tool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["step_done", "step_doing", "step_skip", "add_steps", "complete", "abandon", "batch"],
-                "description": "What to do: step_done/step_doing/step_skip (update a step), add_steps (insert new steps), complete/abandon (finish the plan), batch (update multiple steps at once).",
+                "enum": ["step_done", "step_doing", "step_skip", "add_steps", "complete", "abandon", "deactivate", "reactivate", "batch"],
+                "description": "What to do: step_done/step_doing/step_skip (update a step), add_steps (insert new steps), complete/abandon (finish the plan), deactivate (pause current plan), reactivate (resume a paused plan by id), batch (update multiple steps at once).",
             },
             "step_id": {
                 "type": "integer",
@@ -47,6 +47,14 @@ class PlanUpdateTool(Tool):
                 },
                 "description": "For batch action: list of step updates to apply at once.",
             },
+            "plan_id": {
+                "type": "string",
+                "description": "Plan ID to reactivate (for reactivate action).",
+            },
+            "experiment": {
+                "type": "string",
+                "description": "Experiment name to link to this step (for step_done/step_doing). Automatically appended to the step's experiments list.",
+            },
         },
         "required": ["action"],
     }
@@ -56,17 +64,22 @@ class PlanUpdateTool(Tool):
 
     def execute(self, **kwargs) -> str:
         action = kwargs["action"]
+        experiment = kwargs.get("experiment", "")
         try:
             if action == "step_done":
                 step_id = kwargs.get("step_id")
                 if not step_id:
                     return "ERROR: step_id required for step_done."
                 self._plan.update_step(step_id, "done", kwargs.get("notes", ""))
+                if experiment:
+                    self._plan.link_experiment(step_id, experiment)
             elif action == "step_doing":
                 step_id = kwargs.get("step_id")
                 if not step_id:
                     return "ERROR: step_id required for step_doing."
                 self._plan.update_step(step_id, "doing", kwargs.get("notes", ""))
+                if experiment:
+                    self._plan.link_experiment(step_id, experiment)
             elif action == "step_skip":
                 step_id = kwargs.get("step_id")
                 if not step_id:
@@ -81,6 +94,19 @@ class PlanUpdateTool(Tool):
                 self._plan.complete()
             elif action == "abandon":
                 self._plan.abandon(kwargs.get("notes", ""))
+            elif action == "deactivate":
+                plan = self._plan.deactivate()
+                if not plan:
+                    return "No active plan to deactivate."
+                return f"Plan '{plan['title']}' paused."
+            elif action == "reactivate":
+                plan_id = kwargs.get("plan_id")
+                if not plan_id:
+                    return "ERROR: plan_id required for reactivate."
+                plan = self._plan.reactivate(plan_id)
+                if not plan:
+                    return f"ERROR: Could not reactivate plan '{plan_id}'. Not found or not paused."
+                return self._plan.summary()
             elif action == "batch":
                 updates = kwargs.get("updates", [])
                 if not updates:

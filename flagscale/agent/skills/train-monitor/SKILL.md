@@ -34,6 +34,14 @@ suggests: []
 
 Monitor running FlagScale training jobs: locate logs, check health, detect anomalies, and report metrics.
 
+## Critical Rules
+
+1. **Always use `monitor(output_dir=...)` as the primary monitoring method.** It auto-discovers the latest logs, scans stderr for errors, and reports metrics — all in one call. NEVER use raw `find` commands to locate logs (they find old runs from previous launches).
+
+2. **Check stderr FIRST, not stdout.** Crash information is in stderr. A process showing "wandb initialized" or "loading model" in stdout may already be dead. The monitor tool checks stderr automatically.
+
+3. **Old log trap**: `find ... -name "stdout.log"` without timestamp filtering will return logs from ALL previous runs. Always filter by the current run's timestamp or use the monitor tool which handles this automatically.
+
 ## Finding the Experiment Directory
 
 Before searching the filesystem, check workspace_state's "Experiments" section — it contains a registry of all launched experiments with their directories. Use `workspace_state(action="read")` and look up the experiment dir from the table. This is the fastest and most reliable way to find logs.

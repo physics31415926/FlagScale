@@ -142,7 +142,7 @@ class TestReactAgentLoop:
 
         assert provider.chat_stream.call_count == 2
 
-    def test_autosave_written_after_turn(self, tmp_path):
+    def test_conversation_saved_after_turn(self, tmp_path):
         config = _make_config(tmp_path)
         provider = _mock_provider_text_only("Done.")
 
@@ -153,29 +153,12 @@ class TestReactAgentLoop:
         agent.history.append({"role": "user", "content": "test"})
         agent._react_loop()
 
-        autosave_path = agent._autosave_path()
-        assert os.path.isfile(autosave_path)
-        with open(autosave_path) as f:
+        conv_path = os.path.join(agent._session_dir, "conversation.json")
+        assert os.path.isfile(conv_path)
+        with open(conv_path) as f:
             data = json.load(f)
-        assert data["id"] == "autosave"
-        assert data["metadata"]["turns"] == 1
-
-    def test_exit_clears_autosave(self, tmp_path):
-        config = _make_config(tmp_path)
-        provider = _mock_provider_text_only("Done.")
-
-        with patch("flagscale.agent.react.agent.get_provider", return_value=provider):
-            agent = ReactAgent(config)
-
-        agent.provider = provider
-        agent.history.append({"role": "user", "content": "test"})
-        agent._react_loop()
-
-        autosave_path = agent._autosave_path()
-        assert os.path.isfile(autosave_path)
-
-        agent._exit()
-        assert not os.path.isfile(autosave_path)
+        assert data["session_id"] == agent._session_id
+        assert len(data["messages"]) > 0
 
 
 class TestResultJudge:
@@ -337,73 +320,63 @@ class TestProxyConnectivity:
         assert "timed out" in captured.out
 
 
-class TestCheckAutosave:
-    def test_resume_restores_state(self, tmp_path):
+class TestCheckResume:
+    def test_resume_restores_messages(self, tmp_path):
         config = _make_config(tmp_path)
         provider = _mock_provider_text_only()
 
         with patch("flagscale.agent.react.agent.get_provider", return_value=provider):
             agent = ReactAgent(config)
 
-        # Write a fake autosave
-        autosave_path = agent._autosave_path()
-        os.makedirs(os.path.dirname(autosave_path), exist_ok=True)
-        data = {
-            "id": "autosave",
-            "timestamp": time.time(),
-            "metadata": {
-                "turns": 3,
-                "loaded_skills": ["train-run"],
-                "input_tokens": 5000,
-                "output_tokens": 800,
-            },
-            "messages": [
+        # Write a fake resumable session in the sessions root
+        from flagscale.agent.react.session import save_conversation
+        old_session_dir = os.path.join(agent._sessions_root, "old_session")
+        save_conversation(
+            old_session_dir, "old_session",
+            [
                 {"role": "user", "content": "start training"},
                 {"role": "assistant", "content": "OK, starting..."},
             ],
-        }
-        with open(autosave_path, "w") as f:
-            json.dump(data, f)
+            completed=False,
+        )
 
         with patch("builtins.input", return_value="y"):
-            agent._check_autosave()
+            agent._check_resume()
 
-        assert agent._turn_count == 3
-        assert "train-run" in agent._loaded_skills
-        assert agent._session_input_tokens == 5000
+        assert agent._session_id == "old_session"
+        # Messages should include the restored conversation
+        user_msgs = [m for m in agent.history.messages if m.get("role") == "user"]
+        assert any("start training" in m.get("content", "") for m in user_msgs)
 
-    def test_decline_clears_autosave(self, tmp_path):
+    def test_decline_does_not_resume(self, tmp_path):
         config = _make_config(tmp_path)
         provider = _mock_provider_text_only()
 
         with patch("flagscale.agent.react.agent.get_provider", return_value=provider):
             agent = ReactAgent(config)
 
-        autosave_path = agent._autosave_path()
-        os.makedirs(os.path.dirname(autosave_path), exist_ok=True)
-        data = {
-            "id": "autosave",
-            "timestamp": time.time(),
-            "metadata": {"turns": 1, "loaded_skills": [], "input_tokens": 0, "output_tokens": 0},
-            "messages": [{"role": "user", "content": "hi"}],
-        }
-        with open(autosave_path, "w") as f:
-            json.dump(data, f)
+        from flagscale.agent.react.session import save_conversation
+        old_session_dir = os.path.join(agent._sessions_root, "old2")
+        save_conversation(
+            old_session_dir, "old2",
+            [{"role": "user", "content": "hi"}],
+            completed=False,
+        )
 
+        original_id = agent._session_id
         with patch("builtins.input", return_value="n"):
-            agent._check_autosave()
+            agent._check_resume()
 
-        assert not os.path.isfile(autosave_path)
-        assert agent._turn_count == 0
+        assert agent._session_id == original_id
 
-    def test_no_autosave_file(self, tmp_path):
+    def test_no_resumable_sessions(self, tmp_path):
         config = _make_config(tmp_path)
         provider = _mock_provider_text_only()
 
         with patch("flagscale.agent.react.agent.get_provider", return_value=provider):
             agent = ReactAgent(config)
 
-        agent._check_autosave()
+        agent._check_resume()
         assert agent._turn_count == 0
 
 

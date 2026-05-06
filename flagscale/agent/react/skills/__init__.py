@@ -1,4 +1,4 @@
-"""Skill manager — loads and parses SKILL.md files."""
+"""Skill manager — load and parse SKILL.md files."""
 
 import logging
 import os

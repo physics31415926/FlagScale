@@ -32,6 +32,12 @@ suggests: [env-setup, data-prep]
 
 Launch, stop, and manage FlagScale distributed training jobs on GPU servers.
 
+## Critical Rules
+
+1. **If the user says the environment/conda is already set up, DO NOT install packages.** Go straight to preflight verification (Step 3). Only install if preflight imports fail.
+2. **After launching training (not dryrun — dryrun only generates scripts), you MUST immediately call monitor() to observe the process.** Do not proceed to other tasks without monitoring.
+3. **Never delete experiment output directories.**
+
 ## Prerequisites
 
 - SSH access to training server
@@ -172,16 +178,18 @@ nvidia-smi --query-gpu=index --format=csv,noheader | wc -l
 
 If GPU count or model differs from what's in memory, warn the user that topology data is stale.
 
-### 3e. Dry Run — HARD GATE
+### 3e. Dryrun (Script Generation) — HARD GATE
 
-**Do NOT launch real training without completing dryrun first.**
+**CRITICAL DISTINCTION:**
+- `flagscale train <model> --dryrun` = generates launch scripts ONLY. No training is launched, no GPU is used, no process starts. It validates config syntax and produces shell scripts.
+- Validation run (`--train-iters 20`) = actual short training that launches processes, uses GPUs, loads model, and runs 20 iterations. This is what validates the pipeline.
 
-For FlagScale-native training:
+**Step 1: Generate scripts with dryrun**
 ```bash
 flagscale train <model> --dryrun
 ```
 
-If dry run fails, report the error. Do NOT proceed to actual training.
+If dryrun fails, it means config has syntax errors or missing fields. Fix and retry.
 
 After dryrun succeeds, inspect the generated launch script:
 ```bash
@@ -190,6 +198,13 @@ cat {exp_dir}/logs/scripts/host_*_run.sh
 Verify: correct GPU count (`--nproc_per_node`), correct entrypoint, all expected CLI flags, no placeholder paths (`/path/to/`, `FIXME`, `TODO`).
 
 **If you modify the config after dryrun, you MUST re-run dryrun.** Cached scripts contain hardcoded values from the previous config.
+
+**Step 2: Run a short validation training**
+After dryrun scripts look correct, run actual training with minimal iterations to validate the full pipeline (model loading, data loading, forward/backward pass):
+```bash
+flagscale train <model> --train-iters 20
+```
+Only proceed to full training after this validation passes.
 
 For third-party reproduction tasks (no FlagScale launcher): construct the full launch command, print it, and verify it manually before executing. Check: correct `--nproc_per_node`, correct `PYTHONPATH`, correct entrypoint script, all required CLI args present, no placeholder paths in any referenced config files.
 
@@ -275,7 +290,7 @@ If this script hangs, crashes, or shows unexpected shapes, fix the data pipeline
 
 If loading a pretrained checkpoint (not training from scratch), verify it actually loaded by checking step-0 loss.
 
-After the dry-run (3e) completes 2 iterations:
+After the validation run (step 2 of 3e) completes 2 iterations:
 1. Check the loss at iteration 0
 2. Compare with `ln(vocab_size)` — the expected loss for random initialization
 
@@ -318,7 +333,7 @@ flagscale train <model> --stop
 # Stop (legacy)
 python run.py --config-path ./examples/<model>/conf --config-name train action=stop
 
-# Dry run (validate config only)
+# Dry run (generate scripts only — NO training launched, NO GPU used)
 flagscale train <model> --dryrun
 ```
 
@@ -378,9 +393,10 @@ After launching training, follow this sequence EVERY time. Do NOT skip steps.
    Launching a new training run while an old one is still alive causes port conflicts, GPU OOM, and log corruption. This check takes seconds; debugging the resulting failures takes much longer.
 
 **Within 30 seconds of launch:**
-1. Use `find_latest_log(experiment="<exp_dir>")` to locate the new log directory — NEVER use `find`, `ls -lt`, or shell globbing to search for logs
-2. Check stderr on rank 0 for import errors or early crashes
+1. **Wait 10-15 seconds** before checking logs — the log directory may not exist yet (race condition with nohup/background launch)
+2. Use `monitor(output_dir="<exp_dir>", duration=60)` to auto-discover logs AND scan stderr — NEVER use raw `find` commands (they may find old logs from previous runs)
 3. If stderr has errors → training failed at startup. Fix and retry.
+4. **Check stderr FIRST, not stdout** — crash info is in stderr. A process showing "wandb initialized" in stdout may already be dead.
 
 **After first metrics appear (usually 1-3 minutes):**
 4. **Auto-trigger `parse_training_metrics`** — do NOT use `tail -f` or `grep` to manually scan logs. The tool parses structured metrics and runs health checks automatically. Call it with `vocab_size` for the random-output check:
@@ -516,14 +532,14 @@ When the user wants to quickly verify a training setup works:
 | `RuntimeError: CUDA out of memory` | Model too large for GPU memory | Reduce `micro_batch_size`, enable activation checkpointing, or increase TP/PP |
 | `FileNotFoundError: data path` | Data files missing or wrong path in config | Verify data path with `ls`, check train.yaml data section |
 | `Address already in use` | Previous training process still running | Kill old processes: `pkill -f torchrun`, wait, retry |
-| `Hydra config error` | YAML syntax error or missing required field | Run `flagscale train <model> --dryrun` to validate config |
+| `Hydra config error` | YAML syntax error or missing required field | Run `flagscale train <model> --dryrun` to check config syntax (generates scripts only) |
 | Process starts but exits silently | Import error or early crash | Check stderr.log of rank 0 immediately |
 
 ### Recovery Steps
 
 1. Read FULL stderr.log (not just tail) — multiple errors may exist
 2. Fix ALL identified issues before relaunching
-3. Clean Hydra cache if config was changed: `rm -rf outputs/<exp>/hydra/ outputs/<exp>/logs/scripts/`
+3. **HYDRA CACHE**: If you edited any config YAML, you MUST clean the cache before relaunching: `rm -rf outputs/<exp>/hydra/ outputs/<exp>/logs/scripts/`. FlagScale may use cached config from a previous run, making your edits appear to have no effect.
 4. Never retry more than once without a clear diagnosis
 
 ### Fast Isolated Verification (before relaunching)
@@ -542,7 +558,7 @@ print(f"Batch keys: {batch.keys()}, shapes: {[(k, v.shape) for k, v in batch.ite
 
 **Import / path errors**: `python -c "import <module>; print('OK')"` — instant.
 
-**Config errors**: run with `--help` or a dry-run flag if available.
+**Config errors**: run `flagscale train <model> --dryrun` to check syntax (script generation only, no GPU).
 
 **Shape / architecture errors**: instantiate model on meta device, no checkpoint needed.
 

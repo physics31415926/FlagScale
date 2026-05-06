@@ -18,11 +18,20 @@ from flagscale.agent.react.tools.find_log import _last_sorted_subdir, _numeric_k
 _INTERESTING_RE = re.compile(
     r'ERROR|FATAL|Traceback|NCCL|OOM|OutOfMemory|RuntimeError|'
     r'TERMINATED|STALLED|KeyError|ModuleNotFoundError|ImportError|'
+    r'AttributeError|TypeError|NameError|NotImplementedError|'
     r'torch\.cuda\.OutOfMemoryError|CUDA error|'
     r'saved\s+checkpoint|training\s+complete|finished|'
     r'gradient_accumulation_fusion|No such file.*TransformerEngine|'
     r'CUDA extension not found|flash_attn.*not.*installed|'
     r'AssertionError|ValueError.*config|FileNotFoundError',
+    re.IGNORECASE,
+)
+
+# Lines matching _INTERESTING_RE but also matching this are NOT real errors
+_STDERR_IGNORE_RE = re.compile(
+    r'wandb[:\s]|W\s+wandb|UserWarning|FutureWarning|DeprecationWarning|'
+    r'warnings\.warn|torch\.utils\._pytree|pkg_resources|'
+    r'Setting ds_accelerator|TensorFloat-32',
     re.IGNORECASE,
 )
 
@@ -106,8 +115,23 @@ class MonitorTool(Tool):
         "required": [],
     }
 
-    def __init__(self, display_fn=None):
+    def __init__(self, display_fn=None, regex_judge_fn=None):
         self._display_fn = display_fn
+        self._regex_judge_fn = regex_judge_fn
+
+    def _is_real_error(self, lines: list, context: str = "") -> list:
+        """Filter error lines through regex + LLM judge. Returns confirmed error lines."""
+        # First pass: regex + ignore list
+        candidates = [l for l in lines
+                      if _INTERESTING_RE.search(l) and not _STDERR_IGNORE_RE.search(l)]
+        if not candidates:
+            return []
+        # Second pass: LLM judge (if available)
+        if self._regex_judge_fn:
+            matched_text = "\n".join(candidates[:10])
+            if not self._regex_judge_fn("is_error", matched_text, context):
+                return []
+        return candidates
 
     def execute(self, **kwargs) -> str:
         file_path = kwargs.get("file", "")
@@ -125,7 +149,7 @@ class MonitorTool(Tool):
             # Wait up to 30s for logs to appear (handles nohup race condition)
             discovered = None
             for _wait in range(6):
-                discovered = self._discover_flagscale_logs(output_dir)
+                discovered = self._discover_logs(output_dir)
                 if not discovered.get("error"):
                     break
                 time.sleep(5)
@@ -133,7 +157,7 @@ class MonitorTool(Tool):
                 return discovered["error"]
             file_path = discovered.get("stdout_log", "")
             if not file_path:
-                return f"ERROR: No stdout log found in {output_dir}. Check if training has started."
+                return f"ERROR: No log file found in {output_dir}. Check if training has started."
 
         if not file_path and not command:
             return "ERROR: Provide 'file', 'command', or 'output_dir' to monitor."
@@ -148,12 +172,38 @@ class MonitorTool(Tool):
         events = []
         no_change_cycles = 0
         stderr_checked = {}  # track stderr sizes to detect new errors
+        baseline_captured = False  # skip pattern matching on first poll (existing content)
 
-        # Discover stderr logs for FlagScale output_dir
+        # Discover stderr logs for output_dir (works for FlagScale and generic layouts)
         stderr_logs = []
         if output_dir:
-            discovered = self._discover_flagscale_logs(output_dir)
+            discovered = self._discover_logs(output_dir)
             stderr_logs = discovered.get("stderr_logs", [])
+            # Immediate stderr check: if stderr already has errors, return immediately
+            # (handles case where training crashed before monitor started)
+            for sp in stderr_logs:
+                try:
+                    size = os.path.getsize(sp)
+                    if size > 0:
+                        with open(sp, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read(16384)
+                        error_lines = self._is_real_error(
+                            content.splitlines(), content[:500])
+                        if error_lines:
+                            rank = self._extract_rank_from_path(sp)
+                            return self._format_result(
+                                "stderr_error", 0, 0,
+                                [f"[STDERR ERROR rank {rank} — already present at monitor start: {error_lines[0][:80]}]"],
+                                content.strip().splitlines()[-30:], ""
+                            )
+                except OSError:
+                    pass
+            # Capture initial stderr sizes so we only detect NEW errors going forward
+            for sp in stderr_logs:
+                try:
+                    stderr_checked[sp] = os.path.getsize(sp)
+                except OSError:
+                    pass
 
         while True:
             elapsed = time.time() - start
@@ -168,6 +218,32 @@ class MonitorTool(Tool):
                 current = self._run_command(command)
 
             poll_count += 1
+
+            # First poll: capture baseline content without pattern matching
+            # This prevents returning immediately due to pre-existing log content
+            if not baseline_captured:
+                baseline_captured = True
+                last_content = current
+                last_line_count = len(current.strip().splitlines())
+                # Immediate liveness check — if process is already dead, don't wait
+                if not self._is_process_alive(process_pattern):
+                    if stderr_logs:
+                        stderr_error = self._scan_stderr_logs(stderr_logs, stderr_checked, elapsed)
+                        if stderr_error:
+                            events.append(stderr_error["event"])
+                            return self._format_result(
+                                "stderr_error", poll_count, elapsed,
+                                events, stderr_error["lines"], current
+                            )
+                    events.append(f"[process DEAD at start, no training running]")
+                    return self._format_result(
+                        "process_dead", poll_count, elapsed,
+                        events, self._tail_lines(current, 20), current
+                    )
+                if self._display_fn:
+                    self._display_fn(poll_count, elapsed, last_line_count)
+                time.sleep(interval)
+                continue
 
             if current != last_content:
                 no_change_cycles = 0
@@ -205,7 +281,8 @@ class MonitorTool(Tool):
                             )
 
                 # Check for errors
-                error_lines = [l for l in new_lines if _INTERESTING_RE.search(l)]
+                error_lines = self._is_real_error(
+                    new_lines, "\n".join(new_lines[:10]))
                 if error_lines:
                     events.append(f"[interesting change at {int(elapsed)}s: {len(error_lines)} lines]")
                     return self._format_result(
@@ -224,8 +301,8 @@ class MonitorTool(Tool):
             else:
                 no_change_cycles += 1
 
-            # FlagScale stderr scan — check ALL rank stderr.log files for errors
-            if stderr_logs and poll_count % 2 == 1:
+            # FlagScale stderr scan — every cycle
+            if stderr_logs:
                 stderr_error = self._scan_stderr_logs(stderr_logs, stderr_checked, elapsed)
                 if stderr_error:
                     events.append(stderr_error["event"])
@@ -234,23 +311,22 @@ class MonitorTool(Tool):
                         events, stderr_error["lines"], current
                     )
 
-            # Process liveness check — every 2nd poll cycle when no new output
-            if no_change_cycles >= 2 and poll_count % 2 == 0:
-                if not self._is_process_alive(process_pattern):
-                    # Before declaring dead, do one final stderr scan
-                    if stderr_logs:
-                        stderr_error = self._scan_stderr_logs(stderr_logs, stderr_checked, elapsed)
-                        if stderr_error:
-                            events.append(stderr_error["event"])
-                            return self._format_result(
-                                "stderr_error", poll_count, elapsed,
-                                events, stderr_error["lines"], current
-                            )
-                    events.append(f"[process DEAD at {int(elapsed)}s, no new output for {no_change_cycles} cycles]")
-                    return self._format_result(
-                        "process_dead", poll_count, elapsed,
-                        events, self._tail_lines(current, 20), current
-                    )
+            # Process liveness check — every cycle, unconditionally
+            if not self._is_process_alive(process_pattern):
+                # Process gone — do one final stderr scan for crash reason
+                if stderr_logs:
+                    stderr_error = self._scan_stderr_logs(stderr_logs, stderr_checked, elapsed)
+                    if stderr_error:
+                        events.append(stderr_error["event"])
+                        return self._format_result(
+                            "stderr_error", poll_count, elapsed,
+                            events, stderr_error["lines"], current
+                        )
+                events.append(f"[process DEAD at {int(elapsed)}s, no new output for {no_change_cycles} cycles]")
+                return self._format_result(
+                    "process_dead", poll_count, elapsed,
+                    events, self._tail_lines(current, 20), current
+                )
 
             # Display progress
             if self._display_fn:
@@ -264,14 +340,95 @@ class MonitorTool(Tool):
             events, self._tail_lines(current, 20), current
         )
 
+    def _discover_logs(self, output_dir):
+        """Discover log files — tries FlagScale structure first, then generic scan."""
+        # Try FlagScale layout first
+        logs_dir = os.path.join(output_dir, "logs", "details")
+        if os.path.isdir(logs_dir):
+            return self._discover_flagscale_logs(output_dir)
+        # Generic log discovery: scan for common log file patterns
+        return self._discover_generic_logs(output_dir)
+
+    def _discover_generic_logs(self, output_dir):
+        """Discover logs in a generic directory layout.
+
+        Looks for common patterns:
+        - *.log files (stdout.log, train.log, output.log, etc.)
+        - stderr*, error* files
+        - nohup.out
+        - Recursively up to 3 levels deep
+        """
+        result = {"stdout_log": "", "stderr_logs": [], "error": ""}
+        if not os.path.isdir(output_dir):
+            result["error"] = f"ERROR: Directory not found: {output_dir}"
+            return result
+
+        stdout_candidates = []
+        stderr_candidates = []
+
+        # Walk up to 3 levels deep
+        for root, dirs, files in os.walk(output_dir):
+            depth = root.replace(output_dir, "").count(os.sep)
+            if depth > 3:
+                dirs.clear()
+                continue
+            for f in files:
+                fpath = os.path.join(root, f)
+                flow = f.lower()
+                # stderr / error files
+                if "stderr" in flow or "error" in flow:
+                    stderr_candidates.append(fpath)
+                # stdout / main log files
+                elif flow in ("stdout.log", "train.log", "output.log", "nohup.out", "main.log"):
+                    stdout_candidates.append(fpath)
+                elif flow.endswith(".log"):
+                    stdout_candidates.append(fpath)
+
+        if not stdout_candidates and not stderr_candidates:
+            result["error"] = f"ERROR: No log files found in {output_dir} (searched 3 levels deep)."
+            return result
+
+        # Pick the best stdout log: prefer the most recently modified with content
+        if stdout_candidates:
+            stdout_candidates.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+            # Prefer files with training metrics
+            for candidate in stdout_candidates:
+                try:
+                    size = os.path.getsize(candidate)
+                    if size == 0:
+                        continue
+                    with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
+                        fh.seek(max(0, size - 4096))
+                        tail = fh.read()
+                    if _METRIC_RE.search(tail):
+                        result["stdout_log"] = candidate
+                        break
+                except OSError:
+                    continue
+            # Fallback: most recently modified non-empty file
+            if not result["stdout_log"]:
+                for candidate in stdout_candidates:
+                    try:
+                        if os.path.getsize(candidate) > 0:
+                            result["stdout_log"] = candidate
+                            break
+                    except OSError:
+                        continue
+
+        result["stderr_logs"] = stderr_candidates
+        return result
+
     def _discover_flagscale_logs(self, output_dir):
         """Discover the latest FlagScale run's log files.
 
         Reuses find_log utilities for directory traversal.
-        FlagScale log structure:
+        FlagScale log structure (multi-node):
           outputs/<exp>/logs/details/host_<N>_<hostname>/<timestamp>/<run_name>/attempt_<N>/<rank>/
             - stdout.log
             - stderr.log
+
+        Scans ALL hosts to collect all rank logs, then picks the rank with
+        training metrics (last pipeline rank, which may be on any host).
         """
         result = {"stdout_log": "", "stderr_logs": [], "error": ""}
         logs_dir = os.path.join(output_dir, "logs", "details")
@@ -279,49 +436,68 @@ class MonitorTool(Tool):
             result["error"] = f"ERROR: No logs directory at {logs_dir}. Training may not have started."
             return result
 
-        # Find the most recent host/timestamp using _last_sorted_subdir
         host_dirs = sorted(glob.glob(os.path.join(logs_dir, "host_*")))
         if not host_dirs:
             result["error"] = f"ERROR: No host directories in {logs_dir}."
             return result
 
-        # Find latest timestamp across all hosts
-        latest_ts = ""
+        # Collect rank dirs from ALL hosts (multi-node support)
+        all_rank_dirs = []
+        stderr_logs = []
         for host_dir in host_dirs:
             ts_dir = _last_sorted_subdir(host_dir)
-            if ts_dir and (not latest_ts or os.path.getmtime(ts_dir) > os.path.getmtime(latest_ts)):
-                latest_ts = ts_dir
-
-        if not latest_ts:
-            result["error"] = f"ERROR: No run directories found in {logs_dir}."
-            return result
-
-        # Navigate: timestamp -> run_name -> latest attempt
-        run_dir = _last_sorted_subdir(latest_ts)
-        if not run_dir:
-            result["error"] = f"ERROR: No run directory under {latest_ts}."
-            return result
-
-        attempt_dir = _last_sorted_subdir(run_dir, key=_numeric_key)
-        if not attempt_dir:
-            result["error"] = f"ERROR: No attempt directory under {run_dir}."
-            return result
-
-        # Collect all rank logs
-        stderr_logs = []
-        stdout_log = ""
-        for entry in sorted(os.listdir(attempt_dir)):
-            rank_dir = os.path.join(attempt_dir, entry)
-            if not os.path.isdir(rank_dir):
+            if not ts_dir:
                 continue
-            stderr_path = os.path.join(rank_dir, "stderr.log")
-            stdout_path = os.path.join(rank_dir, "stdout.log")
-            if os.path.isfile(stderr_path):
-                stderr_logs.append(stderr_path)
-            if os.path.isfile(stdout_path) and entry == "0":
-                stdout_log = stdout_path
-            elif os.path.isfile(stdout_path) and not stdout_log:
-                stdout_log = stdout_path
+            run_dir = _last_sorted_subdir(ts_dir)
+            if not run_dir:
+                continue
+            attempt_dir = _last_sorted_subdir(run_dir, key=_numeric_key)
+            if not attempt_dir:
+                continue
+            for entry in sorted(os.listdir(attempt_dir)):
+                rank_dir = os.path.join(attempt_dir, entry)
+                if not os.path.isdir(rank_dir):
+                    continue
+                all_rank_dirs.append(rank_dir)
+                stderr_path = os.path.join(rank_dir, "stderr.log")
+                if os.path.isfile(stderr_path):
+                    stderr_logs.append(stderr_path)
+
+        if not all_rank_dirs:
+            result["error"] = f"ERROR: No rank directories found under {logs_dir}."
+            return result
+
+        # Sort rank dirs by rank number (basename) to find the last rank
+        all_rank_dirs.sort(key=lambda p: int(os.path.basename(p)) if os.path.basename(p).isdigit() else 0)
+
+        # Pick stdout_log: scan from last rank backwards to find the one with metrics
+        stdout_log = ""
+        for rank_dir in reversed(all_rank_dirs):
+            candidate = os.path.join(rank_dir, "stdout.log")
+            if not os.path.isfile(candidate):
+                continue
+            if not stdout_log:
+                stdout_log = candidate  # fallback: last rank's stdout
+            try:
+                size = os.path.getsize(candidate)
+                if size == 0:
+                    continue
+                with open(candidate, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(max(0, size - 4096))
+                    tail = f.read()
+                if _METRIC_RE.search(tail):
+                    stdout_log = candidate
+                    break
+            except OSError:
+                continue
+
+        # If no rank has metrics yet, fall back to first rank with any content
+        if not stdout_log:
+            for rank_dir in all_rank_dirs:
+                candidate = os.path.join(rank_dir, "stdout.log")
+                if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                    stdout_log = candidate
+                    break
 
         result["stdout_log"] = stdout_log
         result["stderr_logs"] = stderr_logs
@@ -355,7 +531,8 @@ class MonitorTool(Tool):
                 continue
 
             # Check for error patterns
-            error_lines = [l for l in new_content.splitlines() if _INTERESTING_RE.search(l)]
+            error_lines = self._is_real_error(
+                new_content.splitlines(), new_content[:500])
             if error_lines:
                 rank = self._extract_rank_from_path(log_path)
                 return {
@@ -432,23 +609,37 @@ class MonitorTool(Tool):
 
     @staticmethod
     def _format_result(reason, poll_count, elapsed, events, recent_lines, full_content):
-        parts = [f"Monitor result: {reason} ({poll_count} polls, {int(elapsed)}s)"]
+        # Make crash reasons unmistakable to the agent
+        if reason == "stderr_error":
+            header = "TRAINING CRASHED — fatal error detected in stderr"
+        elif reason == "process_dead":
+            header = "TRAINING DEAD — all processes exited"
+        else:
+            header = f"Monitor result: {reason}"
+        parts = [f"{header} ({poll_count} polls, {int(elapsed)}s)"]
 
         if events:
             parts.append("Events:")
             for e in events[-10:]:
                 parts.append(f"  {e}")
 
-        if recent_lines:
+        if reason in ("stderr_error", "process_dead") and recent_lines:
+            parts.append("Error output (stderr):" if reason == "stderr_error" else "Last output before death:")
+            for line in recent_lines:
+                parts.append(f"  {line}")
+            if reason == "stderr_error":
+                parts.append("ACTION REQUIRED: Training has failed. Do NOT re-monitor — diagnose the error above.")
+        elif recent_lines:
             parts.append("Recent output:")
             for line in recent_lines:
                 parts.append(f"  {line}")
 
-        # Extract latest metrics for quick reference
-        metric_lines = [l for l in (full_content or "").splitlines() if _METRIC_RE.search(l)]
-        if metric_lines:
-            parts.append("Latest metrics:")
-            for line in metric_lines[-3:]:
-                parts.append(f"  {line.strip()}")
+        # Extract latest metrics for quick reference (only for non-crash results)
+        if reason not in ("stderr_error", "process_dead"):
+            metric_lines = [l for l in (full_content or "").splitlines() if _METRIC_RE.search(l)]
+            if metric_lines:
+                parts.append("Latest metrics:")
+                for line in metric_lines[-3:]:
+                    parts.append(f"  {line.strip()}")
 
         return "\n".join(parts)

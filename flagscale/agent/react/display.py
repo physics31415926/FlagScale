@@ -222,7 +222,7 @@ def banner(provider, model, mode=None, extra_lines=None):
     title = f"FlagScale Agent v{__version__}"
     mode_str = f" | Mode: {mode}" if mode else ""
     info = f"Provider: {provider} | Model: {model}{mode_str}"
-    cmds = "Commands: /skill  /file  /plan  /save  /load  /export  /memory  /mode  /reload  /quit"
+    cmds = "Commands: /skill  /file  /plan  /save  /load  /resume  /export  /memory  /mode  /reload  /quit"
     lines = [info, cmds]
     if extra_lines:
         lines.extend(extra_lines)
@@ -304,8 +304,24 @@ def thinking_clear():
 
 # ── Context compaction ─────────────────────────────────────────────────
 
+_last_compaction_to = 0
+_compaction_suppressed = 0
+
 
 def context_compacted(from_tokens, to_tokens, compaction_num=None, ratio=None):
+    global _last_compaction_to, _compaction_suppressed
+    # Suppress if change from last notification is < 5k tokens
+    if abs(to_tokens - _last_compaction_to) < 5000 and _last_compaction_to > 0:
+        _compaction_suppressed += 1
+        if _compaction_suppressed >= 5:
+            from_k = from_tokens // 1000
+            to_k = to_tokens // 1000
+            _print(dim(f"📦 Context compacted ×{_compaction_suppressed + 1}: now {to_k}k tokens"))
+            _compaction_suppressed = 0
+            _last_compaction_to = to_tokens
+        return
+    _compaction_suppressed = 0
+    _last_compaction_to = to_tokens
     from_k = from_tokens // 1000
     to_k = to_tokens // 1000
     detail = f"{from_k}k → {to_k}k"
@@ -651,6 +667,18 @@ def file_injected(path, chars):
 
 def session_saved(path):
     _print(green(f"  ✓ Session saved: {path}"))
+
+
+def resume_found(session_id, last_msg, timestamp):
+    import datetime
+    ts = datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    _print(dim(f"  Resumable session: {session_id} ({ts})"))
+    if last_msg:
+        _print(dim(f"    Last: {last_msg[:80]}"))
+
+
+def session_resumed(session_id):
+    _print(green(f"  ✓ Resumed session: {session_id}"))
 
 
 def session_loaded(path, turns):

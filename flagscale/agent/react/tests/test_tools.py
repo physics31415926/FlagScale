@@ -96,7 +96,7 @@ class TestShellTool:
         assert "TERMINATED" in result
 
     def test_dangerous_command_blocked(self):
-        tool = ShellTool(check_dangerous=True, require_confirm=False)
+        tool = ShellTool(check_dangerous=True, require_confirm=True)
         result = tool.execute(command="rm -rf /")
         assert result.startswith("FATAL:")
 

@@ -127,7 +127,7 @@ When porting a model with a non-standard dataset (e.g., PackedDataset, interleav
 - [ ] Dataset `__getitem__` returns tensors with shapes independent of rank
 - [ ] If using packing: `reset_position_ids: true`, `reset_attention_mask: true`
 - [ ] If using custom collation: output dict keys match what `get_batch_on_this_tp_rank` expects
-- [ ] Test with `--train-iters 2` at target parallelism BEFORE long runs
+- [ ] Test with `--train-iters 20` at target parallelism BEFORE long runs
 - [ ] Watch for infinite loops: if your dataset has a custom `repeat` or cycling mechanism, verify it terminates correctly with Megatron's `MegatronPretrainingSampler`
 
 ### 3.3 Common Data Pipeline Failures
@@ -249,8 +249,8 @@ model:
 Before committing to a long training run, verify parallelism works:
 
 ```bash
-# 1. Dry run: 2 iterations at target parallelism
-python -m flagscale.train --config ... --train-iters 2
+# 1. Dry run: 20 iterations at target parallelism
+python -m flagscale.train --config ... --train-iters 20
 
 # 2. Check GPU memory is balanced (no single GPU much higher)
 nvidia-smi  # during the 2-iteration run
