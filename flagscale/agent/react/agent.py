@@ -70,12 +70,33 @@ Working directory: {cwd}
 1. Context First: review memories/workspace/plan before acting. Don't re-discover what you already have.
 2. Understand then Act: for complex tasks, read source code deeply and build understanding before implementing. Simple tasks with clear intent can be executed immediately. Quality of understanding determines quality of execution.
 3. Transparent Execution: show findings, explain approach (1-2 sentences), report outcomes. Transparent ≠ verbose.
-4. Parallel Execution: run independent commands simultaneously.
-5. Use `monitor` for Waiting: use the `monitor` tool instead of shell+sleep loops. It polls locally without LLM calls. Examples: `monitor(file="log.txt", target_step=100)`, `monitor(command="nvidia-smi ...", duration=300, success_pattern="[4-7][0-9]{{4}}")`.
-6. Know When to Ask vs Act: ASK when ambiguous/destructive/unclear. ACT when task is clear from context.
-7. Follow explicit instructions exactly. If you disagree, state concern and ask — don't silently override.
-8. Proactive Problem Detection: flag issues immediately. Fail-fast with pre-checks. After 2nd consecutive failure of same category, STOP and do systematic audit.
-9. Plan Complex Work: multi-step tasks need plans. Update progress. Replan when things go wrong.
+4. Use `monitor` for Waiting: use the `monitor` tool instead of shell+sleep loops. It polls locally without LLM calls. Examples: `monitor(file="log.txt", target_step=100)`, `monitor(command="nvidia-smi ...", duration=300, success_pattern="[4-7][0-9]{{4}}")`.
+5. Know When to Ask vs Act: ASK when ambiguous/destructive/unclear. ACT when task is clear from context.
+6. Follow explicit instructions exactly. If you disagree, state concern and ask — don't silently override.
+7. Proactive Problem Detection: flag issues immediately. Fail-fast with pre-checks. After 2nd consecutive failure of same category, STOP and do systematic audit.
+8. Plan Complex Work: multi-step tasks need plans. Update progress. Replan when things go wrong.
+
+## MANDATORY: Batch Tool Calls to Minimize Round-Trips
+
+Each response triggers a full context re-send (~12K+ tokens). You MUST batch independent tool calls in a single response.
+
+**RULE**: If your next 2-5 actions do NOT depend on each other's results, issue them ALL in one response. NEVER return a single tool call when multiple independent calls are possible.
+
+**Batchable patterns** (MUST batch):
+- Multiple file reads: read_file(A) + read_file(B) + read_file(C) → ONE response
+- Env check + file listing: shell("conda env list") + shell("ls /path") → ONE response
+- Hardware + workspace: workspace_hardware() + workspace_current() + shell("ls examples/") → ONE response
+- Multiple independent shell commands: shell("nvidia-smi ...") + shell("ls /path") + shell("cat /etc/os-release") → ONE response
+
+**Anti-patterns** (NEVER do):
+- ❌ Response 1: read_file(A) → Response 2: read_file(B) → Response 3: read_file(C) = 3 round-trips, ~36K wasted tokens
+- ❌ Response 1: shell("conda env list") → Response 2: shell("ls examples/") = 2 round-trips when 1 suffices
+- ❌ Response 1: workspace_hardware() → Response 2: workspace_current() = pointless sequential calls
+
+**When NOT to batch** (sequential is correct):
+- Next call depends on previous result (e.g., need file path from ls before reading it)
+- Write operations that must be verified before proceeding
+- Commands that modify state another command reads
 
 **Workspace & storage**: Load `workspace-layout` skill before downloading models/data, creating envs, or launching training. Workspace root = FlagScale's parent. Conda envs use `--prefix <root>/envs/<name>`.
 
@@ -257,6 +278,7 @@ class ReactAgent:
         self.history.set_summarizer(self._summarize_for_compaction)
 
         self._turn_count = 0
+        self._original_user_task = ""
         self._session_start = time.time()
         self._session_input_tokens = 0
         self._session_output_tokens = 0
@@ -325,6 +347,7 @@ class ReactAgent:
         self._last_tool_calls_deque = deque(maxlen=5)
         self._extra_tools_next_iter = set()
         self._turn_iteration_count = 0
+        self._consecutive_single_tool_calls = 0  # Track single-call responses for batch nudge
 
         # Token optimization: skill lifecycle management
         self._active_skill_content = {}  # {skill_name: content_text}
@@ -377,6 +400,10 @@ class ReactAgent:
         """
         # Build structured state snapshot
         state_snapshot = []
+
+        # Original user task (MUST survive compaction)
+        if self._original_user_task:
+            state_snapshot.append(f"Original user task: {self._original_user_task[:200]}")
 
         # Mode flags (critical for gate enforcement)
         mode_flags = []
@@ -473,7 +500,12 @@ class ReactAgent:
             if not line or line == "(no critical state)":
                 continue
 
-            if line.startswith("Mode flags:"):
+            if line.startswith("Original user task:"):
+                restored_task = line.split(":", 1)[1].strip()
+                if restored_task and not self._original_user_task:
+                    self._original_user_task = restored_task
+
+            elif line.startswith("Mode flags:"):
                 flags = [f.strip() for f in line.split(":", 1)[1].strip().split(",")]
                 if "porting" in flags:
                     self._porting_mode = True
@@ -1143,6 +1175,11 @@ Load ops-discipline skill for full diagnosis protocol.
 
     def _inject_context(self, user_input):
         """Auto-inject session memory, plan, and workspace context into the system prompt."""
+        if not self._original_user_task:
+            self._original_user_task = user_input[:300]
+            if not self._workspace_manager.get_current_task():
+                self._workspace_manager.update_current(task=user_input[:200])
+
         memory_context = self._build_memory_context()
 
         plan_context = self.task_plan.context_for_prompt()
@@ -1588,6 +1625,9 @@ Load ops-discipline skill for full diagnosis protocol.
                 parts.append(f"Current step: {doing[0].get('text', '')[:80]}")
             elif pending:
                 parts.append(f"Next step: {pending[0].get('text', '')[:80]}")
+                # Check if multiple pending steps are independent (heuristic: first 3 pending)
+                if len(pending) >= 2:
+                    parts.append("BATCH: multiple pending steps — issue independent tool calls together")
 
         # Include current experiment status if relevant
         exp_name = self._workspace_manager.get_current_experiment()
@@ -1597,6 +1637,10 @@ Load ops-discipline skill for full diagnosis protocol.
                 attempts = exp.get("attempts", [])
                 if attempts:
                     parts.append(f"Last attempt: {attempts[-1].get('result', '')[:80]}")
+
+        # Include original task when no plan context available
+        if not parts and self._original_user_task:
+            parts.append(f"Task: {self._original_user_task[:100]}")
 
         # Detect language
         last_user = ""
@@ -1614,8 +1658,8 @@ Load ops-discipline skill for full diagnosis protocol.
             return f"Continue. {context}"
 
         if has_cjk:
-            return "继续。按照你的计划推进任务。"
-        return "Continue. Proceed with your plan."
+            return "继续。按照你的计划推进任务。Remember: batch independent tool calls in one response."
+        return "Continue. Proceed with your plan. Remember: batch independent tool calls in one response."
 
     def _exit(self):
         atexit.unregister(self._atexit_hook)
@@ -2436,9 +2480,9 @@ Load ops-discipline skill for full diagnosis protocol.
                       if len(set(e.lower().split()[:20]) & last_words) > len(last_words) * 0.5)
         return similar + 1  # Include the last one itself
 
-    _PLAN_GATE_MAX_EXPLORATORY = 20
-    _PLAN_GATE_INDEPENDENT_WARN = 25
-    _PLAN_GATE_INDEPENDENT_BLOCK = 35
+    _PLAN_GATE_MAX_EXPLORATORY = 50
+    _PLAN_GATE_INDEPENDENT_WARN = 60
+    _PLAN_GATE_INDEPENDENT_BLOCK = 80
 
     def _check_plan_creation_gate(self, tool_name):
         """Gate: encourage plan creation for sustained exploration.
@@ -2463,20 +2507,34 @@ Load ops-discipline skill for full diagnosis protocol.
         if self._complex_task_no_plan:
             self._pre_plan_tool_calls += 1
             if self._pre_plan_tool_calls > self._PLAN_GATE_MAX_EXPLORATORY:
+                task_reminder = ""
+                if self._original_user_task:
+                    task_reminder = (
+                        f"\n\nORIGINAL USER REQUEST: {self._original_user_task[:200]}\n"
+                        f"Your plan MUST address THIS request."
+                    )
                 return (
                     f"⛔ [PLAN GATE — TOOL NOT EXECUTED] This task was flagged as complex. "
                     f"You've used {self._pre_plan_tool_calls} exploratory calls "
                     f"(limit: {self._PLAN_GATE_MAX_EXPLORATORY}) without creating a plan.\n"
                     f"This tool call was BLOCKED. You MUST call plan_create NOW.\n"
                     f"Use what you've gathered so far to create a concrete step-by-step plan."
+                    + task_reminder
                 )
 
         # Mode 2: independent — soft warn at 8, hard block at 12
         if self._consecutive_reads >= self._PLAN_GATE_INDEPENDENT_BLOCK:
+            task_reminder = ""
+            if self._original_user_task:
+                task_reminder = (
+                    f"\n\nORIGINAL USER REQUEST: {self._original_user_task[:200]}\n"
+                    f"Your plan MUST address THIS request."
+                )
             return (
                 f"⛔ [PLAN GATE — TOOL NOT EXECUTED] You've made {self._consecutive_reads} "
                 f"consecutive exploratory calls without creating a plan.\n"
                 f"This tool call was BLOCKED. You MUST call plan_create NOW to organize your approach."
+                + task_reminder
             )
         if self._consecutive_reads >= self._PLAN_GATE_INDEPENDENT_WARN:
             return (
@@ -2909,7 +2967,7 @@ Load ops-discipline skill for full diagnosis protocol.
 
             current = self._workspace_manager.read_current()
             snapshot = {
-                "task": current.get("task", ""),
+                "task": self._original_user_task or current.get("task", ""),
                 "status": current.get("status", "running"),
                 "phase": getattr(self, '_current_phase', 'unknown'),
                 "verification_stage": getattr(self, '_verification_stage', 'none'),
@@ -2930,6 +2988,11 @@ Load ops-discipline skill for full diagnosis protocol.
         """Extract mandatory anchors for summary preservation."""
         anchors = []
         try:
+            if self._original_user_task:
+                anchors.append(f"ORIGINAL USER TASK: {self._original_user_task[:200]}")
+            elif self._workspace_manager.get_current_task():
+                anchors.append(f"ORIGINAL USER TASK: {self._workspace_manager.get_current_task()[:200]}")
+
             plan = self.task_plan.get_active() if hasattr(self, 'task_plan') else None
             if plan:
                 doing = [s for s in plan.get("steps", []) if s.get("status") == "doing"]
@@ -4967,8 +5030,22 @@ For each comparison point:
 
     def _execute_tools(self, tool_calls):
         if len(tool_calls) == 1:
-            return [self._execute_tool(tool_calls[0])]
+            result = self._execute_tool(tool_calls[0])
+            tool_name = tool_calls[0]["name"]
+            if tool_name in self._READ_ONLY_TOOLS:
+                self._consecutive_single_tool_calls += 1
+                if 2 <= self._consecutive_single_tool_calls <= 4:
+                    result += (
+                        "\n\n[EFFICIENCY REMINDER: You have made "
+                        f"{self._consecutive_single_tool_calls} consecutive single-tool responses. "
+                        "Batch independent tool calls (read_file, shell, workspace_*) in ONE response "
+                        "to reduce round-trips. Each round-trip re-sends ~12K tokens of context.]"
+                    )
+            else:
+                self._consecutive_single_tool_calls = 0
+            return [result]
 
+        self._consecutive_single_tool_calls = 0
         # Gate checks for parallel calls — count all read-only tools toward progress gate
         # and block the entire batch if gates fire
         for tc in tool_calls:
