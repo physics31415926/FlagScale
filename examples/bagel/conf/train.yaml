@@ -1,0 +1,29 @@
+defaults:
+  - train: 7b
+  - _self_
+
+experiment:
+  exp_name: bagel
+  exp_dir: ./outputs/bagel_warmstart_ema
+  task:
+    type: train
+    backend: megatron
+    entrypoint: ./flagscale/train/megatron/train_bagel.py
+  runner:
+    nnodes: 1
+  cmds:
+    before_start: |
+      source activate /workspace/new_agent_v3/envs/flagscale
+      export PYTHONPATH=/workspace/new_agent_v2/BAGEL:$PYTHONPATH
+      export CUDA_LAUNCH_BLOCKING=1
+      export TORCH_USE_CUDA_DSA=1
+  envs:
+    CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+    CUDA_DEVICE_MAX_CONNECTIONS: 1
+    NVTE_APPLY_QK_LAYER_SCALING: 0
+
+action: run
+
+hydra:
+  run:
+    dir: ${experiment.exp_dir}/hydra

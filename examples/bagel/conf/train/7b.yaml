@@ -1,0 +1,80 @@
+system:
+  tensor_model_parallel_size: 2
+  pipeline_model_parallel_size: 1
+  disable_bias_linear: False
+  use_flash_attn: True
+  use_distributed_optimizer: True
+  precision:
+    bf16: True
+  logging:
+    log_interval: 1
+    tensorboard_log_interval: 1
+    wandb_project: bagel_flagscale
+    wandb_exp_name: bagel_7b_mot_8gpu
+  checkpoint:
+    save_interval: 999999
+    load: /workspace/new_agent_v2/models/BAGEL-7B-MoT-megatron-tp2-ema
+    finetune: True
+    no_load_optim: True
+    no_load_rng: True
+
+model:
+  # Architecture
+  num_layers: 28
+  hidden_size: 3584
+  ffn_hidden_size: 18944
+  num_attention_heads: 28
+  group_query_attention: True
+  num_query_groups: 4
+  seq_length: 3072
+  max_position_embeddings: 32768
+  norm_epsilon: 1e-6
+  use_rotary_position_embeddings: True
+  rotary_base: 1000000
+  swiglu: True
+  normalization: RMSNorm
+  untie_embeddings_and_output_weights: True
+  init_method_std: 0.02
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  position_embedding_type: rope
+  # Training
+  train_iters: 20
+  dataloader_type: external
+  eval_iters: 0
+  eval_interval: 999999
+  micro_batch_size: 1
+  global_batch_size: 4
+  # Optimizer
+  lr: 2e-5
+  min_lr: 1e-7
+  weight_decay: 0.0
+  lr_warmup_iters: 10
+  lr_decay_style: constant
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1e-15
+  clip_grad: 1.0
+  # Tokenizer
+  tokenizer_type: NullTokenizer
+  vocab_size: 152064
+  make_vocab_size_divisible_by: 1
+  # BAGEL extra args
+  bagel_model_path: /workspace/new_agent_v2/models/BAGEL-7B-MoT
+  bagel_src_dir: /workspace/new_agent_v2/BAGEL
+  dataset_config_file: /workspace/new_agent_v2/BAGEL/data/configs/example.yaml
+  max_latent_size: 64
+  latent_patch_size: 2
+  vae_z_channels: 16
+  vae_downsample: 8
+  vit_hidden_size: 1152
+  vit_intermediate_size: 4304
+  vit_num_layers: 26
+  vit_num_attention_heads: 16
+  vit_image_size: 980
+  vit_patch_size: 14
+
+data:
+  data_path: null
+  split: "1,0,0"
+  num_workers: 2

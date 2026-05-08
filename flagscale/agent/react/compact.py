@@ -126,7 +126,22 @@ class CompactionMixin:
         try:
             response = self.provider.chat(scoring_messages, tools=[])
             score_text = response.get("content", "").strip()
-            scores = [int(s.strip()) for s in score_text.split(",") if s.strip().isdigit()]
+            # Strip preamble text (e.g., "Here are the scores: 7,3,...")
+            # Find the first digit and start parsing from there
+            first_digit = next((i for i, c in enumerate(score_text) if c.isdigit()), -1)
+            if first_digit > 0:
+                score_text = score_text[first_digit:]
+            # Split on comma, semicolon, or newline — LLMs vary in separator choice
+            tokens = re.split(r'[,;\n]+', score_text)
+            scores = []
+            for tok in tokens:
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    scores.append(max(0, min(10, int(float(tok)))))
+                except (ValueError, TypeError):
+                    continue
             if len(scores) == len(messages):
                 return scores
             logger.warning("Scorer returned %d scores for %d messages, falling back", len(scores), len(messages))

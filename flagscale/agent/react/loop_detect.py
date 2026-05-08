@@ -9,38 +9,52 @@ class LoopDetectMixin:
     _AUTOSAVE_INTERVAL = 5
 
     def _get_tool_call_key(self, tool_name, arguments):
-        """Generate a hashable key for a tool call."""
+        """Generate a hashable key for a tool call.
+
+        Keys must capture the FULL semantics of the call — two calls that would
+        produce different results must have different keys.  Never truncate or
+        hash content; use the full values so that legitimate retries with
+        different new_string / content are not falsely flagged as loops.
+        """
         if tool_name == "shell":
             return (tool_name, arguments.get("command", ""))
         elif tool_name == "read_file":
             path = arguments.get("path", "")
-            start_line = arguments.get("start_line", 0)
-            end_line = arguments.get("end_line", 0)
-            return (tool_name, path, start_line, end_line)
-        elif tool_name in ("write_file", "edit_file"):
+            start_line = arguments.get("start_line", "")
+            end_line = arguments.get("end_line", "")
+            return (tool_name, path, str(start_line), str(end_line))
+        elif tool_name == "edit_file":
             path = arguments.get("path", "") or arguments.get("file_path", "")
-            if tool_name == "edit_file":
-                old_str = arguments.get("old_string", "")
-                old_hash = hash(old_str[:200]) if old_str else 0
-                return (tool_name, path, old_hash)
-            return (tool_name, path)
+            old_str = arguments.get("old_string", "")
+            new_str = arguments.get("new_string", "")
+            return (tool_name, path, old_str, new_str)
+        elif tool_name == "write_file":
+            path = arguments.get("path", "") or arguments.get("file_path", "")
+            content = arguments.get("content", "")
+            return (tool_name, path, content)
         elif tool_name == "load_skill":
             return (tool_name, arguments.get("name", ""))
+        elif tool_name == "memory_write":
+            return (tool_name, arguments.get("key", ""), arguments.get("content", ""))
         else:
-            key_parts = []
-            for k, v in list(arguments.items())[:2]:
-                key_parts.append(f"{k}={str(v)[:100]}")
-            return (tool_name, "|".join(key_parts))
+            parts = []
+            for k, v in sorted(arguments.items()):
+                parts.append(f"{k}={v}")
+            return (tool_name, "|".join(parts))
 
     def _check_loop_detection(self, tool_name, arguments):
-        """Detect repeated identical tool calls that indicate the agent is stuck."""
+        """Detect repeated identical tool calls that indicate the agent is stuck.
+
+        Only triggers when the EXACT same call (same tool + same full arguments)
+        appears >= threshold times in the recent window.  The blocked call itself
+        is NOT counted — otherwise a single block poisons the window and prevents
+        the agent from ever retrying with different args.
+        """
         key = self._get_tool_call_key(tool_name, arguments)
-        self._recent_tool_calls.append(key)
-        if len(self._recent_tool_calls) > self._LOOP_DETECTION_WINDOW:
-            self._recent_tool_calls = self._recent_tool_calls[-self._LOOP_DETECTION_WINDOW:]
 
         count = self._recent_tool_calls.count(key)
         if count >= self._LOOP_DETECTION_THRESHOLD:
+            # Do NOT append this call — it's blocked, shouldn't pollute the window
             return (
                 f"\n\n⚠️ [LOOP DETECTION] You've called {tool_name} with the same arguments "
                 f"{count} times in the last {self._LOOP_DETECTION_WINDOW} tool calls. "
@@ -50,6 +64,12 @@ class LoopDetectMixin:
                 f"2. Try a fundamentally different strategy\n"
                 f"3. If blocked, write what you know to workspace and ask the user\n"
             )
+
+        # Only record after confirming it's not a loop — keeps window clean
+        self._recent_tool_calls.append(key)
+        if len(self._recent_tool_calls) > self._LOOP_DETECTION_WINDOW:
+            self._recent_tool_calls = self._recent_tool_calls[-self._LOOP_DETECTION_WINDOW:]
+
         return ""
 
     def _check_duplicate_read(self, tool_name, arguments):
@@ -78,10 +98,10 @@ class LoopDetectMixin:
             if not mem_key:
                 return None
             key = ("memory_write", mem_key)
+            if key in self._tool_call_cache:
+                return self._tool_call_cache[key]
         else:
             return None
-        if key in self._tool_call_cache:
-            return self._tool_call_cache[key]
         return None
 
     def _cache_tool_result(self, tool_name, arguments, result):

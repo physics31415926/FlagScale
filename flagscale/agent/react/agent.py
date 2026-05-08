@@ -2082,10 +2082,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         self._last_tool_call = (tool_name, cmd_key, error)
 
         # Cache tool result for duplicate detection within this turn
-        if tool_name == "read_file" and not error:
-            path = arguments.get("path", "")
-            cache_key = ("read_file", path)
-            self._tool_call_cache[cache_key] = result
+        self._cache_tool_result(tool_name, arguments, result if not error else f"ERROR: {result}")
 
         # Periodic save: save conversation every N tool calls
         self._tool_calls_since_save = getattr(self, '_tool_calls_since_save', 0) + 1
