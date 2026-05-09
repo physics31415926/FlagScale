@@ -109,7 +109,8 @@ class FindLatestLogTool(Tool):
         "Find and display the latest FlagScale training log. "
         "Scans ALL ranks to find the one with training metrics (loss/iteration). "
         "Returns structured output: loss rank stdout, error ranks stderr, health checks. "
-        "Megatron prints metrics on the LAST pipeline rank, not rank 0."
+        "Megatron prints metrics on the LAST pipeline rank, not rank 0. "
+        "Use filter='errors' to show only ERROR/FATAL/Traceback lines (saves tokens on long logs)."
     )
     parameters = {
         "type": "object",
@@ -131,6 +132,11 @@ class FindLatestLogTool(Tool):
                 "type": "integer",
                 "description": "Model vocab size for health check (e.g. 32000, 128256). If provided, checks if loss ~ ln(vocab_size).",
             },
+            "filter": {
+                "type": "string",
+                "enum": ["all", "errors", "progress"],
+                "description": "Filter mode: 'all' (default, full output), 'errors' (only ERROR/FATAL/Traceback/Exception lines with context), 'progress' (only iteration/loss lines)",
+            },
         },
         "required": ["experiment"],
     }
@@ -143,6 +149,7 @@ class FindLatestLogTool(Tool):
         log_type = kwargs.get("log_type", "both")
         lines = kwargs.get("lines", 50)
         vocab_size = kwargs.get("vocab_size", 0)
+        filter_mode = kwargs.get("filter", "all")
 
         attempt_dir = self._find_attempt_dir(experiment)
         if attempt_dir.startswith("ERROR"):
@@ -162,7 +169,8 @@ class FindLatestLogTool(Tool):
                 rank_num = os.path.basename(loss_rank)
                 parts.append(f"\n=== Loss rank (rank {rank_num}, stdout) ===")
                 parts.append(f"Path: {os.path.join(loss_rank, 'stdout.log')}")
-                parts.append(loss_content)
+                filtered_content = self._apply_filter(loss_content, filter_mode)
+                parts.append(filtered_content)
                 if loss_metrics["last_iter"] is not None:
                     summary_parts = [f"Latest iteration: {loss_metrics['last_iter']}"]
                     for k, v in loss_metrics["last_loss"].items():
@@ -181,7 +189,8 @@ class FindLatestLogTool(Tool):
                 if os.path.isfile(stdout_path):
                     parts.append(f"\nFallback: last rank {rank_num} stdout:")
                     parts.append(f"Path: {stdout_path}")
-                    parts.append(_tail(stdout_path, lines))
+                    content = _tail(stdout_path, lines)
+                    parts.append(self._apply_filter(content, filter_mode))
 
         if error_ranks and log_type in ("stderr", "both"):
             parts.append("\n=== Error ranks ===")
@@ -195,6 +204,40 @@ class FindLatestLogTool(Tool):
             parts.append("\n=== No stderr errors detected ===")
 
         return "\n".join(parts)
+
+    def _apply_filter(self, text: str, mode: str) -> str:
+        """Apply filter mode to log content."""
+        if mode == "all":
+            return text
+        lines = text.splitlines()
+        if mode == "errors":
+            error_patterns = re.compile(
+                r'(error|fatal|traceback|exception|killed|oom|segfault|'
+                r'cuda error|nccl error|out of memory)',
+                re.IGNORECASE,
+            )
+            result = []
+            for i, line in enumerate(lines):
+                if error_patterns.search(line):
+                    # Include 1 line of context before and after
+                    start = max(0, i - 1)
+                    end = min(len(lines), i + 2)
+                    for j in range(start, end):
+                        if lines[j] not in result:
+                            result.append(lines[j])
+            if not result:
+                return "(no error lines found)"
+            return "\n".join(result)
+        if mode == "progress":
+            progress_pattern = re.compile(
+                r'(iteration\s+\d+|training\s+step|loss[:\s]|elapsed)',
+                re.IGNORECASE,
+            )
+            result = [line for line in lines if progress_pattern.search(line)]
+            if not result:
+                return "(no progress lines found)"
+            return "\n".join(result)
+        return text
 
     def _find_attempt_dir(self, experiment: str) -> str:
         """Resolve experiment to the latest attempt directory."""

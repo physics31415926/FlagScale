@@ -208,6 +208,94 @@ class GatesMixin:
 
         return ""
 
+    def _check_plan_maintenance_gate(self, tool_name):
+        """Gate: remind agent to update plan when it's going stale.
+
+        If a plan exists but the current 'doing' step hasn't been updated for 8+ turns,
+        inject a reminder to update the plan.
+        Returns a soft warning (never hard blocks).
+        """
+        plan = self.task_plan.get_active()
+        if not plan:
+            return ""
+
+        # Don't nag when agent is already updating the plan
+        if tool_name in ("plan_update", "plan_create", "plan_status"):
+            return ""
+
+        doing_steps = [s for s in plan.get("steps", []) if s.get("status") == "doing"]
+        if not doing_steps:
+            return ""
+
+        step = doing_steps[0]
+        last_activity = step.get("_last_activity_turn", 0)
+        turns_stale = self._turn_count - last_activity if last_activity else 0
+
+        if turns_stale >= 8:
+            return (
+                f"\n\n[PLAN MAINTENANCE] Step {step['id']} ('{step.get('title', '')[:40]}') "
+                f"has had no plan_update for {turns_stale} turns. "
+                f"If it's done, call plan_update(action='step_done'). "
+                f"If blocked, call plan_update(action='step_skip') and move on."
+            )
+        return ""
+
+    def _check_config_validation_hint(self, tool_name):
+        """Soft hint: suggest validate_config after writing a YAML config file.
+
+        Includes full schema reference so the agent sees correct structure
+        only when it's actually editing configs (not every turn).
+        """
+        if tool_name == "validate_config":
+            return ""
+        if not hasattr(self, '_recent_tool_calls') or not self._recent_tool_calls:
+            return ""
+        last_call = self._recent_tool_calls[-1] if self._recent_tool_calls else None
+        if not last_call:
+            return ""
+        last_name = last_call[0] if isinstance(last_call, (list, tuple)) else ""
+        if last_name not in ("write_file", "edit_file"):
+            return ""
+        last_args = last_call[1] if len(last_call) > 1 else ""
+        path = str(last_args) if last_args else ""
+        if not path.endswith(".yaml") and not path.endswith(".yml"):
+            return ""
+        if "conf/" not in path and "conf\\" not in path:
+            return ""
+        return (
+            "\n[CONFIG HINT] You just wrote/edited a YAML config. "
+            "Call validate_config(path='...') to check for structural errors.\n"
+            "\n"
+            "FlagScale config structure reference:\n"
+            "  Top-level (conf/train.yaml): defaults, experiment{exp_name,task{type,backend,entrypoint},runner,cmds,envs}, action, hydra\n"
+            "  Model-level (conf/train/<model>.yaml):\n"
+            "    system: {tensor_model_parallel_size, pipeline_model_parallel_size, precision:{bf16}, logging:{log_interval,wandb_project}, checkpoint:{save_interval}}\n"
+            "    model: {num_layers, hidden_size, num_attention_heads, seq_length, micro_batch_size, global_batch_size, optimizer:{lr_scheduler:{lr,min_lr}}}\n"
+            "    data: {data_path, tokenizer:{tokenizer_type, tokenizer_path, vocab_size}}\n"
+            "  Common mistakes: bf16→system.precision NOT model | tp/pp→system NOT model | save_interval→system.checkpoint NOT model | data_path→data NOT top-level"
+        )
+
+    def _check_source_reading_gate(self, tool_name, arguments):
+        """Soft gate: after 2+ failures, require reading framework source before writing fixes."""
+        if self._consecutive_train_failures < 2:
+            return ""
+        if tool_name not in ("write_file", "edit_file"):
+            return ""
+        if self._source_reads_since_last_failure >= 2:
+            return ""
+        target = arguments.get("path", "") or arguments.get("file_path", "")
+        if not target or any(ext in target for ext in (".yaml", ".yml", ".md", ".txt", ".json")):
+            return ""
+        return (
+            f"\n\n[SOURCE READING REQUIRED] You have {self._consecutive_train_failures} consecutive "
+            f"failures but have only read {self._source_reads_since_last_failure} framework source "
+            f"files since the last failure.\n"
+            "Before writing another fix, read the UPSTREAM implementation:\n"
+            "- Find the actual Megatron-LM-FL / TransformerEngine-FL / FlagScale code path involved\n"
+            "- Understand what the framework expects (args, shapes, dtypes, return values)\n"
+            "- Then write a fix based on what you learned, not on guessing"
+        )
+
     def _check_dry_run_gate(self, cmd, result):
         """Post-execution annotation: distinguish FlagScale dryrun from validation runs."""
         if not self._TRAIN_LAUNCH_RE.search(cmd):
@@ -298,13 +386,15 @@ class GatesMixin:
             return ""
         if elapsed < 120:
             return ""
-        # Check if result shows hang indicators
-        hang_indicators = [
-            "before the start of training step" in result and "iteration" not in result.split("before the start")[-1],
-            "0%" in result and "utilization" in result.lower(),
-            elapsed > 180 and "iteration" not in result[-500:],
-        ]
-        if any(hang_indicators):
+        # Require at least 2 independent signals to avoid false positives
+        hang_score = 0
+        if elapsed > 180 and "iteration" not in result[-500:]:
+            hang_score += 1
+        if re.search(r'utilization.*\b0\s*%|\b0\s*%.*utilization', result, re.I):
+            hang_score += 1
+        if "before the start of training step" in result and not re.search(r'iteration\s+\d+', result):
+            hang_score += 1
+        if hang_score >= 2:
             return (
                 "\n\n[TRAINING HANG DETECTED] Training appears hung:\n"
                 f"- Elapsed: {elapsed:.0f}s with no iteration progress\n"
@@ -318,7 +408,11 @@ class GatesMixin:
         return ""
 
     def _check_error_escalation(self, tool_name, arguments):
-        """After error, require root cause before big changes."""
+        """After error, require layered diagnosis before big changes.
+
+        Enforces: environment check → dependency check → source reading → fix.
+        The most common failure mode is skipping source reading and jumping to code changes.
+        """
         if not self._last_tool_had_error:
             return ""
 
@@ -332,6 +426,19 @@ class GatesMixin:
         is_large_change = len(content) > 500
 
         if (is_config_change or is_large_change) and not self._root_cause_recorded_since_error:
+            failures = getattr(self, '_consecutive_train_failures', 0)
+            if failures >= 2:
+                return (
+                    "\n\n[DIAGNOSIS REQUIRED — LAYERED RECOVERY]\n"
+                    f"You have {failures} consecutive failures and are attempting another code change "
+                    "without recording root cause. Follow this diagnosis order:\n"
+                    "1. ENVIRONMENT: verify Python env, CUDA version, installed packages (pip show, nvidia-smi)\n"
+                    "2. DEPENDENCIES: check FlagScale/Megatron-LM-FL/TransformerEngine-FL versions match\n"
+                    "3. SOURCE READING: read the ACTUAL framework implementation that's failing — "
+                    "not just your code, but the upstream code path (Megatron/TE/FlagScale source)\n"
+                    "4. Only THEN write a fix based on what you learned from the source\n\n"
+                    "Record your diagnosis with memory_write or workspace_experiment before proceeding."
+                )
             return (
                 "\n\n[ROOT CAUSE CHECK] You're making a significant change after an error, "
                 "but haven't recorded the root cause yet. Before proceeding:\n"
@@ -351,7 +458,7 @@ class GatesMixin:
             anchors = self._get_compaction_anchors()
             if anchors:
                 self.history.set_compaction_anchors(anchors)
-            self.history.force_compact(target_ratio=0.60)
+            self.history.force_compact(target_ratio=0.50)
             self._context_pressure_soft_warned = False
             self._context_pressure_hard_warned = False
             return ""
@@ -508,6 +615,50 @@ class GatesMixin:
             f"{read_count} files this session (minimum recommended: {self._MIN_READS_BEFORE_PORTING_WRITE}). "
             f"Model porting failures are almost always caused by incomplete understanding. "
             f"Consider reading source model code, target base classes, and similar implementations first."
+        )
+
+    def _check_diagnostic_print_hint(self, tool_name, arguments):
+        """Suggest diagnostic prints when writing model/training code for the first time.
+
+        Fires once per file: when writing a .py file that contains forward/init/get_batch
+        and doesn't already include shape-printing statements.
+        """
+        if tool_name != "write_file":
+            return ""
+        if not self._porting_mode:
+            return ""
+        path = arguments.get("path", "")
+        if not path.endswith(".py"):
+            return ""
+        content = arguments.get("content", "")
+        if not content:
+            return ""
+        # Only trigger for model/training files
+        has_model_code = any(kw in content for kw in (
+            "def forward(", "def __init__(", "def get_batch(", "def model_provider(",
+        ))
+        if not has_model_code:
+            return ""
+        # Skip if already has diagnostic prints
+        has_prints = any(kw in content for kw in (
+            "print(", ".shape", "f\"shape", "f\"dtype", "print_rank_0(",
+        ))
+        if has_prints:
+            return ""
+        # Only fire once per file
+        if not hasattr(self, '_diagnostic_print_hinted_files'):
+            self._diagnostic_print_hinted_files = set()
+        if path in self._diagnostic_print_hinted_files:
+            return ""
+        self._diagnostic_print_hinted_files.add(path)
+        return (
+            "\n[DIAGNOSTIC PRINT HINT] You're writing model/training code without diagnostic prints.\n"
+            "Add temporary prints at key boundaries to verify shapes/dtypes on first run:\n"
+            "- forward() entry: input shapes, dtypes, device\n"
+            "- After each major op: intermediate tensor shapes\n"
+            "- get_batch(): output keys, shapes, dtypes\n"
+            "One diagnostic run that confirms all shapes saves multiple blind training attempts.\n"
+            "Remove prints after verification passes."
         )
 
     def _check_analysis_persistence(self, tool_name, arguments):
@@ -668,7 +819,16 @@ class GatesMixin:
             )
 
         # Phase 3: LLM self-confirmation for THIS specific porting task
+        # Auto-pass after 3 blocks to prevent deadlock (the agent has read and persisted,
+        # which is the real gate — confirmation is nice-to-have)
         if not self._pipeline_knowledge_confirmed:
+            if not hasattr(self, '_pipeline_confirm_block_count'):
+                self._pipeline_confirm_block_count = 0
+            self._pipeline_confirm_block_count += 1
+            if self._pipeline_confirm_block_count >= 3:
+                self._pipeline_knowledge_confirmed = True
+                logger.info("Pipeline knowledge confirmation auto-passed after 3 blocks")
+                return ""
             return (
                 "\n\n[KNOWLEDGE CONFIRMATION GATE] You've read the code and persisted knowledge. "
                 "Now CONFIRM: for THIS specific porting task, is your knowledge sufficient?\n\n"
@@ -780,6 +940,80 @@ class GatesMixin:
             "enters the model). The gate clears after you persist pipeline understanding."
         )
 
+    def _check_data_parallelism_gate(self, tool_name, arguments):
+        """HARD BLOCK: Enforce parallelism strategy awareness when implementing data pipeline.
+
+        Data pipeline implementation MUST consider ALL parallelism dimensions from the start.
+        This prevents the common failure of implementing data pipeline without considering
+        parallelism, then having to rewrite it.
+        """
+        if not self._porting_mode and not self._data_prep_mode:
+            return ""
+        if tool_name not in ("write_file", "edit_file"):
+            return ""
+
+        target = arguments.get("path", "") or arguments.get("file_path", "")
+        content = arguments.get("content", "") or arguments.get("new_string", "")
+
+        # Detect data pipeline implementation
+        is_data_pipeline = (
+            "get_batch" in content or
+            "dataset" in target.lower() or
+            re.search(r'class.*Dataset|def get_batch|DataLoader|data_provider', content)
+        )
+
+        if not is_data_pipeline:
+            return ""
+
+        # Check if parallelism strategy has been documented
+        entries = self.session_memory.list_entries()
+        has_parallelism_doc = any(
+            any(kw in (e.get("content") or "").lower()
+                for kw in ("tp=", "pp=", "dp=", "ep=", "cp=", "sp=",
+                           "tensor parallel", "pipeline parallel", "data parallel",
+                           "expert parallel", "context parallel", "sequence parallel",
+                           "broadcast_data", "parallelism strategy", "parallel strategy"))
+            for e in entries
+        )
+
+        # Check if content mentions parallelism handling
+        content_mentions_parallelism = any(
+            kw in content.lower()
+            for kw in ("broadcast_data", "tensor_model_parallel", "pipeline_model_parallel",
+                       "data_parallel_rank", "expert_parallel", "context_parallel",
+                       "tp_rank", "pp_rank", "dp_rank", "ep_rank", "cp_rank",
+                       "pre_process", "post_process", "get_data_parallel_group",
+                       "get_tensor_model_parallel_group", "get_pipeline_model_parallel_group")
+        )
+
+        if has_parallelism_doc or content_mentions_parallelism:
+            return ""  # Parallelism is considered
+
+        return (
+            "[DATA PARALLELISM GATE — BLOCKED]\n\n"
+            "Data pipeline implementation BLOCKED. Parallelism strategy not documented.\n\n"
+            "In distributed training, data pipeline MUST be designed with ALL parallelism dimensions:\n"
+            "- TP (Tensor Parallel): All TP ranks receive IDENTICAL input\n"
+            "  → Use broadcast_data() from megatron.training.utils\n"
+            "- PP (Pipeline Parallel): Only first stage needs tokens, only last needs labels\n"
+            "  → Guard with pre_process/post_process flags\n"
+            "- DP (Data Parallel): Different micro-batch per rank\n"
+            "  → Handled by sampler, don't break with global indexing\n"
+            "- EP (Expert Parallel): Data routing to experts must account for expert sharding\n"
+            "  → Token-to-expert assignment must be consistent across EP ranks\n"
+            "- CP (Context Parallel): Sequence split across ranks\n"
+            "  → Correct position IDs and attention masks per rank\n"
+            "- SP (Sequence Parallel): Activation memory distributed along sequence dimension\n"
+            "  → Automatically handled by framework when enabled with TP\n\n"
+            "Before implementing get_batch:\n"
+            "1. Document current parallelism strategy (TP/PP/DP/EP/CP/SP values)\n"
+            "2. Explain how data will be distributed across ALL parallelism dimensions\n"
+            "3. Identify which ranks need which data and in what format\n"
+            "4. Consider special cases: MoE routing, long sequences, packed samples\n"
+            "5. Save to memory (workspace_experiment or memory_write)\n\n"
+            "Data pipeline and parallelism are NOT separable — design them together.\n"
+        )
+
     # ── Lightweight understanding check (non-porting tasks) ─────────────
 
     _CONFIG_WRITE_PATTERNS = re.compile(
@@ -826,6 +1060,163 @@ class GatesMixin:
 
     # ── Checkpoint verification gate ────────────────────────────────────
 
+    def _check_phase_ordering_gate(self, tool_name, arguments):
+        """HARD BLOCK: Enforce strict phase ordering in porting workflow.
+
+        Prevents:
+        - Checkpoint conversion before model structure is complete
+        - Data pipeline work before checkpoint is converted
+        - Training launch before data pipeline is ready
+
+        This addresses the common failure of doing work out of order, which
+        wastes time and must be redone.
+        """
+        if not self._porting_mode:
+            return ""
+
+        current_phase = getattr(self, "_current_phase", "analysis")
+        if current_phase == "complete":
+            return ""  # All phases complete, no restrictions
+
+        # Define phase order indices
+        phase_order = [
+            "analysis",
+            "structure_implementation",
+            "structure_verification",
+            "data_pipeline",
+            "checkpoint_conversion",
+            "training_verification",
+            "complete",
+        ]
+        current_idx = phase_order.index(current_phase) if current_phase in phase_order else 0
+
+        # Detect checkpoint conversion attempts
+        if tool_name == "shell":
+            cmd = arguments.get("command", "")
+            if re.search(r'convert.*checkpoint|checkpoint.*convert|ckpt.*convert|convert.*ckpt', cmd, re.I):
+                if current_idx < phase_order.index("checkpoint_conversion"):
+                    return (
+                        f"[PHASE ORDERING GATE — BLOCKED]\n\n"
+                        f"Current phase: {current_phase}\n"
+                        f"Checkpoint conversion is NOT allowed yet.\n\n"
+                        f"Required order:\n"
+                        f"1. Complete model structure implementation\n"
+                        f"2. Verify structure completeness (all components present)\n"
+                        f"3. Implement data pipeline with parallelism support\n"
+                        f"4. THEN convert checkpoint\n\n"
+                        f"Converting checkpoint before data pipeline is ready wastes time — "
+                        f"data pipeline design may reveal missing model interfaces.\n"
+                    )
+
+        # Detect data pipeline implementation
+        if tool_name == "write_file":
+            path = arguments.get("path", "")
+            content = arguments.get("content", "")
+            is_data_pipeline = (
+                "get_batch" in content or
+                "dataset" in path.lower() or
+                "data_prep" in path.lower() or
+                re.search(r'class.*Dataset|def get_batch', content)
+            )
+            if is_data_pipeline and current_idx < phase_order.index("data_pipeline"):
+                return (
+                    f"[PHASE ORDERING GATE — BLOCKED]\n\n"
+                    f"Current phase: {current_phase}\n"
+                    f"Data pipeline implementation is NOT allowed yet.\n\n"
+                    f"Required order:\n"
+                    f"1. Complete model structure\n"
+                    f"2. Verify structure completeness\n"
+                    f"3. THEN implement data pipeline\n\n"
+                    f"Data pipeline must be designed with the final model structure in mind.\n"
+                )
+
+        # Detect training launch
+        if tool_name == "shell":
+            cmd = arguments.get("command", "")
+            if self._is_training_launch(cmd) and not self._is_quick_test_command(cmd):
+                if current_idx < phase_order.index("training_verification"):
+                    return (
+                        f"[PHASE ORDERING GATE — BLOCKED]\n\n"
+                        f"Current phase: {current_phase}\n"
+                        f"Full training launch is NOT allowed yet.\n\n"
+                        f"Complete these phases first:\n"
+                        f"- Model structure implementation and verification\n"
+                        f"- Data pipeline with parallelism support\n"
+                        f"- Checkpoint conversion\n"
+                    )
+
+        return ""
+
+    def _check_structure_completeness_gate(self, tool_name, arguments):
+        """HARD BLOCK: Prevent checkpoint conversion before model structure is verified complete.
+
+        Enforces the correct porting order:
+        1. Enumerate all source model components
+        2. Implement all components in target
+        3. Verify structure completeness
+        4. THEN do checkpoint conversion
+
+        This prevents the common failure of converting checkpoints for incomplete models,
+        which wastes time and must be redone after adding missing components.
+        """
+        if not self._porting_mode:
+            return ""
+        if tool_name != "shell" and tool_name != "write_file":
+            return ""
+
+        # Detect checkpoint conversion attempts
+        is_ckpt_conversion = False
+        if tool_name == "shell":
+            cmd = arguments.get("command", "")
+            if re.search(r'convert.*checkpoint|checkpoint.*convert|ckpt.*convert|convert.*ckpt|convert.*weight|weight.*convert', cmd, re.I):
+                is_ckpt_conversion = True
+        elif tool_name == "write_file":
+            path = arguments.get("path", "")
+            if re.search(r'convert.*ckpt|ckpt.*convert|convert.*checkpoint|checkpoint.*convert', path, re.I):
+                is_ckpt_conversion = True
+
+        if not is_ckpt_conversion:
+            return ""
+
+        # Check if structure completeness has been verified
+        if getattr(self, '_structure_completeness_verified', False):
+            return ""
+
+        # Check memory for structure enumeration evidence
+        entries = self.session_memory.list_entries()
+        has_enumeration = any(
+            any(kw in (e.get("content") or "").lower()
+                for kw in ("component checklist", "structure enumeration", "all components",
+                           "module tree", "total parameters", "porting checklist"))
+            for e in entries
+        )
+
+        if has_enumeration:
+            # Enumeration exists but not explicitly verified — soft warning
+            return (
+                "[STRUCTURE COMPLETENESS CHECK]\n"
+                "You have a component enumeration in memory. Before converting checkpoints, "
+                "confirm ALL components from the checklist are implemented:\n"
+                "1. Compare your implemented module tree against the source enumeration\n"
+                "2. Verify parameter count matches (within 1% tolerance)\n"
+                "3. If all components are present, proceed with conversion\n"
+                "4. If any are missing, implement them FIRST — partial conversion wastes time\n"
+            )
+
+        # No enumeration at all — hard block
+        return (
+            "[STRUCTURE COMPLETENESS GATE — BLOCKED]\n\n"
+            "Checkpoint conversion BLOCKED. Model structure completeness not verified.\n\n"
+            "You MUST complete these steps before checkpoint conversion:\n"
+            "1. Enumerate ALL source model components (run model.named_modules() or read __init__)\n"
+            "2. Create a porting checklist with every component and its parameter count\n"
+            "3. Implement ALL components in the target model\n"
+            "4. Verify: target module count and parameter count match source\n\n"
+            "Save the checklist to memory (workspace_experiment or memory_write).\n"
+            "Checkpoint conversion on an incomplete model wastes time — it must be redone "
+            "after adding missing components.\n"
+        )
+
     def _check_checkpoint_verified_gate(self, tool_name, arguments):
         """Verify checkpoint after conversion before using it in training."""
         if tool_name != "shell":
@@ -843,27 +1234,35 @@ class GatesMixin:
         )
 
         if not has_conversion:
-            return ""  # No recent conversion, assume checkpoint is pre-verified
+            return ""
 
-        # Check if verification was done after conversion
-        has_verification = any(
-            ("torch.load" in str(rest) or "state_dict" in str(rest) or "verify" in str(name).lower())
-            and i > max(idx for idx, (n, *_r) in enumerate(recent_tools) if "convert" in str(n).lower())
+        # Check if deep verification was done (inspect_checkpoint or torch.load with shape check)
+        conversion_indices = [idx for idx, (n, *_r) in enumerate(recent_tools)
+                             if "convert" in str(n).lower()]
+        last_conversion_idx = conversion_indices[-1] if conversion_indices else -1
+        has_deep_verification = any(
+            ("inspect_checkpoint" in str(name) or
+             ("torch.load" in str(rest) and "shape" in str(rest)) or
+             "verify" in str(name).lower())
+            and i > last_conversion_idx
             for i, (name, *rest) in enumerate(recent_tools)
         )
 
-        if has_verification:
+        if has_deep_verification:
             return ""
 
-        # Extract checkpoint path from command
         ckpt_match = re.search(r'--load[=\s]+([^\s]+)', cmd)
         ckpt_path = ckpt_match.group(1) if ckpt_match else "<checkpoint_path>"
 
         return (
             "[CHECKPOINT VERIFICATION GATE]\n"
             f"Recently converted checkpoint ({ckpt_path}) not verified before training.\n"
-            "Run: torch.load → check key count, sample shapes/norms, cross-check vs model state_dict.\n"
-            "Catches 90% of conversion bugs in 30 seconds.\n"
+            "Use `inspect_checkpoint(path=...)` to verify:\n"
+            "- Shape/dtype correctness for all tensors\n"
+            "- No all-zero, NaN, or Inf anomalies\n"
+            "- Key count matches model expectation\n"
+            "- Optionally compare vs reference with reference_path=...\n"
+            "This catches 90% of conversion bugs in seconds — much cheaper than a failed training run.\n"
         )
 
     # ── Distributed training prerequisite gate ──────────────────────────
@@ -895,19 +1294,6 @@ class GatesMixin:
 
         if has_single_gpu:
             return ""  # Already verified single-GPU
-
-        # Try to extract model info from workspace or config
-        model_type = "unknown"
-        model_size = "unknown"
-        custom_components = []
-
-        try:
-            if isinstance(ws_state, dict):
-                model_type = ws_state.get("model_type", "unknown")
-                model_size = ws_state.get("model_size", "unknown")
-                custom_components = ws_state.get("custom_components", [])
-        except:
-            pass
 
         return (
             "[DISTRIBUTED PREREQUISITE GATE]\n"
@@ -1073,17 +1459,24 @@ class GatesMixin:
 
         return ""
 
+    _MONITOR_GATE_MAX_BLOCKS = 5
+
     def _check_monitor_after_launch_gate(self, tool_name, arguments):
         """Hard block: after a real training launch (not dryrun), the next action MUST be monitor.
 
         Allows: monitor, plan_update, workspace_experiment, and read-only shell commands
         (pgrep, ps, ls, cat, tail, grep, find, head, wc, stat, file) since these are
         diagnostic and don't interfere with monitoring.
+
+        Auto-clears after _MONITOR_GATE_MAX_BLOCKS consecutive blocks (prevents permanent
+        deadlock when training exits before agent can call monitor), or when a diagnostic
+        shell command reveals the training process is no longer running.
         """
         if not self._awaiting_monitor:
             return ""
         if tool_name == "monitor":
             self._awaiting_monitor = False
+            self._monitor_gate_block_count = 0
             return ""
         if tool_name in ("plan_update", "workspace_experiment", "read_file"):
             return ""
@@ -1097,6 +1490,18 @@ class GatesMixin:
             ))
             if is_read_only:
                 return ""
+
+        if not hasattr(self, '_monitor_gate_block_count'):
+            self._monitor_gate_block_count = 0
+        self._monitor_gate_block_count += 1
+
+        if self._monitor_gate_block_count >= self._MONITOR_GATE_MAX_BLOCKS:
+            self._awaiting_monitor = False
+            self._monitor_gate_block_count = 0
+            logger.warning("Monitor gate auto-cleared after %d consecutive blocks",
+                           self._MONITOR_GATE_MAX_BLOCKS)
+            return ""
+
         return (
             "[MONITOR GATE — COMMAND NOT EXECUTED]\n\n"
             "After launching training, you MUST call monitor() to observe the process.\n"
@@ -1516,11 +1921,13 @@ class GatesMixin:
             self._check_no_delete_experiment_dir_gate,
             self._check_porting_path_gate,
             self._check_porting_path_deviation_gate,
-            self._check_reading_quality,
             self._check_pipeline_comprehension_gate,
             self._check_data_pipeline_gate,
+            self._check_data_parallelism_gate,
             self._check_understanding_verification_gate,
             self._check_component_isolation_gate,
+            self._check_phase_ordering_gate,
+            self._check_structure_completeness_gate,
             self._check_experiment_gate,
         ]
         for gate in hard_block_gates:
@@ -1542,6 +1949,7 @@ class GatesMixin:
         soft_warnings = []
         soft_gates = [
             self._check_reading_depth_gate,
+            self._check_reading_quality,
             self._check_import_verification_gate,
             self._check_reference_comparison_gate,
             self._check_checkpoint_verified_gate,
@@ -1553,19 +1961,34 @@ class GatesMixin:
             self._check_tp_compatibility_gate,
             self._check_component_integration_gate,
             self._check_error_escalation,
+            self._check_source_reading_gate,
+            self._check_diagnostic_print_hint,
             self._check_analysis_persistence,
             self._check_verification_ladder,
             self._check_config_understanding,
         ]
+        _MAX_SOFT_WARNINGS = 3
         for gate in soft_gates:
             w = gate(tool_name, arguments)
             if w:
                 soft_warnings.append(w)
+                if len(soft_warnings) >= _MAX_SOFT_WARNINGS:
+                    break
 
         if plan_gate_warning:
             soft_warnings.append(plan_gate_warning)
         if progress_warning:
             soft_warnings.append(progress_warning)
+
+        # Plan maintenance gate (soft warning only)
+        plan_maint_warning = self._check_plan_maintenance_gate(tool_name)
+        if plan_maint_warning:
+            soft_warnings.append(plan_maint_warning)
+
+        # Config validation hint after YAML write
+        config_hint = self._check_config_validation_hint(tool_name)
+        if config_hint:
+            soft_warnings.append(config_hint)
 
         return None, "\n".join(soft_warnings)
 

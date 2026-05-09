@@ -98,6 +98,65 @@ class CheckpointMixin:
         except Exception as e:
             logger.warning("Failed to auto-record verification advance: %s", e)
 
+    # ── Proactive Memory Recall ─────────────────────────────────────────
+
+    def _proactive_memory_recall(self, error_text: str) -> str:
+        """Query memory for entries relevant to the current error.
+
+        Called when training fails or a significant error occurs.
+        Surfaces past fixes/workarounds so the agent doesn't repeat failed approaches.
+        """
+        if not hasattr(self, 'session_memory') or not self.session_memory:
+            return ""
+
+        # Extract keywords from error text
+        keywords = self._extract_recall_keywords(error_text)
+        if not keywords:
+            return ""
+
+        entries = self.session_memory.query_relevant(
+            keywords, max_tokens=1500,
+            current_session_id=getattr(self, '_session_id', ''),
+        )
+        if not entries:
+            return ""
+
+        lines = []
+        for e in entries[:5]:
+            key = e.get("key", "?")
+            content = e.get("content", "")
+            if len(content) > 200:
+                content = content[:197] + "..."
+            lines.append(f"  [{e.get('type', '?')}] {key}: {content}")
+
+        return (
+            "\n\n🧠 RELEVANT MEMORIES (from past sessions):\n"
+            + "\n".join(lines)
+            + "\n  → Check these before trying a new fix. Avoid repeating failed approaches.\n"
+        )
+
+    def _extract_recall_keywords(self, text: str) -> list:
+        """Extract meaningful keywords from error text for memory recall."""
+        keywords = []
+        # Extract error type keywords
+        error_patterns = re.findall(
+            r'(OOM|OutOfMemory|NCCL|CUDA error|RuntimeError|ImportError|'
+            r'ModuleNotFoundError|shape mismatch|dtype|assertion|'
+            r'KeyError|FileNotFoundError|Permission|timeout)',
+            text, re.IGNORECASE,
+        )
+        keywords.extend(set(p.lower() for p in error_patterns))
+
+        # Extract module/file names
+        module_patterns = re.findall(r'(\w+(?:Layer|Module|Attention|MLP|Embedding|Model))', text)
+        keywords.extend(set(p.lower() for p in module_patterns[:3]))
+
+        # Extract config-related keywords
+        config_patterns = re.findall(r'(tp|pp|dp|batch_size|seq_length|precision|bf16|fp16)', text, re.IGNORECASE)
+        keywords.extend(set(p.lower() for p in config_patterns[:3]))
+
+        return keywords[:8]
+
     # ── Auto-Persistence Layer ─────────────────────────────────────────
 
     def _auto_persist_on_event(self, tool_name, arguments, result, error):

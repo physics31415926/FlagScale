@@ -3,6 +3,7 @@
 import os
 
 from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.read_file import get_file_cache
 
 
 class WriteFileTool(Tool):
@@ -30,6 +31,8 @@ class WriteFileTool(Tool):
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
+            get_file_cache().invalidate(os.path.abspath(path))
+            get_file_cache().invalidate(path)
             return f"Successfully wrote {len(content)} characters to {path}"
         except Exception as e:
             return f"ERROR: {e}"

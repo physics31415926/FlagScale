@@ -2,15 +2,24 @@
 
 ## 简介
 
-FlagScale Agent 是一个面向大模型训练基础设施的 AI 助手。它能够读写文件、执行命令、查阅文档，帮助你完成训练环境搭建、配置调优、故障排查等任务。
+FlagScale Agent 是面向大模型训练基础设施的 AI 助手。它能读写文件、执行命令、查阅文档，帮助你完成环境搭建、配置调优、模型迁移和故障排查。
 
-Agent 采用 ReAct（Reasoning + Acting）模式工作：先思考，再调用工具，根据结果继续推理，直到给出最终回答。
+Agent 采用 ReAct（Reasoning + Acting）模式：思考 → 调用工具 → 观察结果 → 继续推理，直到任务完成。
+
+### v6 新特性
+
+- **6 阶段严格有序**的模型迁移流程（分析 → 结构实现 → 结构验证 → 数据管道 → Checkpoint 转换 → 训练验证）
+- **Gate 系统**：31 个安全门控（硬阻断 + 软警告），防止过早或危险操作
+- **循环检测**：防止重复执行相同的工具调用
+- **Checkpoint 深度验证**：shape/dtype/NaN/Inf/全零异常检测
+- **主动记忆召回**：错误发生时自动检索相关历史发现
+- **配置验证工具**：训练启动前捕获 YAML 错误放置
+- **进程死亡检测**：训练崩溃时立即反馈
+- **语义去重**：通过 LLM 判断避免重复尝试已失败的修复方案
 
 ## 快速开始
 
 ### 1. 配置 API Key
-
-Agent 支持 Anthropic 和 OpenAI 两种后端。通过环境变量配置：
 
 ```bash
 # Anthropic（默认）
@@ -22,8 +31,6 @@ export OPENAI_API_KEY="sk-..."
 
 ### 2. 启动 Agent
 
-通过 FlagScale CLI 启动：
-
 ```bash
 # 交互模式（默认 Anthropic + claude-sonnet）
 flagscale agent
@@ -31,38 +38,23 @@ flagscale agent
 # 指定 provider 和模型
 flagscale agent --provider openai --model gpt-4o
 
-# 指定配置文件
-flagscale agent --config ~/.flagscale/agent.yaml
-
 # 自定义 API 地址（适配代理/网关）
 flagscale agent --base-url https://my-proxy.example.com/v1
 
-# 单次查询（非交互模式，自动关闭命令确认）
+# 单次查询（非交互模式）
 flagscale agent "FlagScale 训练环境有哪些依赖？"
 ```
 
-CLI 参数说明：
+CLI 参数：
 
 | 参数 | 缩写 | 说明 |
 |------|------|------|
-| `--provider` | `-p` | LLM 后端，`anthropic`（默认）或 `openai` |
-| `--model` | `-m` | 模型名称，默认使用 provider 的默认模型 |
+| `--provider` | `-p` | LLM 后端：`anthropic`（默认）或 `openai` |
+| `--model` | `-m` | 模型名称 |
 | `--base-url` | `-b` | API 地址，用于代理或自部署网关 |
 | `--config` | `-c` | 配置文件路径 |
 
-也可以通过 Python 代码启动：
-
-```python
-from flagscale.agent.react import run_agent
-
-# 使用默认配置
-run_agent()
-
-# 指定 provider 和模型
-run_agent(provider="openai", model="gpt-4o")
-```
-
-或者更精细地控制：
+Python API：
 
 ```python
 from flagscale.agent.react import AgentConfig, ReactAgent
@@ -74,12 +66,10 @@ agent = ReactAgent(config)
 agent.run()
 
 # 单次查询
-agent.run(single_shot_query="FlagScale 训练环境有哪些依赖？")
+agent.run(single_shot_query="检查训练环境依赖")
 ```
 
 ### 3. 开始对话
-
-启动后你会看到：
 
 ```
 ╭─ FlagScale Agent ─────────────────────────────╮
@@ -90,67 +80,55 @@ agent.run(single_shot_query="FlagScale 训练环境有哪些依赖？")
 >
 ```
 
-直接输入问题即可。Agent 会自动思考、调用工具、给出回答。
+直接输入问题。Agent 会自动思考、调用工具、给出回答。
 
 ## 配置
 
 ### 配置文件
 
-Agent 按以下优先级查找配置文件：
+Agent 按以下优先级查找配置：
 
 1. 环境变量 `FLAGSCALE_AGENT_CONFIG` 指定的路径
 2. 当前目录 `.flagscale/agent.yaml`
 3. 用户目录 `~/.flagscale/agent.yaml`
 
-配置文件示例：
+示例：
 
 ```yaml
 # ~/.flagscale/agent.yaml
 
-# LLM 后端
 provider: anthropic
 model: claude-sonnet-4-20250514
-# api_key: sk-ant-...        # 也可以用环境变量
-# base_url: https://...      # 自定义 API 地址
 
 # 行为控制
-max_iterations: 200           # 单轮最大工具调用次数
-max_context_tokens: 100000    # 上下文窗口大小
-shell_timeout: 120            # Shell 命令超时（秒）
-dangerous_commands_check: true # 拦截危险命令
-confirm_commands: true         # 高风险命令需确认
+max_iterations: 200
+max_context_tokens: 100000
+shell_timeout: 120
+dangerous_commands_check: true
+confirm_commands: true
 
 # 费用控制
-max_cost: 5.0                 # 预算上限（美元），0 表示不限
-pricing:                      # 自定义模型定价（可选）
+max_cost: 5.0
+pricing:
   my-custom-model:
-    input: 3.0                # 每百万 input token
-    output: 15.0              # 每百万 output token
+    input: 3.0
+    output: 15.0
 
-# 知识缓存
-cache_ttl_days: 7             # 缓存过期天数
-
-# 会话记忆
-memory_ttl_days: 7            # 记忆过期天数
+# 记忆
+memory_ttl_days: 7
+cache_ttl_days: 7
 
 # 网络代理
 shell_env:
   HTTP_PROXY: "http://proxy.example.com:8080"
   HTTPS_PROXY: "http://proxy.example.com:8080"
 
-# 技能目录（追加到内置目录之后）
+# 自定义技能/工具目录
 skill_dirs:
   - /path/to/custom/skills
-
-# 插件工具目录
 plugin_tool_dirs:
   - /path/to/plugin/tools
-
-# 会话存储目录
-session_dir: ~/.flagscale/sessions
 ```
-
-所有配置项都可以省略，Agent 会使用合理的默认值。
 
 ### 环境变量
 
@@ -159,15 +137,12 @@ session_dir: ~/.flagscale/sessions
 | `ANTHROPIC_API_KEY` | Anthropic API Key |
 | `ANTHROPIC_AUTH_TOKEN` | Anthropic Auth Token（优先级高于 API_KEY） |
 | `ANTHROPIC_BASE_URL` | Anthropic API 自定义地址 |
-| `ANTHROPIC_MODEL` | 覆盖默认模型 |
 | `OPENAI_API_KEY` | OpenAI API Key |
 | `OPENAI_BASE_URL` | OpenAI API 自定义地址 |
 | `FLAGSCALE_AGENT_CONFIG` | 配置文件路径 |
-| `HTTP_PROXY` / `HTTPS_PROXY` | 网络代理（自动继承到 Shell 环境） |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 网络代理 |
 
 ### 热重载
-
-修改配置文件后，无需重启 Agent，在对话中输入：
 
 ```
 > /reload
@@ -176,390 +151,295 @@ Config and skills reloaded.
 
 ## 交互命令
 
-在对话中以 `/` 开头的输入是命令，不会发送给 LLM：
+以 `/` 开头的输入是命令，不会发送给 LLM：
 
 | 命令 | 说明 |
 |------|------|
 | `/quit` | 退出 Agent |
-| `/reload` | 重新加载配置文件和技能 |
+| `/reload` | 重新加载配置和技能 |
 | `/skill list` | 列出所有可用技能 |
-| `/skill load <name>` | 手动加载一个技能 |
-| `/file <path>` | 将文件内容注入到对话上下文 |
+| `/skill load <name>` | 手动加载技能 |
+| `/file <path>` | 将文件内容注入对话上下文 |
 | `/save [name]` | 保存当前会话 |
-| `/load [name\|path]` | 加载已保存的会话（无参数列出所有会话） |
-| `/export [path]` | 导出对话为 Markdown 文件 |
-| `/cache list` | 列出所有知识缓存条目 |
-| `/cache delete <key>` | 删除指定缓存条目 |
-| `/cache clear` | 清空所有缓存 |
-| `/memory list` | 列出所有会话记忆条目 |
-| `/memory delete <key>` | 删除指定记忆条目 |
+| `/load [name]` | 加载已保存的会话 |
+| `/export [path]` | 导出对话为 Markdown |
+| `/memory list` | 列出所有记忆条目 |
+| `/memory delete <key>` | 删除指定记忆 |
 | `/memory clear` | 清空所有记忆 |
 
-## 内置工具
+## 工具（18 个）
 
-Agent 有 10 个内置工具，在对话中自动使用：
+Agent 在对话中自动选择和调用工具：
 
 | 工具 | 说明 |
 |------|------|
-| `read_file` | 读取文件内容 |
+| `read_file` | 读取文件内容（带 30s TTL 缓存） |
 | `write_file` | 创建或覆盖文件 |
-| `edit_file` | 精确替换文件中的字符串（支持全部替换） |
+| `edit_file` | 精确替换文件中的字符串 |
 | `shell` | 执行 Shell 命令 |
-| `web_fetch` | 抓取网页内容（支持代理） |
-| `load_skill` | 加载技能指令 |
-| `cache_write` | 缓存项目知识 |
-| `cache_read` | 读取缓存的项目知识 |
-| `memory_write` | 保存关键发现、决策或待办事项 |
-| `memory_read` | 读取指定的记忆条目 |
+| `web_fetch` | 抓取网页内容 |
+| `find_latest_log` | 查找和过滤日志文件（errors/progress/all） |
+| `monitor` | 长时间文件/进程监控，无 LLM 调用 |
+| `parse_training_metrics` | 从日志提取 loss/throughput/MFU |
+| `inspect_checkpoint` | Checkpoint 深度验证（shape/dtype/异常检测） |
+| `validate_config` | YAML 配置结构验证 |
+| `memory_write` | 保存发现、决策或待办 |
+| `memory_read` | 读取记忆条目 |
+| `memory_list` | 列出所有记忆键 |
+| `workspace_experiment` | 管理实验记录 |
+| `plan_create` | 创建任务计划 |
+| `plan_update` | 更新计划步骤状态 |
+| `plan_status` | 显示计划状态 |
+| `load_skill` | 加载技能定义 |
 
 ### Shell 安全机制
 
-Agent 执行 Shell 命令时有三层保护：
+三层保护：
 
-1. **致命命令拦截**：`rm -rf /`、`mkfs`、`dd if=` 等命令直接拒绝执行
-2. **高风险命令确认**：`rm`、`kill`、`git push`、`pip install` 等命令需要你确认
-3. **自杀保护**：如果命令可能杀死 Agent 自身进程，会自动改写命令排除 Agent 的 PID
+1. **致命命令拦截**：`rm -rf /`、`mkfs`、`dd if=` 直接拒绝
+2. **高风险命令确认**：`rm`、`kill`、`git push`、`pip install` 需要确认
+3. **自杀保护**：可能杀死 Agent 自身进程的命令会自动改写
+
+### Monitor 工具
+
+用于长时间操作（训练、模型加载）：
 
 ```
-> 帮我清理训练产生的临时文件
+> 启动训练后帮我监控日志
 
-⚡ shell(command="rm -rf outputs/exp_20240101/tmp/")
-⚠  Risky command: rm -rf outputs/exp_20240101/tmp/
-   Allow? [y/N]: y
-  ✓ shell (0.3s)
+⚡ monitor(file="outputs/qwen3/logs/train.log", duration=300, target_step=100)
+  ⠹ poll #15 — step=42, loss=2.31 (150s)
+  ...
+  ✓ monitor: target_reached (180s)
+
+训练已到达 step 100，loss 从 4.2 降到 1.8，正常收敛。
 ```
 
-你可以在配置中关闭这些检查：
+Monitor 会在以下情况返回：
+- 检测到错误模式（ERROR/OOM/NCCL 等）
+- 匹配成功/失败模式
+- 达到目标步数
+- 训练进程死亡
+- 超时
 
-```yaml
-dangerous_commands_check: false  # 关闭致命命令拦截
-confirm_commands: false          # 关闭确认提示
+### Inspect Checkpoint 工具
+
+深度验证 checkpoint 质量：
+
+```
+> 帮我检查转换后的 checkpoint
+
+⚡ inspect_checkpoint(path="checkpoints/qwen3_converted.pt", reference_path="checkpoints/original.pt")
+  ✓ inspect_checkpoint
+
+Keys: 142 | Params: 0.6B | dtype: torch.bfloat16
+Anomalies: None
+Reference comparison: all keys match shape and dtype [OK]
+```
+
+检测项：NaN、Inf、全零张量、shape/dtype 不匹配、缺失/多余的键。
+
+### Validate Config 工具
+
+训练前验证配置正确性：
+
+```
+> 帮我验证训练配置
+
+⚡ validate_config(path="conf/train/qwen3_0_6b.yaml")
+  ✓ validate_config
+
+Config type: model-level
+ERRORS:
+  - bf16 found under 'model' — should be under 'system.precision'
+  - save_interval found under 'model' — should be under 'system.checkpoint'
 ```
 
 ## 技能系统
 
 技能是预置的领域知识模块，让 Agent 在特定场景下获得专业指导。
 
-### 技能文件格式
+### 内置技能
 
-技能以 Markdown 文件形式存放，每个技能一个目录，包含 `SKILL.md`：
-
-```
-skills/
-  train-debug/
-    SKILL.md
-  env-setup/
-    SKILL.md
-```
-
-`SKILL.md` 格式：
-
-```markdown
----
-name: train-debug
-description: 大模型训练故障排查
-keywords: [OOM, hang, crash, 训练, 报错]
-parameters:
-  - name: model
-    description: 模型名称
-    default: aquila
----
-
-## 排查步骤
-
-1. 检查 {model} 的训练日志...
-2. 查看 GPU 显存使用...
-```
-
-### 技能目录
-
-Agent 按以下顺序扫描技能目录（后面的覆盖前面的同名技能）：
-
-1. 内置目录：`flagscale/agent/skills/`
-2. 项目目录：`<当前目录>/.flagscale/skills/`
-3. 用户目录：`~/.flagscale/skills/`
-4. 配置文件中 `skill_dirs` 指定的目录
+| 技能 | 用途 |
+|------|------|
+| `model-porter` | 模型迁移方法论（含 6 阶段流程） |
+| `data-prep` | 数据管道准备（含并行策略前置要求） |
+| `train-config` | 训练配置生成 |
+| `train-run` | 训练执行 |
+| `train-monitor` | 训练监控 |
+| `env-setup` | 环境搭建 |
+| `topo-detect` | 硬件拓扑检测 |
+| `reproduce` | 基线复现 |
+| `precision-alignment` | Loss 曲线对齐 |
 
 ### 自动加载
 
-默认开启（`auto_skill: true`）。Agent 会根据你的输入自动匹配相关技能并加载。匹配基于技能的 `keywords`、`name`、`description` 与用户输入的关键词重叠度。
-
-你也可以手动加载：
+Agent 根据你的输入自动匹配并加载相关技能。也可手动加载：
 
 ```
-> /skill load train-debug
+> /skill load model-porter
 ```
 
-### 参数化技能
+### 技能文件格式
 
-技能支持参数。在 frontmatter 中定义参数和默认值，技能正文中用 `{param_name}` 引用。加载时可以传入参数覆盖默认值。
+```markdown
+---
+name: my-skill
+description: 技能描述
+keywords: [关键词1, 关键词2]
+parameters:
+  - name: model
+    description: 模型名称
+    default: qwen3
+---
 
-## 知识缓存
+## 步骤
 
-Agent 分析项目文件后，会将结论缓存起来，避免下次重复读取。
-
-### 工作原理
-
-1. 你问"训练环境有哪些依赖？"
-2. Agent 读取 `requirements.txt`、`Dockerfile` 等文件，分析后回答
-3. Agent 调用 `cache_write` 保存分析结论，记录源文件的 SHA-256 哈希
-4. 下次你问类似问题时，系统自动匹配缓存并注入到上下文
-5. 如果源文件被修改，缓存自动失效，Agent 重新分析
-
-### 缓存管理
-
-```
-> /cache list
-  env_dependencies: training environment dependencies [valid, 3 sources]
-  project_structure: project directory layout [valid, 1 sources]
-
-> /cache delete env_dependencies
-Deleted cache entry 'env_dependencies'.
-
-> /cache clear
-Cleared 2 cache entries.
+1. 第一步...
+2. 第二步...
 ```
 
-### 缓存存储
+技能目录扫描顺序：
+1. 内置：`flagscale/agent/skills/`
+2. 项目级：`.flagscale/skills/`
+3. 用户级：`~/.flagscale/skills/`
+4. 配置文件 `skill_dirs` 指定的目录
 
-缓存文件存放在 `~/.flagscale/agent_cache/`，每个条目一个 YAML 文件。默认 7 天过期，可通过 `cache_ttl_days` 配置。
+## 记忆系统
 
-## 会话记忆
+### SessionMemory
 
-知识缓存存的是项目结构知识（依赖、架构），会话记忆存的是工作上下文（发现、决策、待办）。Agent 在对话过程中实时记录关键信息，跨会话持久化。
-
-### 工作原理
-
-Agent 在对话中发现重要信息时，会主动调用 `memory_write` 记录：
-
-```
-> Aquila 70B 用 TP=8 训练 OOM 了
-
-⚡ shell(command="grep -i 'out of memory' outputs/aquila70b/logs/latest.log | tail -5")
-  ✓ shell (0.5s)
-
-TP=8 时每卡显存不够，建议改为 TP=4+PP=2。
-
-⚡ memory_write(key="aquila70b_tp_oom", type="finding", content="Aquila 70B: TP=8 OOM，改为 TP=4+PP=2 后正常")
-  ✓ memory_write (0.0s)
-```
-
-下次启动时，Agent 自动加载最近的记忆：
+Agent 在对话中实时记录关键信息，跨会话持久化：
 
 ```
-╭─ FlagScale Agent ─────────────────────────────╮
-│  Provider: anthropic | Model: mco-4            │
-╰────────────────────────────────────────────────╯
+> Qwen3 用 TP=8 训练 OOM 了
 
-> 继续调 Aquila 70B 的并行策略
-
-（Agent 已经知道上次 TP=8 OOM，改用了 TP=4+PP=2，直接接着工作）
+⚡ memory_write(key="qwen3_tp_oom", type="finding", priority="high",
+    content="Qwen3-0.6B: TP=8 OOM，改为 TP=4+PP=2 后正常")
 ```
 
-### 记忆类型
+下次启动时自动加载相关记忆。
 
-| 类型 | 说明 | 示例 |
-|------|------|------|
-| `finding` | 发现的事实 | "TP=8 时 OOM，显存占用超过 80GB/卡" |
-| `decision` | 做出的决策 | "最终采用 TP=4+PP=2+DP=4 的并行策略" |
-| `todo` | 待办事项 | "还需要测试 EP 策略对 MoE 模型的效果" |
-| `context` | 背景信息 | "用户在准备 V4 架构的 CSA/HCA 混合注意力开发" |
+### 记忆优先级
 
-### 记忆管理
+| 优先级 | TTL | 用途 |
+|--------|-----|------|
+| `high` | 永不过期 | 关键发现、永久决策 |
+| `critical` | 7 天 | 压缩检查点 |
+| `normal` | 30 天 | 标准发现 |
+| `low` | 7 天 | 临时上下文 |
+
+访问 ≥3 次的条目自动从 `normal` 提升为 `high`。
+
+### 主动召回
+
+训练失败时，Agent 自动从记忆中检索相关条目并注入上下文，无需手动查询。
+
+### ExperimentManager
+
+结构化追踪每次实验尝试：
 
 ```
-> /memory list
-  [finding] aquila70b_tp_oom: Aquila 70B: TP=8 OOM，改为 TP=4+PP=2 后正常
-  [decision] parallel_strategy_final: 最终采用 TP=4+PP=2+DP=4
-  [todo] todo_test_ep: 还需要测试 EP 策略
+> 记录这次训练尝试
 
-> /memory delete aquila70b_tp_oom
-Deleted memory 'aquila70b_tp_oom'.
-
-> /memory clear
-Cleared 3 memory entries.
+⚡ workspace_experiment(action="add_attempt", name="qwen3_porting",
+    change="修改 attention mask 为 causal", result="loss 正常下降")
 ```
 
-### 与知识缓存的区别
+失败尝试会被自动注入后续对话，标记为 `FAILED attempts (DO NOT REPEAT)`。
 
-| | 知识缓存 | 会话记忆 |
-|---|---------|---------|
-| 内容 | 项目结构知识 | 工作上下文和决策 |
-| 写入方式 | Agent 分析文件后缓存 | Agent 对话中实时记录 |
-| 失效机制 | 源文件哈希变化 | TTL 过期（默认 7 天） |
-| 粒度 | 大块分析总结 | 单条事实/决策 |
-| 存储位置 | `~/.flagscale/agent_cache/` | `~/.flagscale/agent_memory/` |
+## 计划管理
 
-### 注入预算
+Agent 可以创建和追踪任务计划：
 
-启动时最多注入 800 tokens 的记忆（约 10-15 条），按时间从新到旧排列。超出预算的旧记忆不会注入，但仍可通过 `memory_read` 工具主动读取。
+```
+> 帮我制定 Qwen3 迁移计划
+
+⚡ plan_create(steps=["枚举模型结构", "实现 Attention 模块", "实现 MLP 模块", ...])
+```
+
+计划特性：
+- **自动同步**：工具执行后自动更新步骤状态
+- **一致性检查**：每 5 轮检测停滞和重复失败
+- **重建建议**：连续 3 次失败时建议重新制定计划
+
+## Gate 系统（安全门控）
+
+Agent 内置 31 个安全门控，自动防止危险操作：
+
+- **阶段顺序 Gate**：模型结构未完成前阻止 checkpoint 转换
+- **源码阅读 Gate**：2 次以上失败后，修代码前必须先读框架源码
+- **并行策略 Gate**：写数据管道前必须文档化全部并行维度
+- **诊断打印提示**：写 forward/init 代码时建议添加 shape/dtype 打印
+
+Gate 不需要用户干预，在后台自动工作。
 
 ## 会话管理
 
-### 自动保存与归档
+### 自动保存
 
-Agent 每轮对话后自动保存状态到 `~/.flagscale/sessions/autosave.json`。如果意外退出（断网、终端关闭等），下次启动时会提示恢复：
+每轮对话后自动保存。意外退出后下次启动会提示恢复：
 
 ```
 ╭─ Unfinished session detected ──────────────────╮
-│  Time: 2026-04-24 10:30:00                      │
+│  Time: 2026-05-09 10:30:00                      │
 │  5 turns, 3 user messages                        │
-│  Last message: 帮我检查训练配置...                │
 ╰─────────────────────────────────────────────────╯
 Resume previous session? [Y/n]:
 ```
 
-正常退出时（`/quit` 或 Ctrl+C），Agent 会自动归档当前会话到 `~/.flagscale/sessions/session_<id>.json`，然后清除 autosave。会话记忆已在对话过程中实时持久化，退出无需额外 LLM 调用，零延迟。
-
 ### 手动保存和加载
 
 ```
-> /save my-debug-session
-✓ Session saved: ~/.flagscale/sessions/my-debug-session.json
+> /save my-session
+✓ Session saved
 
-> /load
-  session_1745500200  2026-04-24 10:30  (3 turns)
-    ~/.flagscale/sessions/session_1745500200.json
-  my-debug-session    2026-04-24 11:00  (5 turns)
-    ~/.flagscale/sessions/my-debug-session.json
-
-> /load my-debug-session
-✓ Session loaded: ~/.flagscale/sessions/my-debug-session.json (5 user turns)
+> /load my-session
+✓ Session loaded (5 turns)
 ```
-
-### 导出
-
-将对话导出为可读的 Markdown 文件：
-
-```
-> /export conversation.md
-✓ Exported to conversation.md
-```
-
-## 文件注入
-
-用 `/file` 命令将文件内容直接注入到对话上下文，Agent 可以在后续回答中引用：
-
-```
-> /file configs/train_aquila.yaml
-📎 Injected configs/train_aquila.yaml (2,340 chars)
-
-> 这个配置有什么问题？
-```
-
-适合在提问前给 Agent 提供背景信息。
 
 ## 费用控制
 
-Agent 实时追踪 API 调用费用。
-
-### 预算限制
-
-在配置中设置 `max_cost`（单位：美元）：
-
 ```yaml
-max_cost: 5.0
+max_cost: 5.0  # 预算上限（美元）
 ```
 
-- 费用达到 80% 时显示警告
-- 超出预算时自动停止
-
-### 费用显示
-
-每轮对话和退出时都会显示费用：
-
-```
-── Turn 3 | 12.5s | ↑8,234 ↓1,456 tokens | $0.12 / $5.00 ──
-
-Session: 3 turns | 45.2s | ↑24,567 ↓4,321 tokens | $0.35 / $5.00
-Bye!
-```
-
-### 自定义定价
-
-如果使用自部署模型或非标准定价，可以在配置中覆盖：
-
-```yaml
-pricing:
-  my-custom-model:
-    input: 3.0     # 每百万 input token 的价格
-    output: 15.0   # 每百万 output token 的价格
-```
+- 80% 时显示警告
+- 超出预算自动停止
+- 每轮显示费用：`Turn 3 | 12.5s | ↑8,234 ↓1,456 tokens | $0.12 / $5.00`
 
 ## 插件工具
 
-除了内置工具，你可以通过 JSON 文件定义自定义工具。
-
-### 定义插件工具
-
-创建一个 JSON 文件：
+通过 JSON 文件定义自定义工具：
 
 ```json
 {
   "name": "check_gpu",
   "description": "检查 GPU 使用情况",
-  "command": "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv",
+  "command": "nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv",
   "timeout": 30,
-  "parameters": {
-    "type": "object",
-    "properties": {}
-  }
+  "parameters": {"type": "object", "properties": {}}
 }
 ```
 
-带参数的工具：
+参数通过 `{param_name}` 占位符替换，自动 `shlex.quote()` 防注入。
 
-```json
-{
-  "name": "grep_logs",
-  "description": "在训练日志中搜索关键词",
-  "command": "grep -rn {keyword} outputs/{exp_name}/logs/ | tail -50",
-  "timeout": 30,
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "keyword": {
-        "type": "string",
-        "description": "搜索关键词"
-      },
-      "exp_name": {
-        "type": "string",
-        "description": "实验名称"
-      }
-    },
-    "required": ["keyword", "exp_name"]
-  }
-}
-```
-
-参数通过 `{param_name}` 占位符替换到命令中，自动使用 `shlex.quote()` 防止命令注入。
-
-### 加载插件工具
-
-在配置中指定插件目录：
+配置中指定插件目录：
 
 ```yaml
 plugin_tool_dirs:
-  - /path/to/my/tools
   - .flagscale/tools
 ```
 
-目录下所有 `.json` 文件会被自动加载为工具。
-
 ## 网络代理
-
-如果你的环境需要代理才能访问外网，有两种配置方式：
-
-### 方式一：环境变量
 
 ```bash
 export HTTP_PROXY="http://proxy.example.com:8080"
 export HTTPS_PROXY="http://proxy.example.com:8080"
 ```
 
-Agent 会自动继承这些变量到 Shell 命令和 Web 请求中。
-
-### 方式二：配置文件
+或在配置文件中：
 
 ```yaml
 shell_env:
@@ -567,17 +447,15 @@ shell_env:
   HTTPS_PROXY: "http://proxy.example.com:8080"
 ```
 
-如果 Shell 命令遇到网络错误且未配置代理，Agent 会自动提示你配置。
+## 常见用法
 
-## 常见用法示例
-
-### 查看训练环境依赖
+### 模型迁移
 
 ```
-> FlagScale 训练环境有哪些依赖？
+> 帮我把 Qwen3-0.6B 迁移到 FlagScale
 ```
 
-Agent 会读取 `requirements.txt`、`Dockerfile` 等文件，给出完整的依赖清单。首次分析后会缓存结果，下次直接复用。
+Agent 自动加载 `model-porter` 技能，按 6 阶段流程执行。
 
 ### 排查训练故障
 
@@ -585,49 +463,40 @@ Agent 会读取 `requirements.txt`、`Dockerfile` 等文件，给出完整的依
 > 训练 OOM 了，帮我看看怎么回事
 ```
 
-Agent 会自动加载训练排查技能（如果有），然后检查日志、配置、GPU 状态。
+Agent 检查日志（优先级：OOM/CUDA > NCCL > loss 异常 > 慢迭代），给出诊断。
+
+### 验证 Checkpoint
+
+```
+> 帮我验证转换后的 checkpoint 是否正确
+```
+
+Agent 使用 `inspect_checkpoint` 做深度检查，对比 reference。
 
 ### 修改配置
 
 ```
-> 帮我把 aquila 的训练配置改成用 4 机 32 卡
+> 帮我把训练配置改成 TP=4 PP=2
 ```
 
-Agent 会读取配置文件，理解当前配置，然后修改并解释改动。
+Agent 读取配置、修改、然后调用 `validate_config` 验证。
 
-### 检查项目结构
-
-```
-> FlagScale 的目录结构是怎样的？各个目录是做什么的？
-```
-
-### 查阅文档
+### 监控训练
 
 ```
-> 帮我查一下 Megatron-LM 的 tensor parallel 文档
+> 启动训练后帮我监控到 step 1000
 ```
 
-Agent 会用 `web_fetch` 工具抓取相关文档页面。
+Agent 使用 `monitor` 工具本地轮询，不消耗 LLM Token。
 
-## 目录结构参考
+## 目录结构
 
 ```
 ~/.flagscale/
   agent.yaml              # 用户级配置
-  agent_cache/            # 知识缓存
-    env_dependencies.yaml
-    project_structure.yaml
   agent_memory/           # 会话记忆
-    aquila70b_tp_oom.yaml
-    parallel_strategy_final.yaml
   sessions/               # 会话存储
-    autosave.json
-    session_a1b2c3d4.json # 自动归档的会话
-    my-session.json       # 手动保存的会话
-  skills/                 # 用户级技能
-    my-skill/
-      SKILL.md
-  input_history           # 输入历史（用于方向键回溯）
+  input_history           # 输入历史
 
 <项目目录>/
   .flagscale/

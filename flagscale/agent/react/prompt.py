@@ -11,7 +11,7 @@ SYSTEM_PROMPT_CORE = """You are FlagScale Agent, an AI infrastructure expert spe
 
 CRITICAL: When the user gives you a task, WORK ON IT IMMEDIATELY. Never present capability menus, never ask "what would you like to do?", never list what you can do. The user already told you what to do — just do it.
 
-Tools: read_file, write_file, edit_file, shell, web_fetch, load_skill, memory_write, memory_read, memory_list, find_latest_log, parse_training_metrics, monitor, workspace_experiment, plan_create, plan_update, plan_status
+Tools: read_file, write_file, edit_file, shell, web_fetch, load_skill, memory_write, memory_read, memory_list, find_latest_log, parse_training_metrics, monitor, workspace_experiment, plan_create, plan_update, plan_status, validate_config, inspect_checkpoint
 
 Skills (internal reference — do NOT list these to the user unless they explicitly ask "what can you do"):
 {skills}
@@ -88,10 +88,22 @@ For model porting/migration work:
 - Read BOTH source and target implementations completely before writing any code
 - Analysis is per-component, but implementation is whole-model: build the complete nested Module first, don't verify components in isolation
 - Checkpoint conversion: map ALL weights into the nested structure in one pass (strict=True, zero missing keys)
+- After conversion, use `inspect_checkpoint` to verify shapes/dtypes/numerical health
 - Use real data immediately — never synthetic/dummy tensors. Real data surfaces tokenizer, preprocessing, and shape issues instantly
 - Verification: load_state_dict passes → forward with real data produces finite loss → loss decreases over steps
 
-For parallelism selection/debugging, data pipelines under parallelism, attention under TP, or OOM/NCCL/hang issues, load the `parallel-strategy` skill.""",
+For parallelism selection/debugging, data pipelines under parallelism, attention under TP, or OOM/NCCL/hang issues, load the `parallel-strategy` skill.
+
+### Diagnostic Print Strategy
+
+PROACTIVELY add print statements for shape/dtype/args at module boundaries BEFORE running. This reduces experiment iterations:
+- At model __init__: print all submodule parameter shapes and dtypes
+- At forward entry: print input tensor shapes, dtypes, device
+- At checkpoint load: print loaded key count, sample shapes, any missing/unexpected
+- At data pipeline: print batch keys, shapes, dtypes after get_batch
+- At loss computation: print logits shape, labels shape, mask shape
+
+Remove prints after verification passes. One print run that confirms all shapes is worth more than 5 blind training attempts.""",
 
     "decision": """## Decision Discipline
 
@@ -99,7 +111,15 @@ When facing errors or choices:
 - State the problem in ONE sentence
 - List max 3 options with tradeoffs
 - Pick one and commit — don't flip-flop
-- If same approach fails twice, STOP and try fundamentally different approach""",
+- If same approach fails twice, STOP and try fundamentally different approach
+
+Error recovery order (do NOT skip steps):
+1. Environment: verify env, CUDA, package versions
+2. Dependencies: check Megatron-LM-FL / TransformerEngine-FL / FlagScale versions
+3. Source reading: read the UPSTREAM framework code that's failing — not just your code
+4. Fix: only after understanding the framework implementation
+
+Most repeated failures come from not reading the framework source. When stuck, read more code — don't try more fixes.""",
 
     "user_commands": """## User commands
 
@@ -141,7 +161,7 @@ class PromptMixin:
                      "memory_read", "memory_write", "load_skill"},
         "training": {"shell", "monitor", "read_file", "find_latest_log",
                      "parse_training_metrics", "workspace_experiment",
-                     "memory_write"},
+                     "memory_write", "validate_config", "inspect_checkpoint"},
         "default": None,
     }
     _CORE_TOOLS = {"shell", "read_file"}
@@ -181,6 +201,15 @@ Lifecycle:
 
 One experiment, one purpose. Each launch gets its own attempt with hardware + config.
 
+## Log Analysis Priority
+
+When checking training status, use find_latest_log with appropriate filter to save tokens:
+- First call: filter='errors' — check for crashes/OOM/NCCL errors (highest priority)
+- If no errors: filter='progress' — check iteration progress and loss trend
+- Only use filter='all' when you need full context for a specific issue
+
+Diagnosis priority: OOM/CUDA error > NCCL timeout > loss anomaly > slow iteration > warnings.
+
 Load train-run skill for full training launch protocol.
 """,
         "general": """
@@ -194,6 +223,11 @@ Load train-run skill for full training launch protocol.
 - Mark plan steps done as you go
 
 Load ops-discipline skill for full diagnosis protocol.
+""",
+        "config_schema": """
+## FlagScale Config
+
+FlagScale uses two-level Hydra YAML: top-level (`conf/train.yaml` with experiment/action/hydra) + model-level (`conf/train/<model>.yaml` with system/model/data sections). Parallelism and precision go under `system`, not `model`. After writing config YAML, call `validate_config(path=...)` to catch structural errors.
 """
     }
 
@@ -252,6 +286,7 @@ Load ops-discipline skill for full diagnosis protocol.
                 sections_to_load.add("model_porting")
             if "train" in task or "experiment" in task:
                 sections_to_load.add("training")
+                sections_to_load.add("config_schema")
         except Exception:
             pass
 
@@ -261,6 +296,7 @@ Load ops-discipline skill for full diagnosis protocol.
                     sections_to_load.add("env_setup")
                 if tool_name in ("workspace_experiment", "find_latest_log", "parse_training_metrics"):
                     sections_to_load.add("training")
+                    sections_to_load.add("config_schema")
 
         return sections_to_load
 
@@ -365,7 +401,11 @@ Load ops-discipline skill for full diagnosis protocol.
         self._system_prompt = prompt
 
     def _build_memory_context(self):
-        """Build memory context string from recent memories, with dynamic budget based on context pressure."""
+        """Build memory context string from recent memories, with dynamic budget based on context pressure.
+
+        When training failures have occurred, also queries for error-relevant memories
+        to surface past fixes proactively.
+        """
         pressure = self.history.get_context_pressure()
         if pressure > 0.7:
             budget = 1000
@@ -384,12 +424,29 @@ Load ops-discipline skill for full diagnosis protocol.
         stale_keys = []
         stale_threshold = 14 * 86400
         now = time.time()
+        seen_keys = set()
         for n in notes:
+            key = n.get("key", "?")
+            seen_keys.add(key)
             task_tag = f" @{n.get('task', '')}" if n.get("task") else ""
-            lines.append(f'[{n.get("type", "?")}:{n.get("key", "?")}]{task_tag} {n.get("content", "")}')
+            lines.append(f'[{n.get("type", "?")}:{key}]{task_tag} {n.get("content", "")}')
             age = now - n.get("created", 0)
             if age > stale_threshold:
-                stale_keys.append(n.get("key", "?"))
+                stale_keys.append(key)
+
+        # Proactive relevance injection: when failures occurred, surface related memories
+        failures = getattr(self, '_consecutive_train_failures', 0)
+        if failures >= 1 and hasattr(self, '_seen_errors') and self._seen_errors:
+            keywords = list(self._seen_errors)[:5]
+            relevant = self.session_memory.query_relevant(
+                keywords, max_tokens=min(800, budget // 3),
+                current_session_id=getattr(self, '_session_id', ''),
+            )
+            for r in relevant:
+                if r.get("key") not in seen_keys:
+                    lines.append(f'[RELEVANT:{r.get("key", "?")}] {r.get("content", "")}')
+                    seen_keys.add(r.get("key"))
+
         result = "<session-memory>\n" + "\n".join(lines) + "\n</session-memory>"
         if stale_keys:
             result += self._STALE_MEMORY_WARNING_TEMPLATE.format(

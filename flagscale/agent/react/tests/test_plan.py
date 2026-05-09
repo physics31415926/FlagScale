@@ -180,3 +180,100 @@ class TestPersistence:
         assert plan["title"] == "Persistent"
         assert plan["steps"][0]["status"] == "done"
         assert plan["steps"][1]["status"] == "doing"
+
+
+class TestAutoSync:
+    def test_auto_sync_marks_done_on_write(self, tp):
+        tp.create("Test", ["Write config", "Run training"])
+        tp.update_step(1, "doing")
+        tp.auto_sync_step("write_file", success=True, result_summary="config.yaml", turn=3)
+        plan = tp.get_active()
+        assert plan["steps"][0]["status"] == "done"
+        assert "config.yaml" in plan["steps"][0]["notes"]
+        # Step 2 should auto-advance
+        assert plan["steps"][1]["status"] == "doing"
+
+    def test_auto_sync_records_failure(self, tp):
+        tp.create("Test", ["Run training"])
+        tp.update_step(1, "doing")
+        tp.auto_sync_step("shell", success=False, result_summary="OOM error", turn=2)
+        plan = tp.get_active()
+        assert plan["steps"][0]["status"] == "doing"  # Not marked done
+        assert "fail #1" in plan["steps"][0]["notes"]
+        assert plan["steps"][0]["_failure_count"] == 1
+
+    def test_auto_sync_no_plan(self, tp):
+        # Should not raise
+        tp.auto_sync_step("write_file", success=True, result_summary="test", turn=1)
+
+    def test_auto_sync_no_doing_step(self, tp):
+        tp.create("Test", ["A", "B"])
+        # All steps are pending, no doing step
+        tp.auto_sync_step("write_file", success=True, result_summary="test", turn=1)
+        plan = tp.get_active()
+        assert plan["steps"][0]["status"] == "pending"
+
+    def test_auto_sync_non_write_productive_tool(self, tp):
+        tp.create("Test", ["Document findings"])
+        tp.update_step(1, "doing")
+        # memory_write is productive but not write_file/edit_file — should not auto-complete
+        tp.auto_sync_step("memory_write", success=True, result_summary="saved", turn=2)
+        plan = tp.get_active()
+        assert plan["steps"][0]["status"] == "doing"
+
+
+class TestConsistencyCheck:
+    def test_no_issues(self, tp):
+        tp.create("Test", ["A", "B"])
+        tp.update_step(1, "doing")
+        tp.record_turn_activity(5)
+        result = tp.check_consistency(6)
+        assert result is None
+
+    def test_stale_step(self, tp):
+        tp.create("Test", ["A", "B"])
+        tp.update_step(1, "doing")
+        tp.record_turn_activity(1)
+        result = tp.check_consistency(15)  # 14 turns stale > threshold 10
+        assert result is not None
+        assert "Step 1" in result
+        assert "without progress" in result
+
+    def test_repeated_failures(self, tp):
+        tp.create("Test", ["Run training"])
+        tp.update_step(1, "doing")
+        for i in range(3):
+            tp.auto_sync_step("shell", success=False, result_summary=f"error {i}", turn=i + 1)
+        result = tp.check_consistency(5)
+        assert result is not None
+        assert "3 failures" in result
+
+    def test_no_plan(self, tp):
+        result = tp.check_consistency(10)
+        assert result is None
+
+
+class TestShouldRebuild:
+    def test_below_threshold(self, tp):
+        tp.create("Test", ["A"])
+        tp.update_step(1, "doing")
+        assert tp.should_rebuild(2) is False
+
+    def test_above_threshold_with_failures(self, tp):
+        tp.create("Test", ["A"])
+        tp.update_step(1, "doing")
+        for i in range(3):
+            tp.auto_sync_step("shell", success=False, result_summary="err", turn=i)
+        assert tp.should_rebuild(3) is True
+
+    def test_no_plan(self, tp):
+        assert tp.should_rebuild(5) is False
+
+
+class TestRecordTurnActivity:
+    def test_records_turn(self, tp):
+        tp.create("Test", ["A"])
+        tp.update_step(1, "doing")
+        tp.record_turn_activity(7)
+        plan = tp.get_active()
+        assert plan["steps"][0]["_last_activity_turn"] == 7

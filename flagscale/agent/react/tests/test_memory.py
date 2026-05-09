@@ -152,3 +152,166 @@ class TestMemoryTools:
         tool = MemoryReadTool(memory)
         result = tool.execute(key="nonexistent")
         assert "No memory found" in result
+
+
+class TestAccessTracking:
+    """Tests for access frequency tracking and auto-promotion."""
+
+    def test_access_count_increments(self, memory_dir):
+        memory = SessionMemory(memory_dir, ttl_days=7)
+        memory.put("k1", "finding", "some finding", "s1")
+        memory.get("k1")
+        memory.get("k1")
+        entry = memory.get("k1")
+        assert entry["access_count"] == 3
+
+    def test_auto_promotion_to_high(self, memory_dir):
+        memory = SessionMemory(memory_dir, ttl_days=7)
+        memory.put("k1", "finding", "important finding", "s1")
+        # Access 3 times to trigger promotion
+        memory.get("k1")
+        memory.get("k1")
+        entry = memory.get("k1")
+        assert entry["priority"] == "high"
+
+    def test_no_promotion_for_already_high(self, memory_dir):
+        memory = SessionMemory(memory_dir, ttl_days=7)
+        memory.put("k1", "finding", "content", "s1", priority="high")
+        memory.get("k1")
+        memory.get("k1")
+        entry = memory.get("k1")
+        assert entry["priority"] == "high"
+
+    def test_query_relevant_tracks_access(self, memory_dir):
+        memory = SessionMemory(memory_dir, ttl_days=7)
+        memory.put("oom_fix", "finding", "OOM fixed by reducing batch", "s1")
+        memory.query_relevant(["oom"])
+        memory.query_relevant(["oom"])
+        memory.query_relevant(["oom"])
+        entry = memory.get("oom_fix")
+        # 3 from query_relevant + 1 from get
+        assert entry["access_count"] >= 3
+
+
+class TestDedup:
+    """Tests for write-time deduplication."""
+
+    def test_no_dedup_without_llm(self, memory_dir):
+        memory = SessionMemory(memory_dir, ttl_days=7)
+        memory.put("k1", "finding", "OOM on TP=2", "s1")
+        memory.put("k2", "finding", "Out of memory on TP=2", "s1")
+        # Without LLM, both entries should exist
+        assert memory.get("k1") is not None
+        assert memory.get("k2") is not None
+
+    def test_dedup_merges_with_llm(self, memory_dir):
+        def mock_llm(prompt):
+            if "confidence score" in prompt:
+                return "0.9"
+            return ""
+
+        memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
+        memory.put("k1", "finding", "OOM on TP=2, fixed by batch_size=4", "s1")
+        path = memory.put("k2", "finding", "OOM on TP=2, reduced batch to 4", "s1")
+        # k2 should be merged into k1
+        assert "k1" in path
+        assert memory.get("k2") is None
+        entry = memory.get("k1")
+        assert "reduced batch to 4" in entry["content"]
+
+    def test_dedup_no_merge_when_different(self, memory_dir):
+        def mock_llm(prompt):
+            if "confidence score" in prompt:
+                return "0.2"
+            return ""
+
+        memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
+        memory.put("k1", "finding", "OOM on TP=2", "s1")
+        memory.put("k2", "finding", "NCCL timeout on PP=4", "s1")
+        assert memory.get("k1") is not None
+        assert memory.get("k2") is not None
+
+    def test_dedup_low_confidence_no_merge(self, memory_dir):
+        def mock_llm(prompt):
+            if "confidence score" in prompt:
+                return "0.5"  # Below threshold of 0.7
+            return ""
+
+        memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
+        memory.put("k1", "finding", "OOM on TP=2", "s1")
+        memory.put("k2", "finding", "OOM on TP=4 with different config", "s1")
+        # Both should exist since confidence is below threshold
+        assert memory.get("k1") is not None
+        assert memory.get("k2") is not None
+
+
+class TestKeywordExpansion:
+    """Tests for semantic keyword expansion."""
+
+    def test_no_expansion_without_llm(self, memory_dir):
+        memory = SessionMemory(memory_dir, ttl_days=7)
+        memory.put("oom_fix", "finding", "out of memory fixed by reducing batch", "s1")
+        # Without LLM, "cuda_malloc" won't match "out of memory"
+        results = memory.query_relevant(["cuda_malloc"])
+        assert len(results) == 0
+
+    def test_expansion_with_llm(self, memory_dir):
+        import json
+
+        def mock_llm(prompt):
+            if "Expand these" in prompt:
+                return json.dumps({"OOM": ["oom", "out of memory", "memory exhaustion"]})
+            return ""
+
+        memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
+        memory.put("fix1", "finding", "out of memory fixed by reducing batch", "s1")
+        results = memory.query_relevant(["OOM"])
+        assert len(results) == 1
+        assert results[0]["key"] == "fix1"
+
+    def test_expansion_fallback_on_error(self, memory_dir):
+        def mock_llm(prompt):
+            raise RuntimeError("LLM unavailable")
+
+        memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
+        memory.put("oom_fix", "finding", "oom fixed", "s1")
+        # Should fall back to original keywords
+        results = memory.query_relevant(["oom"])
+        assert len(results) == 1
+
+    def test_expansion_cache_avoids_repeated_calls(self, memory_dir):
+        import json
+        call_count = [0]
+
+        def mock_llm(prompt):
+            if "Expand these" in prompt:
+                call_count[0] += 1
+                return json.dumps({"oom": ["oom", "out of memory"]})
+            return ""
+
+        memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
+        memory.put("fix1", "finding", "out of memory error", "s1")
+        # First call — hits LLM
+        memory.query_relevant(["oom"])
+        assert call_count[0] == 1
+        # Second call — should use cache
+        memory.query_relevant(["oom"])
+        assert call_count[0] == 1
+
+    def test_expansion_cache_order_independent(self, memory_dir):
+        import json
+        call_count = [0]
+
+        def mock_llm(prompt):
+            if "Expand these" in prompt:
+                call_count[0] += 1
+                return json.dumps({"oom": ["oom", "out of memory"], "nccl": ["nccl", "nccl timeout"]})
+            return ""
+
+        memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
+        memory.put("fix1", "finding", "out of memory and nccl timeout", "s1")
+        memory.query_relevant(["oom", "nccl"])
+        assert call_count[0] == 1
+        # Same keywords in different order — should hit cache
+        memory.query_relevant(["nccl", "oom"])
+        assert call_count[0] == 1

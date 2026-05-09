@@ -75,6 +75,34 @@ Port models to Megatron-LM-FL / FlagScale for distributed pre-training.
 
 ### Pre-coding analysis (MANDATORY for models >10B or multimodal)
 
+**Analysis 0: Model Structure Enumeration (MANDATORY — must complete BEFORE any implementation)**
+
+Before writing ANY porting code, enumerate the COMPLETE source model structure:
+
+1. **List ALL top-level modules** from the source model's `__init__`:
+   ```python
+   # Example for a multimodal model:
+   self.vision_encoder = ...
+   self.vision_projection = ...
+   self.language_model = ...
+   self.lm_head = ...
+   ```
+
+2. **Count total parameters and submodules**:
+   - Run: `sum(p.numel() for p in model.parameters())` on source model
+   - Run: `len(list(model.named_modules()))` to count all nested modules
+   - Record these numbers — they are your completeness verification baseline
+
+3. **Create a porting checklist** with ALL components:
+   ```markdown
+   - [ ] vision_encoder (ViT, 86M params)
+   - [ ] vision_projection (MLP, 2M params)
+   - [ ] language_model (Transformer, 7B params)
+   - [ ] lm_head (Linear, 50M params)
+   ```
+
+4. **Persist the checklist** to workspace memory BEFORE starting implementation
+
 **Analysis 1: Component diff table**
 
 | Source Component | HF Implementation | Megatron-LM-FL Equivalent | Existing Reference | Gap / Action |

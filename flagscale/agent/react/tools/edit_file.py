@@ -1,6 +1,7 @@
 """Edit file tool — exact string replacement."""
 
 from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.read_file import get_file_cache
 
 
 class EditFileTool(Tool):
@@ -52,6 +53,7 @@ class EditFileTool(Tool):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(new_content)
 
+            get_file_cache().invalidate(path)
             msg = f"Successfully edited {path}"
             if count > 1:
                 msg += f" (replaced {replaced} of {count} occurrences)"

@@ -53,6 +53,8 @@ from flagscale.agent.react.tools.monitor import MonitorTool
 from flagscale.agent.react.tools.plan_create import PlanCreateTool
 from flagscale.agent.react.tools.plan_update import PlanUpdateTool
 from flagscale.agent.react.tools.plan_status import PlanStatusTool
+from flagscale.agent.react.tools.validate_config import ValidateConfigTool
+from flagscale.agent.react.tools.inspect_checkpoint import InspectCheckpointTool
 
 from flagscale.agent.react.prompt import (
     PromptMixin, SYSTEM_PROMPT_CORE, SYSTEM_PROMPT_OPTIONAL, SYSTEM_PROMPT,
@@ -142,12 +144,19 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
 
         # Register after task_plan exists so experiment can auto-link
         self.tool_registry.register(WorkspaceExperimentTool(self._experiment_manager, task_plan=self.task_plan))
+        self.tool_registry.register(ValidateConfigTool())
+        self.tool_registry.register(InspectCheckpointTool())
 
         if not config.api_key:
             raise ValueError(
                 "API key not found. Set ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY, or OPENAI_API_KEY."
             )
         self.provider = get_provider(config.provider, config.model, config.api_key, config.base_url, config.max_output_tokens)
+
+        # Inject LLM capability into session memory for dedup and semantic expansion
+        self.session_memory._llm_fn = lambda prompt: self.provider.chat(
+            [{"role": "user", "content": prompt}], tools=[]
+        ).get("content", "")
 
         self.history = HistoryManager(max_context_tokens=config.max_context_tokens)
         self.history.set_summarizer(self._summarize_for_compaction)
@@ -172,6 +181,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         self._kill_retry_timestamps = []  # Track kill+relaunch cycles
         self._training_launch_timestamps = []  # Track all training launches for hang detection
         self._awaiting_monitor = False  # Rule: must call monitor after real training launch (not dryrun)
+        self._monitor_gate_block_count = 0
         self._context_pressure_soft_warned = False
         self._context_pressure_hard_warned = False
         self._last_checkpoint_tokens = 0  # For progress checkpoint
@@ -193,6 +203,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         self._last_gate_warning = ""  # Gate dedup: don't inject same warning twice
         self._files_read_this_session = set()  # Reading depth gate: track files read
         self._files_written_this_session = set()  # Track files written for snapshot
+        self._source_reads_since_last_failure = 0  # Source-reading gate: framework reads after failure
         self._porting_mode = False  # Reading depth gate: True after model-porter skill loaded
         self._init_regex_judge()  # LLM-assisted regex confirmation
         self._porting_path_confirmed = False  # Porting path gate: True after user confirms Mode B/C
@@ -216,6 +227,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         # New gate state (Phase 1-4)
         self._understanding_verified = False  # A1: True after verification questions answered
         self._component_plan_created = False  # A3: True after component isolation plan created
+        self._structure_completeness_verified = False  # U1: True after model structure enumeration and verification
         self._failure_mode_analyzed = False  # B1: True after failure mode analysis done
         self._sanity_checks_passed = False  # B2: True after 4 sanity checks passed
         self._config_model_verified = False  # B4: True after config-model consistency verified
@@ -413,6 +425,22 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
 
         plan_context = self.task_plan.context_for_prompt()
 
+        # Plan consistency check (every 5 turns when plan exists)
+        if plan_context and self._turn_count > 0 and self._turn_count % 5 == 0:
+            consistency_msg = self.task_plan.check_consistency(self._turn_count)
+            if consistency_msg:
+                plan_context += consistency_msg
+
+        # Plan rebuild suggestion on consecutive failures
+        if self._consecutive_train_failures >= 3 and self.task_plan.should_rebuild(self._consecutive_train_failures):
+            plan_context += (
+                "\n\n⚠️ [PLAN REBUILD SUGGESTED] "
+                f"{self._consecutive_train_failures} consecutive training failures on the current step. "
+                "Your current plan may be based on wrong assumptions. Consider:\n"
+                "1. plan_update(action='abandon') to discard the failing plan\n"
+                "2. Analyze the root cause of repeated failures\n"
+                "3. plan_create with a fundamentally different approach"
+            )
 
         complexity_hint = ""
         if not plan_context and self.config.auto_plan:
@@ -759,9 +787,9 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             doing = [s for s in steps if s.get("status") == "doing"]
             pending = [s for s in steps if s.get("status") == "pending"]
             if doing:
-                parts.append(f"Current step: {doing[0].get('text', '')[:80]}")
+                parts.append(f"Current step: {doing[0].get('title', '')[:80]}")
             elif pending:
-                parts.append(f"Next step: {pending[0].get('text', '')[:80]}")
+                parts.append(f"Next step: {pending[0].get('title', '')[:80]}")
                 # Check if multiple pending steps are independent (heuristic: first 3 pending)
                 if len(pending) >= 2:
                     parts.append("BATCH: multiple pending steps — issue independent tool calls together")
@@ -772,7 +800,17 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             exp = self._experiment_manager.read(exp_name)
             if exp and exp.get("status") == "running":
                 attempts = exp.get("attempts", [])
-                if attempts:
+                failed_attempts = [a for a in attempts if "fail" in str(a.get("result", "")).lower()
+                                   or "error" in str(a.get("result", "")).lower()]
+                if failed_attempts:
+                    # Inject full failure history so LLM can avoid repeating
+                    fail_lines = []
+                    for i, a in enumerate(failed_attempts[-5:], 1):
+                        change = a.get("change", "")[:60]
+                        result = a.get("result", "")[:60]
+                        fail_lines.append(f"  #{i} [FAILED] {change} → {result}")
+                    parts.append("FAILED attempts (DO NOT REPEAT):\n" + "\n".join(fail_lines))
+                elif attempts:
                     parts.append(f"Last attempt: {attempts[-1].get('result', '')[:80]}")
 
         # Include original task when no plan context available
@@ -1080,7 +1118,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             self._record_iteration(response["tool_calls"], results, output_tok, tool_elapsed_list)
 
             # Intra-turn compaction: only when context pressure is genuinely high
-            if iteration > 0 and self.history.get_context_pressure() > 0.60:
+            if iteration > 0 and self.history.get_context_pressure() > 0.70:
                 if self.history.compact_intra_turn(keep_last=6):
                     logger.info("Intra-turn compaction at iteration %d (pressure=%.2f)",
                                 iteration, self.history.get_context_pressure())
@@ -1173,7 +1211,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         pressure = self.history.get_context_pressure()
         if pressure >= 0.85:
             logger.warning("Context pressure %.0f%%, forcing compaction before LLM call", pressure * 100)
-            self.history.force_compact(target_ratio=0.60)
+            self.history.force_compact(target_ratio=0.50)
             if self.history._last_compacted_from:
                 display.context_compacted(
                     self.history._last_compacted_from,
@@ -1185,7 +1223,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                 self.history._last_compacted_to = None
             messages = self.history.get_messages()
         elif pressure >= 0.75:
-            logger.info("Context pressure %.0f%%, approaching limit", pressure * 100)
+            logger.info("Context pressure %.0f%%, approaching limit — consider saving key findings", pressure * 100)
 
         def _handle_context_overflow():
             logger.warning("Context overflow recovery: forcing aggressive compaction")
@@ -1669,6 +1707,14 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             if path:
                 was_already_read = path in self._files_read_this_session
                 self._files_read_this_session.add(path)
+                # Track framework source reads for source-reading gate
+                if self._consecutive_train_failures >= 2:
+                    _FRAMEWORK_INDICATORS = (
+                        "megatron", "transformer_engine", "flagscale",
+                        "Megatron-LM", "TransformerEngine",
+                    )
+                    if any(ind in path for ind in _FRAMEWORK_INDICATORS):
+                        self._source_reads_since_last_failure += 1
                 # Track reading categories for quality gate
                 for cat, pattern in self._PORTING_READ_CATEGORIES.items():
                     if pattern.search(path):
@@ -1706,6 +1752,24 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             path = arguments.get("path", "") or arguments.get("file_path", "")
             if path:
                 self._files_written_this_session.add(path)
+
+        # Auto-sync plan step based on tool execution result
+        if tool_name in self._PRODUCTIVE_TOOLS:
+            summary = ""
+            if tool_name in ("write_file", "edit_file"):
+                summary = arguments.get("path", "") or arguments.get("file_path", "")
+            self.task_plan.auto_sync_step(
+                tool_name, success=not error,
+                result_summary=summary[:100],
+                turn=self._turn_count,
+            )
+        elif error and tool_name == "shell":
+            cmd = arguments.get("command", "")[:60]
+            self.task_plan.auto_sync_step(
+                tool_name, success=False,
+                result_summary=f"cmd failed: {cmd}",
+                turn=self._turn_count,
+            )
 
         # Reset re-read counter when findings are saved
         if tool_name in ("memory_write", "workspace_experiment") and not error:
@@ -1853,6 +1917,15 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                     self._imports_verified = True
                     logger.info("Import verification gate unlocked")
 
+            # U1: Structure completeness — unlock when enumeration persisted
+            if not self._structure_completeness_verified and tool_name in ("workspace_experiment", "memory_write"):
+                struct_kws = ("component checklist", "structure enumeration", "all components",
+                              "module tree", "total parameters", "porting checklist", "named_modules",
+                              "param count", "parameter count")
+                if sum(1 for kw in struct_kws if kw in content) >= 1:
+                    self._structure_completeness_verified = True
+                    logger.info("Structure completeness gate unlocked")
+
             # A2: Reference comparison — unlock when plan created
             if not self._reference_comparison_planned:
                 if tool_name in ("plan_create", "workspace_experiment"):
@@ -1956,6 +2029,10 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                 ckpt_warn = self._checkpoint_training_failure(cmd, result)
                 if ckpt_warn:
                     result = result + ckpt_warn
+                # Proactive memory recall: surface past fixes for similar errors
+                recall = self._proactive_memory_recall(result)
+                if recall:
+                    result = result + recall
             # Remind to memorize learnings when training launches successfully
             if (is_train_launch
                     and not self._is_quick_test_command(cmd)
@@ -1996,6 +2073,11 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             ckpt_warn = self._checkpoint_new_error(error_sig, result)
             if ckpt_warn:
                 result = result + ckpt_warn
+            # Proactive recall for non-training shell errors too
+            if not self._is_training_launch(arguments.get("command", "")):
+                recall = self._proactive_memory_recall(result)
+                if recall:
+                    result = result + recall
 
         # Auto-memory hint after writing model/training code
         if tool_name in ("write_file", "edit_file") and not error and self._porting_mode:
@@ -2050,6 +2132,15 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             hang_warn = self._check_training_hang(cmd, result, elapsed)
             if hang_warn:
                 result = result + hang_warn
+            # Auto-clear monitor gate if diagnostic shows training process is gone
+            if self._awaiting_monitor and re.match(
+                r'\s*(pgrep|ps)\b', cmd
+            ):
+                result_lower = result.lower() if result else ""
+                if not result.strip() or "no process" in result_lower:
+                    self._awaiting_monitor = False
+                    self._monitor_gate_block_count = 0
+                    logger.info("Monitor gate auto-cleared: training process not found")
 
         # Phase transition gate — check AFTER execution, only for successful calls
         phase_warning = ""

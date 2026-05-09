@@ -40,6 +40,30 @@ suggests: [env-setup]
 
 # Data Preparation for FlagScale
 
+## CRITICAL: Parallelism Strategy is a Prerequisite
+
+**Before implementing ANY data pipeline code, you MUST know the parallelism strategy.**
+
+Data loading in FlagScale is NOT independent of parallelism. Every `get_batch` implementation must handle ALL applicable parallelism dimensions:
+
+| Parallelism | Data Requirement | Implementation |
+|-------------|-----------------|----------------|
+| **TP** (Tensor Parallel) | All TP ranks receive IDENTICAL input | Use `broadcast_data()` from `megatron.training.utils` |
+| **PP** (Pipeline Parallel) | Only first stage needs tokens, only last needs labels | Guard with `pre_process`/`post_process` flags |
+| **DP** (Data Parallel) | Different micro-batch per rank | Handled by sampler — don't use global indexing |
+| **EP** (Expert Parallel) | Token-to-expert routing must be consistent across EP ranks | Ensure dispatch/combine tensors align with expert sharding |
+| **CP** (Context Parallel) | Sequence split across ranks | Correct position IDs, attention masks, and loss masks per rank |
+| **SP** (Sequence Parallel) | Activations distributed along sequence dim | Automatically handled by framework when enabled with TP |
+
+**If you don't know the full parallelism configuration (TP/PP/DP/EP/CP/SP), STOP and determine it first** (use `parallel-strategy` skill).
+
+Consider special cases:
+- MoE models: EP affects how tokens are routed — data pipeline must produce consistent routing inputs
+- Long sequences with CP: position IDs and loss masks must be correctly split per rank
+- Packed samples: multiple sequences in one sample require careful attention mask construction under parallelism
+
+---
+
 FlagScale supports two data pipelines depending on modality:
 
 | Pipeline | Modality | Format | Tool |

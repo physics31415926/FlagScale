@@ -1,11 +1,12 @@
 """Session memory — stores key findings, decisions, and todos across conversations."""
 
+import json
 import logging
 import os
 import re
 import time
 
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import yaml
 
@@ -13,13 +14,28 @@ logger = logging.getLogger(__name__)
 
 _TYPE_PRIORITY = {"finding": 0, "decision": 1, "todo": 2, "context": 3}
 
+_PRIORITY_TTL = {
+    "high": None,       # Never expires
+    "critical": 7,      # 7 days — compaction checkpoints, auto-cleanup
+    "normal": 30,       # 30 days (default)
+    "low": 7,           # 7 days — ephemeral context
+}
+
+_PROMOTION_THRESHOLD = 3  # Access count to auto-promote normal → high
+_DEDUP_CONFIDENCE_THRESHOLD = 0.7  # Confidence score to consider duplicate (0-1)
+
 
 class SessionMemory:
     """Incremental memory for cross-session continuity with TTL expiration."""
 
-    def __init__(self, memory_dir: str, ttl_days: int = 30):
+    def __init__(self, memory_dir: str, ttl_days: int = 30, llm_fn: Optional[Callable[[str], str]] = None):
         self._dir = memory_dir
+        self._default_ttl = ttl_days * 86400
         self._ttl = ttl_days * 86400
+        self._llm_fn = llm_fn
+        self._expansion_cache = {}  # keyword → expanded list, avoids repeated LLM calls
+        self._expansion_cache_ttl = 300  # 5 minutes
+        self._expansion_cache_ts = {}  # keyword → timestamp
         self._cleanup_expired()  # Clean up expired entries on init
 
     def _cleanup_expired(self):
@@ -74,11 +90,19 @@ class SessionMemory:
         if not self._is_valid(entry):
             self.delete(safe)
             return None
+        self._record_access(entry, path)
         return entry
 
     def put(self, key: str, mem_type: str, content: str, session_id: str = "", task: str = "", priority: str = "normal", scope: str = "persistent"):
         os.makedirs(self._dir, exist_ok=True)
         safe = self.sanitize_key(key) if not self.is_valid_key(key) else key
+
+        # Auto-dedup: check if semantically duplicate entry exists
+        merged_key = self._try_dedup(safe, content, mem_type)
+        if merged_key:
+            logger.info("Memory dedup: merged into existing key '%s'", merged_key)
+            return self._entry_path(merged_key)
+
         entry = {
             "key": safe,
             "type": mem_type,
@@ -88,6 +112,7 @@ class SessionMemory:
             "priority": priority,
             "scope": scope,
             "created": time.time(),
+            "access_count": 0,
         }
         path = self._entry_path(safe)
         with open(path, "w", encoding="utf-8") as f:
@@ -139,6 +164,56 @@ class SessionMemory:
             except Exception:
                 continue
         return entries
+
+    def query_relevant(self, keywords: list, max_tokens: int = 2000, current_session_id: str = "") -> List[dict]:
+        """Return entries relevant to given keywords, within token budget.
+
+        Scores each entry by keyword hits in key+content. Returns top matches
+        sorted by score desc, then type priority, then recency.
+        Uses LLM keyword expansion when available for semantic matching.
+        """
+        entries = self.list_entries()
+        if current_session_id:
+            entries = [e for e in entries
+                       if e.get("scope", "persistent") != "session"
+                       or e.get("session_id") == current_session_id]
+
+        # Semantic keyword expansion via LLM
+        expanded = self._expand_keywords(keywords)
+        kws = [k.lower() for k in expanded if k]
+        if not kws:
+            return []
+
+        scored = []
+        for e in entries:
+            text = (e.get("key", "") + " " + e.get("content", "")).lower()
+            score = sum(1 for k in kws if k in text)
+            if score > 0:
+                scored.append((score, e))
+
+        scored.sort(key=lambda x: (
+            -x[0],
+            _TYPE_PRIORITY.get(x[1].get("type", "context"), 9),
+            -x[1].get("created", 0),
+        ))
+
+        result, used = [], 0
+        for _, e in scored:
+            content = e.get("content", "")
+            cjk = sum(1 for c in content if '一' <= c <= '鿿')
+            cost = (len(content) - cjk) // 4 + int(cjk * 1.5) + 10
+            if used + cost > max_tokens:
+                break
+            result.append(e)
+            used += cost
+
+        # Record access for returned entries
+        for e in result:
+            path = self._entry_path(e.get("key", ""))
+            if os.path.isfile(path):
+                self._record_access(e, path)
+
+        return result
 
     def recent(self, max_tokens: int = 4000, task_filter: str = "", current_session_id: str = "") -> List[dict]:
         """Return entries within a token budget, prioritized by task relevance, type, then recency.
@@ -222,7 +297,174 @@ class SessionMemory:
         return count
 
     def _is_valid(self, entry: dict) -> bool:
-        if entry.get("priority") == "high":
-            return True
+        priority = entry.get("priority", "normal")
+        ttl_days = _PRIORITY_TTL.get(priority)
+        if ttl_days is None:
+            return True  # "high" priority never expires
+        # Use the smaller of priority-based TTL and constructor-specified TTL
+        ttl_seconds = min(ttl_days * 86400, self._ttl) if self._ttl > 0 else ttl_days * 86400
+        if self._ttl == 0:
+            return False
         created = entry.get("created", 0)
-        return time.time() - created <= self._ttl
+        return time.time() - created <= ttl_seconds
+
+    def _record_access(self, entry: dict, path: str):
+        """Increment access count and promote priority if threshold reached."""
+        try:
+            access_count = entry.get("access_count", 0) + 1
+            entry["access_count"] = access_count
+
+            # Auto-promote normal → high after threshold
+            if access_count >= _PROMOTION_THRESHOLD and entry.get("priority") == "normal":
+                entry["priority"] = "high"
+                logger.info("Memory auto-promoted '%s' to high priority (access_count=%d)", entry.get("key"), access_count)
+
+            # Write back
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(entry, f, allow_unicode=True, default_flow_style=False)
+        except Exception as e:
+            logger.warning("Failed to record access for %s: %s", entry.get("key"), e)
+
+    def _try_dedup(self, key: str, content: str, mem_type: str) -> Optional[str]:
+        """Check if semantically duplicate entry exists. If yes, merge and return existing key."""
+        if not self._llm_fn:
+            return None
+
+        candidates = self._find_dedup_candidates(key, content)
+        for candidate in candidates:
+            if self._llm_judge_duplicate(candidate, content):
+                return self._merge_entries(candidate["key"], content)
+        return None
+
+    def _find_dedup_candidates(self, key: str, content: str) -> List[dict]:
+        """Find existing entries that might be duplicates of the new entry."""
+        entries = self.list_entries()
+        # Extract keywords from key and content
+        words = re.findall(r'\w+', (key + " " + content).lower())
+        keywords = [w for w in words if len(w) > 3][:8]
+
+        if not keywords:
+            return []
+
+        # Score by keyword overlap
+        scored = []
+        for e in entries:
+            text = (e.get("key", "") + " " + e.get("content", "")).lower()
+            score = sum(1 for k in keywords if k in text)
+            if score > 0:
+                scored.append((score, e))
+
+        scored.sort(key=lambda x: -x[0])
+        return [e for _, e in scored[:5]]
+
+    def _llm_judge_duplicate(self, existing: dict, new_content: str) -> bool:
+        """Ask LLM whether new content is semantically duplicate of existing entry.
+
+        Uses confidence scoring — only merges when confidence >= threshold.
+        """
+        if not self._llm_fn:
+            return False
+
+        try:
+            prompt = (
+                "Are these two memory entries semantically duplicate (same core information)?\n\n"
+                f"Existing [{existing.get('type')}] {existing.get('key')}: {existing.get('content', '')[:300]}\n\n"
+                f"New: {new_content[:300]}\n\n"
+                "Reply with a confidence score 0.0-1.0 (1.0 = definitely duplicate, 0.0 = completely different).\n"
+                "Output ONLY the number, e.g. 0.85"
+            )
+            answer = self._llm_fn(prompt).strip()
+            # Extract float from response
+            score_match = re.search(r'(\d+\.?\d*)', answer)
+            if score_match:
+                confidence = float(score_match.group(1))
+                confidence = max(0.0, min(1.0, confidence))
+                logger.info("Dedup confidence for '%s' vs new: %.2f (threshold: %.2f)",
+                            existing.get("key"), confidence, _DEDUP_CONFIDENCE_THRESHOLD)
+                return confidence >= _DEDUP_CONFIDENCE_THRESHOLD
+            # Fallback: treat "yes" as 1.0, "no" as 0.0
+            return answer.lower().startswith("yes")
+        except Exception as e:
+            logger.warning("LLM dedup judge failed: %s", e)
+            return False
+
+    def _merge_entries(self, existing_key: str, new_content: str) -> str:
+        """Merge new content into existing entry, return merged key."""
+        path = self._entry_path(existing_key)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                entry = yaml.safe_load(f)
+
+            # Append new content if different
+            old_content = entry.get("content", "")
+            if new_content not in old_content:
+                entry["content"] = f"{old_content}\n\n[Updated {time.strftime('%Y-%m-%d')}] {new_content}"
+            entry["created"] = time.time()  # Update timestamp
+
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.dump(entry, f, allow_unicode=True, default_flow_style=False)
+
+            return existing_key
+        except Exception as e:
+            logger.warning("Failed to merge entries: %s", e)
+            return existing_key
+
+    def _expand_keywords(self, keywords: list) -> list:
+        """Use LLM to expand keywords with synonyms/aliases for semantic matching.
+
+        Results are cached for 5 minutes to avoid repeated LLM calls for the same keywords.
+        """
+        if not self._llm_fn or not keywords:
+            return keywords
+
+        # Check cache — use sorted tuple as cache key for order-independence
+        cache_key = tuple(sorted(k.lower() for k in keywords[:5]))
+        now = time.time()
+        if cache_key in self._expansion_cache:
+            if now - self._expansion_cache_ts.get(cache_key, 0) < self._expansion_cache_ttl:
+                return self._expansion_cache[cache_key]
+            else:
+                # Expired
+                del self._expansion_cache[cache_key]
+                del self._expansion_cache_ts[cache_key]
+
+        try:
+            kw_str = ", ".join(f'"{k}"' for k in keywords[:5])
+            prompt = (
+                "Expand these technical/error keywords with common synonyms and aliases. "
+                "Return JSON mapping each keyword to a list of variants.\n\n"
+                f"Input: [{kw_str}]\n\n"
+                "Example output: "
+                '{"OOM": ["oom", "out of memory", "memory exhaustion", "cuda malloc failed"], '
+                '"batch_size": ["batch_size", "micro_batch", "global_batch"]}\n\n'
+                "Output JSON only, no explanation:"
+            )
+            response = self._llm_fn(prompt).strip()
+
+            # Extract JSON from response (handle markdown code blocks)
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                response = json_match.group(0)
+
+            expansion = json.loads(response)
+            expanded = []
+            for kw in keywords:
+                expanded.append(kw)
+                variants = expansion.get(kw, [])
+                if isinstance(variants, list):
+                    expanded.extend(variants[:5])
+
+            # Store in cache
+            self._expansion_cache[cache_key] = expanded
+            self._expansion_cache_ts[cache_key] = now
+            # Evict old entries if cache grows too large
+            if len(self._expansion_cache) > 50:
+                oldest_key = min(self._expansion_cache_ts, key=self._expansion_cache_ts.get)
+                del self._expansion_cache[oldest_key]
+                del self._expansion_cache_ts[oldest_key]
+
+            logger.info("Keyword expansion: %d → %d keywords (cached)", len(keywords), len(expanded))
+            return expanded
+        except Exception as e:
+            logger.warning("LLM keyword expansion failed: %s, using original keywords", e)
+            return keywords

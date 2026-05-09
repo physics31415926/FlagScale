@@ -35,7 +35,7 @@ COMPACTION_NOTICE = (
     "</context-compacted>"
 )
 
-MAX_SUMMARY_TOKENS = 4000
+MAX_SUMMARY_TOKENS = 4000  # default, overridden dynamically as max_context_tokens * 0.05
 TRUNCATE_THRESHOLD = 2000
 KEEP_RECENT = 16
 AGING_WINDOW = 10
@@ -288,9 +288,7 @@ class HistoryManager:
     4. Notify agent that compaction happened
     """
 
-    # Progressive compaction: each successive compaction targets a lower ratio,
-    # leaving more buffer so the next compaction is delayed longer.
-    _COMPACTION_RATIOS = [0.80, 0.70, 0.60, 0.50]
+    _COMPACTION_RATIOS = [0.60, 0.50, 0.40, 0.35]
 
     def __init__(self, max_context_tokens: int = 100000):
         self.max_context_tokens = max_context_tokens
@@ -359,21 +357,21 @@ class HistoryManager:
         return total / self.max_context_tokens
 
     def _get_inflation_ratio(self) -> float:
-        """Return ratio of actual API tokens to local estimate.
+        """Return EMA-smoothed ratio of actual API tokens to local estimate.
 
-        When the API reports actual_input_tokens, local estimates can be off
-        by 1.5-2x.  This ratio lets compaction target a *local-estimate*
-        budget that, after inflation, lands at the real target.
-
-        Falls back to last known ratio if actual_input_tokens is not available.
+        Uses exponential moving average to avoid single-point spikes (e.g. from
+        skill load/unload changing system prompt size). Outliers (ratio > 3.0)
+        are discarded to prevent corruption.
         """
         estimated = sum(_message_tokens(m) for m in self._messages)
         actual = self._actual_input_tokens or 0
         if actual > 0 and estimated > 0:
-            ratio = max(actual / estimated, 1.0)
-            self._last_inflation_ratio = ratio  # Remember for future use
-            return ratio
-        return self._last_inflation_ratio  # Use last known ratio as fallback
+            current_ratio = max(actual / estimated, 1.0)
+            if current_ratio > 3.0:
+                return self._last_inflation_ratio
+            self._last_inflation_ratio = 0.7 * self._last_inflation_ratio + 0.3 * current_ratio
+            return self._last_inflation_ratio
+        return self._last_inflation_ratio
 
     def force_compact(self, target_ratio: float = 0.50) -> bool:
         """Force compaction to a target ratio. Returns True if compaction occurred."""
@@ -445,7 +443,7 @@ class HistoryManager:
         This avoids the re-read problem: the agent retains enough context to know
         what files contain and what commands produced, without needing to re-execute.
 
-        Only called when context pressure > 0.60.
+        Only called when context pressure > 0.70.
         """
         turn_start = self._find_turn_start()
         turn_messages = self._messages[turn_start:]
@@ -453,9 +451,9 @@ class HistoryManager:
         if len(turn_messages) <= keep_last + 2:
             return False
 
-        # Target: reduce pressure to ~0.45 of budget
+        # Target: reduce pressure to ~0.50 of budget
         current_tokens = sum(_message_tokens(m) for m in self._messages)
-        target_tokens = int(self.max_context_tokens * 0.45)
+        target_tokens = int(self.max_context_tokens * 0.50)
         tokens_to_free = current_tokens - target_tokens
         if tokens_to_free <= 0:
             return False
@@ -819,15 +817,36 @@ class HistoryManager:
         return f"{SUMMARIZE_PROMPT}{anchor_section}\n\n---\nConversation segment:\n{combined}"
 
     def _merge_summary(self, new_summary: str):
-        """Merge new summary into accumulated summary, keeping total under limit."""
+        """Merge new summary into accumulated summary, keeping total under limit.
+
+        Uses dynamic limit: 5% of max_context_tokens (default 10K for 200K window).
+        When over limit, fuses the two oldest sections via summarizer rather than
+        dropping outright, preserving key decisions from early context.
+        """
+        dynamic_limit = max(MAX_SUMMARY_TOKENS, int(self.max_context_tokens * 0.05))
         if self._accumulated_summary:
             merged = f"{self._accumulated_summary}\n\n---\n\n{new_summary}"
         else:
             merged = new_summary
-        # Trim if over token limit
-        while _estimate_tokens(merged) > MAX_SUMMARY_TOKENS and "\n\n---\n\n" in merged:
-            # Drop the oldest section
-            _, _, merged = merged.partition("\n\n---\n\n")
+        while _estimate_tokens(merged) > dynamic_limit and "\n\n---\n\n" in merged:
+            # Fuse the two oldest sections instead of dropping
+            sections = merged.split("\n\n---\n\n")
+            if len(sections) <= 2:
+                # Only 2 sections left — drop the oldest as last resort
+                merged = sections[-1]
+                break
+            oldest_two = sections[0] + "\n" + sections[1]
+            if self._summarizer and _estimate_tokens(oldest_two) > 500:
+                try:
+                    fused = self._summarizer(
+                        f"Fuse these two summaries into one concise summary:\n\n{oldest_two}"
+                    )
+                    sections = [fused] + sections[2:]
+                except Exception:
+                    sections = sections[1:]
+            else:
+                sections = sections[1:]
+            merged = "\n\n---\n\n".join(sections)
         self._accumulated_summary = merged
 
     def _inject_summary(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -863,7 +882,8 @@ class HistoryManager:
         """Emergency truncation when normal compaction fails to reach target.
 
         Keeps system/summary messages at the front, then fills from the most
-        recent messages backward with aggressive truncation.
+        recent messages backward. Truncation budget per message is based on
+        heuristic value score: high-value messages get more space.
         """
         head = []
         body = []
@@ -882,7 +902,14 @@ class HistoryManager:
         kept = []
         used = 0
         for msg in reversed(body):
-            truncated = _truncate_message(msg, max_chars=400)
+            score = _heuristic_score(msg)
+            if score >= 7:
+                char_limit = 1200
+            elif score >= 4:
+                char_limit = 600
+            else:
+                char_limit = 200
+            truncated = _truncate_message(msg, max_chars=char_limit)
             t = _message_tokens(truncated)
             if used + t > budget:
                 break

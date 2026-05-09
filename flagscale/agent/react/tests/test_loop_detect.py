@@ -27,21 +27,21 @@ class TestGetToolCallKey:
 
     def test_read_file_key(self):
         key = self.agent._get_tool_call_key("read_file", {"path": "/a/b.py", "start_line": 10, "end_line": 50})
-        assert key == ("read_file", "/a/b.py", 10, 50)
+        assert key == ("read_file", "/a/b.py", "10", "50")
 
     def test_read_file_key_defaults(self):
         key = self.agent._get_tool_call_key("read_file", {"path": "/a/b.py"})
-        assert key == ("read_file", "/a/b.py", 0, 0)
+        assert key == ("read_file", "/a/b.py", "", "")
 
     def test_write_file_key(self):
         key = self.agent._get_tool_call_key("write_file", {"path": "/x/y.py"})
-        assert key == ("write_file", "/x/y.py")
+        assert key == ("write_file", "/x/y.py", "")
 
-    def test_edit_file_key_includes_old_string_hash(self):
+    def test_edit_file_key_includes_old_string(self):
         key = self.agent._get_tool_call_key("edit_file", {"file_path": "/x.py", "old_string": "hello"})
         assert key[0] == "edit_file"
         assert key[1] == "/x.py"
-        assert isinstance(key[2], int)
+        assert key[2] == "hello"
 
     def test_load_skill_key(self):
         key = self.agent._get_tool_call_key("load_skill", {"name": "train-run"})
@@ -64,7 +64,8 @@ class TestCheckLoopDetection:
         assert result == ""
 
     def test_loop_detected_at_threshold(self):
-        for _ in range(2):
+        # Threshold is 3: need 3 entries in _recent_tool_calls before 4th triggers
+        for _ in range(3):
             self.agent._check_loop_detection("shell", {"command": "cat log.txt"})
         result = self.agent._check_loop_detection("shell", {"command": "cat log.txt"})
         assert "LOOP DETECTION" in result

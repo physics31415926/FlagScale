@@ -1,5 +1,6 @@
 """Task plan — structured multi-step planning with persistence."""
 
+import logging
 import os
 import threading
 import time
@@ -10,8 +11,14 @@ from typing import Dict, List, Optional
 import yaml
 
 
+logger = logging.getLogger(__name__)
+
 VALID_STEP_STATUSES = ("pending", "doing", "done", "skipped", "blocked")
 VALID_PLAN_STATUSES = ("active", "paused", "completed", "abandoned")
+
+# Auto-sync thresholds
+_STEP_STALE_TURNS = 10  # A "doing" step with no update for this many turns is stale
+_PLAN_REBUILD_FAILURES = 3  # Consecutive failures before suggesting rebuild
 
 STATUS_ICONS = {
     "pending": " ",
@@ -435,3 +442,126 @@ class TaskPlan:
             except Exception:
                 continue
         return count
+
+    # ── Auto-sync: tool results → plan step updates ──────────────────────
+
+    def auto_sync_step(self, tool_name: str, success: bool, result_summary: str = "", turn: int = 0):
+        """Auto-update the current 'doing' step based on tool execution results.
+
+        Called after productive tool execution to keep plan in sync with reality.
+        - success=True on a productive tool → mark step done
+        - success=False → append failure note to step
+        """
+        with self._lock:
+            plan = self.get_active()
+            if not plan:
+                return
+
+            doing_steps = [s for s in plan["steps"] if s["status"] == "doing"]
+            if not doing_steps:
+                return
+
+            step = doing_steps[0]
+
+            # Track turn for staleness detection
+            step["_last_activity_turn"] = turn
+
+            if success and tool_name in ("write_file", "edit_file"):
+                # File write/edit completing a step — mark done
+                step["status"] = "done"
+                if result_summary:
+                    step["notes"] = (step.get("notes", "") + f" ✓ {result_summary}").strip()
+                # Auto-advance next step
+                self._auto_advance(plan)
+                logger.info("Plan auto-sync: step %d → done (tool: %s)", step["id"], tool_name)
+            elif not success:
+                # Failure — append to notes
+                failures = step.get("_failure_count", 0) + 1
+                step["_failure_count"] = failures
+                note = f" [fail #{failures}: {result_summary[:80]}]" if result_summary else f" [fail #{failures}]"
+                step["notes"] = (step.get("notes", "") + note).strip()
+                logger.info("Plan auto-sync: step %d failure #%d", step["id"], failures)
+
+            self._save(plan)
+
+    def _auto_advance(self, plan: dict):
+        """Advance the next pending step to 'doing' after current step completes."""
+        for s in plan["steps"]:
+            if s["status"] == "pending":
+                deps = s.get("depends_on", [])
+                if not deps or all(
+                    self._find_step(plan, d)["status"] in ("done", "skipped")
+                    for d in deps
+                ):
+                    s["status"] = "doing"
+                    break
+
+    # ── Consistency check ────────────────────────────────────────────────
+
+    def check_consistency(self, current_turn: int) -> Optional[str]:
+        """Check plan consistency and return a warning message if issues found.
+
+        Called periodically (every N turns) to detect:
+        - Stale "doing" steps (no activity for too many turns)
+        - Steps with multiple failures still marked "doing"
+        - Plan overall progress stalled
+        """
+        plan = self.get_active()
+        if not plan:
+            return None
+
+        issues = []
+        doing_steps = [s for s in plan["steps"] if s["status"] == "doing"]
+
+        for step in doing_steps:
+            last_activity = step.get("_last_activity_turn", 0)
+            turns_stale = current_turn - last_activity if last_activity else current_turn
+
+            # Stale step detection
+            if turns_stale >= _STEP_STALE_TURNS:
+                issues.append(
+                    f"Step {step['id']} ('{step['title'][:40]}') has been 'doing' for "
+                    f"{turns_stale} turns without progress. Consider: is it still relevant?"
+                )
+
+            # Repeated failure detection
+            failures = step.get("_failure_count", 0)
+            if failures >= 3:
+                issues.append(
+                    f"Step {step['id']} ('{step['title'][:40]}') has {failures} failures. "
+                    f"Consider skipping it or replanning."
+                )
+
+        if not issues:
+            return None
+
+        return (
+            "\n[PLAN CONSISTENCY CHECK]\n"
+            + "\n".join(f"  ⚠ {issue}" for issue in issues)
+            + "\nConsider: plan_update(action='abandon') + plan_create to replan, "
+            "or plan_update(action='step_skip') for blocked steps."
+        )
+
+    def should_rebuild(self, consecutive_failures: int) -> bool:
+        """Return True if the plan should be rebuilt due to repeated failures."""
+        if consecutive_failures < _PLAN_REBUILD_FAILURES:
+            return False
+        plan = self.get_active()
+        if not plan:
+            return False
+        doing_steps = [s for s in plan["steps"] if s["status"] == "doing"]
+        if doing_steps:
+            failures = doing_steps[0].get("_failure_count", 0)
+            return failures >= _PLAN_REBUILD_FAILURES
+        return False
+
+    def record_turn_activity(self, turn: int):
+        """Record that the current turn had activity on the active plan's doing step."""
+        with self._lock:
+            plan = self.get_active()
+            if not plan:
+                return
+            doing_steps = [s for s in plan["steps"] if s["status"] == "doing"]
+            if doing_steps:
+                doing_steps[0]["_last_activity_turn"] = turn
+                self._save(plan)

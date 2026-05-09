@@ -1,8 +1,76 @@
-"""Read file tool with line range support."""
+"""Read file tool with line range support and short-term caching."""
 
 import os
+import time
 
 from flagscale.agent.react.tools.base import Tool
+
+
+class FileCache:
+    """Short-term file content cache with TTL and invalidation on write.
+
+    Design principles:
+    - TTL-based expiry: cached content expires after _TTL seconds
+    - mtime-based validation: if file mtime changes, cache is invalid
+    - Explicit invalidation: write_file/edit_file calls invalidate the path
+    - Memory-bounded: max _MAX_ENTRIES, LRU eviction
+    """
+
+    _TTL = 30  # seconds
+    _MAX_ENTRIES = 50
+
+    def __init__(self):
+        self._store = {}  # path -> (content_lines, mtime, cached_at)
+
+    def get(self, path: str):
+        """Return cached lines or None if cache miss/stale."""
+        entry = self._store.get(path)
+        if entry is None:
+            return None
+        content_lines, cached_mtime, cached_at = entry
+        # TTL check
+        if time.time() - cached_at > self._TTL:
+            del self._store[path]
+            return None
+        # mtime check — file may have been modified externally
+        try:
+            current_mtime = os.path.getmtime(path)
+            if current_mtime != cached_mtime:
+                del self._store[path]
+                return None
+        except OSError:
+            del self._store[path]
+            return None
+        return content_lines
+
+    def put(self, path: str, lines: list):
+        """Cache file content."""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return
+        # LRU eviction: remove oldest entry if at capacity
+        if len(self._store) >= self._MAX_ENTRIES and path not in self._store:
+            oldest_key = min(self._store, key=lambda k: self._store[k][2])
+            del self._store[oldest_key]
+        self._store[path] = (lines, mtime, time.time())
+
+    def invalidate(self, path: str):
+        """Explicitly invalidate a path (called after write/edit)."""
+        self._store.pop(path, None)
+
+    def invalidate_all(self):
+        """Clear entire cache."""
+        self._store.clear()
+
+
+# Module-level singleton so it's shared across tool instances
+_file_cache = FileCache()
+
+
+def get_file_cache() -> FileCache:
+    """Access the shared file cache (for invalidation from write/edit tools)."""
+    return _file_cache
 
 
 class ReadFileTool(Tool):
@@ -50,11 +118,20 @@ class ReadFileTool(Tool):
         if os.path.isdir(path):
             return f"ERROR: Path is a directory: {path}"
 
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-        except Exception as e:
-            return f"ERROR: {e}"
+        # Try cache first (only for full-file reads without line range)
+        is_full_read = (start <= 1 and end is None)
+        lines = None
+        if is_full_read:
+            lines = _file_cache.get(path)
+
+        if lines is None:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except Exception as e:
+                return f"ERROR: {e}"
+            # Cache full file content
+            _file_cache.put(path, lines)
 
         total = len(lines)
         start = max(1, start)

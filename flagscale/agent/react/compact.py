@@ -144,22 +144,39 @@ class CompactionMixin:
                     continue
             if len(scores) == len(messages):
                 return scores
+            # Tolerate small mismatches (±10%): align by truncating or padding with median
+            diff = len(scores) - len(messages)
+            if abs(diff) <= max(1, len(messages) // 10):
+                if diff > 0:
+                    scores = scores[:len(messages)]
+                else:
+                    median = sorted(scores)[len(scores) // 2] if scores else 5
+                    scores.extend([median] * (-diff))
+                logger.warning("Scorer returned %d scores for %d messages, aligned by %s",
+                               len(scores) + diff, len(messages), "truncation" if diff > 0 else "padding")
+                return scores
             logger.warning("Scorer returned %d scores for %d messages, falling back", len(scores), len(messages))
         except Exception as e:
             logger.warning("LLM scorer failed: %s", e)
 
         return []
 
-    def _pre_compaction_memory_dump(self):
-        """Auto-save critical context before compaction destroys it."""
+    def _pre_compaction_memory_dump(self, droppable_messages=None):
+        """Auto-save critical context before compaction destroys it.
+
+        Scans droppable messages (or recent 20 if not provided) for errors,
+        solutions, attempted fixes, and modified files. Injects a warning
+        message into history if the dump fails so the agent knows context was lost.
+        """
         try:
-            recent = self.history.messages[-20:]
+            scan_msgs = droppable_messages if droppable_messages else self.history.messages[-20:]
             errors_found = []
             solutions_found = []
+            attempted_fixes = []
             files_modified = []
             current_approach = ""
 
-            for msg in recent:
+            for msg in scan_msgs:
                 text = ""
                 if msg.get("role") == "assistant":
                     content = msg.get("content", "")
@@ -187,6 +204,11 @@ class CompactionMixin:
                     for line in text.split("\n"):
                         if any(kw in line.lower() for kw in ("fixed", "solution", "workaround", "resolved")):
                             solutions_found.append(line.strip()[:150])
+                # Track attempted fixes (tried X but Y pattern)
+                if any(kw in text.lower() for kw in ("tried", "attempted", "but failed", "didn't work", "still fails")):
+                    for line in text.split("\n"):
+                        if any(kw in line.lower() for kw in ("tried", "attempted", "but", "didn't work")):
+                            attempted_fixes.append(line.strip()[:150])
                 if "write_file" in text or "edit_file" in text:
                     paths = re.findall(r'["\']([/\w._-]+\.(py|yaml|sh))["\']', text)
                     files_modified.extend(p[0] for p in paths[:5])
@@ -199,6 +221,8 @@ class CompactionMixin:
                 parts.append(f"Errors: {'; '.join(errors_found[:5])}")
             if solutions_found:
                 parts.append(f"Solutions: {'; '.join(solutions_found[:5])}")
+            if attempted_fixes:
+                parts.append(f"Attempted fixes (FAILED): {'; '.join(attempted_fixes[:5])}")
             if files_modified:
                 parts.append(f"Files modified: {', '.join(set(files_modified)[:10])}")
             if current_approach:
@@ -214,13 +238,39 @@ class CompactionMixin:
             self.session_memory.put(
                 key, "context", checkpoint_content,
                 self._session_id,
-                priority="high",
+                priority="critical",
             )
 
-            logger.info("Pre-compaction memory dump: saved checkpoint with %d errors, %d solutions",
-                        len(errors_found), len(solutions_found))
+            # Sync attempted fixes to ExperimentManager so they survive compaction
+            if attempted_fixes and hasattr(self, '_experiment_manager'):
+                exp_name = self._experiment_manager.get_current_experiment()
+                if exp_name:
+                    exp = self._experiment_manager.read(exp_name)
+                    if exp:
+                        existing_learnings = exp.get("learnings", [])
+                        for fix in attempted_fixes[:5]:
+                            entry = f"[FAILED] {fix}"
+                            if entry not in existing_learnings:
+                                existing_learnings.append(entry)
+                        exp["learnings"] = existing_learnings[-10:]
+                        self._experiment_manager._save(exp_name, exp)
+
+            logger.info("Pre-compaction memory dump: saved checkpoint with %d errors, %d solutions, %d attempted fixes",
+                        len(errors_found), len(solutions_found), len(attempted_fixes))
         except Exception as e:
             logger.warning("Pre-compaction memory dump failed: %s", e)
+            # Inject warning so agent knows context was lost without backup
+            try:
+                self.history.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM WARNING] Pre-compaction memory dump FAILED. "
+                        "Critical context from dropped messages may be permanently lost. "
+                        "Re-read relevant files and re-check state before proceeding."
+                    ),
+                })
+            except Exception:
+                pass
 
     def _get_compaction_anchors(self) -> list:
         """Extract mandatory anchors for summary preservation."""
@@ -233,7 +283,7 @@ class CompactionMixin:
             if plan:
                 doing = [s for s in plan.get("steps", []) if s.get("status") == "doing"]
                 if doing:
-                    anchors.append(f"Current plan step: {doing[0].get('text', '')[:80]}")
+                    anchors.append(f"Current plan step: {doing[0].get('title', '')[:80]}")
 
             entries = self.session_memory.list_entries()
             high_pri = [e for e in entries if e.get("priority") == "high"]

@@ -10,6 +10,9 @@ import pytest
 from flagscale.agent.react.tools.monitor import MonitorTool
 
 
+_LIVE_PATTERN = "pytest"  # always matches the test runner process
+
+
 class TestMonitorTool:
 
     def test_basic_file_watch_timeout(self, tmp_path):
@@ -17,14 +20,16 @@ class TestMonitorTool:
         log_file.write_text("line 1\n")
 
         tool = MonitorTool()
-        result = tool.execute(file=str(log_file), duration=3, interval=1)
+        result = tool.execute(file=str(log_file), duration=3, interval=1,
+                              process_pattern=_LIVE_PATTERN)
 
         assert "timeout" in result
         assert "polls" in result
 
     def test_file_not_found_waits(self, tmp_path):
         tool = MonitorTool()
-        result = tool.execute(file=str(tmp_path / "nonexistent.log"), duration=3, interval=1)
+        result = tool.execute(file=str(tmp_path / "nonexistent.log"), duration=3, interval=1,
+                              process_pattern=_LIVE_PATTERN)
         assert "timeout" in result
 
     def test_target_step_reached(self, tmp_path):
@@ -43,7 +48,8 @@ class TestMonitorTool:
         t.start()
 
         tool = MonitorTool()
-        result = tool.execute(file=str(log_file), target_step=10, duration=10, interval=1)
+        result = tool.execute(file=str(log_file), target_step=10, duration=10, interval=1,
+                              process_pattern=_LIVE_PATTERN)
 
         assert "target_reached" in result
         assert "step=0000010" in result
@@ -64,7 +70,7 @@ class TestMonitorTool:
         tool = MonitorTool()
         result = tool.execute(
             file=str(log_file), success_pattern="training complete",
-            duration=10, interval=1
+            duration=10, interval=1, process_pattern=_LIVE_PATTERN
         )
 
         assert "success" in result.lower() or "SUCCESS" in result
@@ -85,7 +91,7 @@ class TestMonitorTool:
         tool = MonitorTool()
         result = tool.execute(
             file=str(log_file), fail_pattern="CUDA error",
-            duration=10, interval=1
+            duration=10, interval=1, process_pattern=_LIVE_PATTERN
         )
 
         assert "error_detected" in result or "FAIL" in result
@@ -104,7 +110,8 @@ class TestMonitorTool:
         t.start()
 
         tool = MonitorTool()
-        result = tool.execute(file=str(log_file), duration=10, interval=1)
+        result = tool.execute(file=str(log_file), duration=10, interval=1,
+                              process_pattern=_LIVE_PATTERN)
 
         assert "interesting_change" in result
         assert "NCCL" in result
@@ -112,13 +119,15 @@ class TestMonitorTool:
 
     def test_command_mode(self):
         tool = MonitorTool()
-        result = tool.execute(command="echo hello", duration=3, interval=1)
+        result = tool.execute(command="echo hello", duration=3, interval=1,
+                              process_pattern=_LIVE_PATTERN)
         # Should timeout since output doesn't change
         assert "timeout" in result
 
     def test_both_file_and_command_accepted(self):
         tool = MonitorTool()
-        result = tool.execute(file="/tmp/nonexistent_xyz", command="echo y", duration=2, interval=1)
+        result = tool.execute(file="/tmp/nonexistent_xyz", command="echo y", duration=2, interval=1,
+                              process_pattern=_LIVE_PATTERN)
         # No longer an error — tool accepts both; just check it runs
         assert "ERROR" not in result or "No such file" in result
 
@@ -140,7 +149,8 @@ class TestMonitorTool:
         t.start()
 
         tool = MonitorTool()
-        result = tool.execute(file=str(log_file), duration=8, interval=1)
+        result = tool.execute(file=str(log_file), duration=8, interval=1,
+                              process_pattern=_LIVE_PATTERN)
 
         # Metrics are recorded but don't break the loop (timeout expected)
         assert "timeout" in result
