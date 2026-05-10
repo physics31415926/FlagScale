@@ -63,3 +63,37 @@ After 2+ failures, forces this order:
 ## Integration
 
 Gates run in `_run_pre_execution_gates(tool_name, arguments)` called from the main agent loop after parsing tool calls but before execution. Hard gates short-circuit (first block wins). All soft gates run and their messages are concatenated.
+
+### Gate Override Mechanism
+
+Hard gates can be overridden by the LLM when it is certain the gate does not apply to its situation. This prevents gates from being too rigid for edge cases (e.g., custom models that don't follow standard Megatron patterns).
+
+**How it works:**
+1. Gate blocks a tool call and includes the override key in its message (e.g., `PIPELINE_COMPREHENSION`)
+2. LLM includes in its response: `[GATE_OVERRIDE: PIPELINE_COMPREHENSION] Reason: <detailed justification>`
+3. Agent parses the override declaration from the response text
+4. On the NEXT tool call, if the same gate fires again, the override is consumed and the gate passes (one-shot)
+
+**Design principles:**
+- Override is one-shot: it passes the gate exactly once, then expires
+- Override requires a clear reason — the LLM must explain WHY the gate doesn't apply
+- Override key is derived from gate method name: `_check_xxx_gate` → `XXX`
+- The override hint is shown after 1st block (subtle), becomes more prominent at 2nd and 3rd blocks
+- This prevents the LLM from being permanently stuck when a gate's heuristic doesn't match the actual situation
+
+### Data→Model Interface Gate
+
+Added to prevent the #1 cause of porting rework: writing model.forward() without knowing what the data pipeline produces.
+
+- Triggers when writing model code (files matching model/forward/backbone/head patterns)
+- Checks if data→model interface is documented in session memory
+- Passes if the code itself shows awareness of real data keys (input_ids, attention_mask, etc.)
+- Override key: `DATA_MODEL_INTERFACE`
+
+### No Dummy Data Gate
+
+Strictly forbids using torch.rand/zeros/ones as model input during porting verification.
+
+- Triggers when writing/running code that invokes model forward with synthetic tensors
+- Does NOT trigger for model definition files (class with def forward)
+- Override key: `NO_DUMMY_DATA`

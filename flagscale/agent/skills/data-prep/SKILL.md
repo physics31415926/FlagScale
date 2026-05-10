@@ -40,6 +40,28 @@ suggests: [env-setup]
 
 # Data Preparation for FlagScale
 
+## CRITICAL: Data Pipeline is EQUALLY Important as Model Adaptation
+
+Data pipeline is NOT a follow-up task after model porting. It is a co-equal deliverable that must be designed alongside the model. If you implement model.forward() without knowing what get_batch produces, you WILL rewrite the model later.
+
+**Before writing ANY data pipeline or model code:**
+1. Document the data→model interface contract (see `model-porter` skill, Analysis 4)
+2. Know the parallelism strategy
+3. Understand the source data format AND the model's expected input format
+
+🚫 **NEVER use dummy/synthetic data** (torch.rand/zeros/ones) for model verification. ALL verification must flow through the real data pipeline. No exceptions — not for "quick checks", not for "shape testing", not as a placeholder.
+
+## ABSOLUTE RULE: No Parallelism = Failed Megatron Integration
+
+**A data pipeline without parallelism awareness is a FAILED Megatron integration.** This is not optional, not "add later", not "nice to have". It is the fundamental contract of distributed training in Megatron.
+
+If your get_batch does NOT:
+- Call `broadcast_data()` for TP rank consistency
+- Guard inputs with `pre_process`/`post_process` for PP stages
+- Respect DP micro-batch distribution via sampler
+
+...then it WILL deadlock or produce wrong results at runtime. Every single get_batch in Megatron handles parallelism. There are zero exceptions.
+
 ## CRITICAL: Parallelism Strategy is a Prerequisite
 
 **Before implementing ANY data pipeline code, you MUST know the parallelism strategy.**

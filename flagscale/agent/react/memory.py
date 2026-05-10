@@ -78,35 +78,54 @@ class SessionMemory:
         return os.path.join(self._dir, f"{key}.yaml")
 
     def get(self, key: str) -> Optional[dict]:
+        """Get entry by key. Falls back to semantic search if exact match not found."""
         safe = self.sanitize_key(key) if not self.is_valid_key(key) else key
         path = self._entry_path(safe)
-        if not os.path.isfile(path):
+
+        # Try exact match first
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    entry = yaml.safe_load(f)
+                if self._is_valid(entry):
+                    self._record_access(entry, path)
+                    return entry
+                else:
+                    self.delete(safe)
+            except Exception:
+                pass
+
+        # Fallback: semantic search by key words
+        keywords = re.findall(r'\w+', key.lower())
+        keywords = [w for w in keywords if len(w) > 2]
+        if not keywords:
             return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                entry = yaml.safe_load(f)
-        except Exception:
-            return None
-        if not self._is_valid(entry):
-            self.delete(safe)
-            return None
-        self._record_access(entry, path)
-        return entry
+
+        relevant = self.query_relevant(keywords, max_tokens=500)
+        if relevant:
+            logger.info("Memory get('%s'): exact miss, semantic fallback returned '%s'", key, relevant[0].get("key"))
+            return relevant[0]
+        return None
 
     def put(self, key: str, mem_type: str, content: str, session_id: str = "", task: str = "", priority: str = "normal", scope: str = "persistent"):
         os.makedirs(self._dir, exist_ok=True)
         safe = self.sanitize_key(key) if not self.is_valid_key(key) else key
 
-        # Auto-dedup: check if semantically duplicate entry exists
-        merged_key = self._try_dedup(safe, content, mem_type)
-        if merged_key:
-            logger.info("Memory dedup: merged into existing key '%s'", merged_key)
-            return self._entry_path(merged_key)
+        # Find and merge related entries (keyword overlap >= 50%)
+        merged_content = content
+        merged_from = self._find_and_merge_related(safe, content)
+        if merged_from:
+            merged_content = content
+            for old_entry in merged_from:
+                old_content = old_entry.get("content", "")
+                if old_content and old_content not in merged_content:
+                    merged_content = f"{merged_content}\n\n{old_content}"
+            logger.info("Memory put('%s'): merged %d related entries", safe, len(merged_from))
 
         entry = {
             "key": safe,
             "type": mem_type,
-            "content": content,
+            "content": merged_content,
             "session_id": session_id,
             "task": task,
             "priority": priority,
@@ -118,6 +137,89 @@ class SessionMemory:
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(entry, f, allow_unicode=True, default_flow_style=False)
         return path
+
+    def _find_and_merge_related(self, new_key: str, new_content: str) -> List[dict]:
+        """Find entries related to new content using LLM judgment, remove them (content merged into new key).
+
+        If no LLM is available, falls back to keyword overlap heuristic.
+        """
+        if not os.path.isdir(self._dir):
+            return []
+
+        entries = self.list_entries()
+        candidates = [e for e in entries if e.get("key") != new_key]
+        if not candidates:
+            return []
+
+        # Use LLM to judge relatedness
+        if self._llm_fn:
+            return self._llm_find_related(new_key, new_content, candidates)
+
+        # Fallback: keyword overlap (no LLM available)
+        new_words = set(re.findall(r'\w+', (new_key + " " + new_content).lower()))
+        new_words = {w for w in new_words if len(w) > 2}
+        if not new_words:
+            return []
+
+        merged = []
+        for entry in candidates:
+            existing_key = entry.get("key", "")
+            old_words = set(re.findall(r'\w+', (existing_key + " " + entry.get("content", "")).lower()))
+            old_words = {w for w in old_words if len(w) > 2}
+            if not old_words:
+                continue
+            overlap = len(new_words & old_words)
+            smaller = min(len(new_words), len(old_words))
+            if smaller > 0 and overlap / smaller >= 0.5:
+                merged.append(entry)
+                path = self._entry_path(existing_key)
+                if os.path.isfile(path):
+                    os.remove(path)
+        return merged
+
+    def _llm_find_related(self, new_key: str, new_content: str, candidates: List[dict]) -> List[dict]:
+        """Use LLM to identify which existing entries should be merged with the new one."""
+        # Build a concise summary of candidates for LLM
+        candidate_summaries = []
+        for i, e in enumerate(candidates[:15]):  # Cap to avoid huge prompts
+            summary = f"{i}: [{e.get('type','?')}] {e.get('key','')} — {e.get('content','')[:150]}"
+            candidate_summaries.append(summary)
+
+        if not candidate_summaries:
+            return []
+
+        prompt = (
+            "You are a memory management system. A new memory entry is being stored. "
+            "Determine which existing entries are about the SAME topic and should be merged.\n\n"
+            f"NEW ENTRY:\nKey: {new_key}\nContent: {new_content[:300]}\n\n"
+            f"EXISTING ENTRIES:\n" + "\n".join(candidate_summaries) + "\n\n"
+            "Which existing entries should be merged into the new one? "
+            "Reply with a JSON list of indices (e.g. [0, 3, 7]). "
+            "Only include entries that are clearly about the same topic. "
+            "If none are related, reply with []. Output ONLY the JSON list:"
+        )
+
+        try:
+            response = self._llm_fn(prompt).strip()
+            # Extract JSON list
+            json_match = re.search(r'\[[\d,\s]*\]', response)
+            if not json_match:
+                return []
+            indices = json.loads(json_match.group(0))
+            merged = []
+            for idx in indices:
+                if 0 <= idx < len(candidates):
+                    entry = candidates[idx]
+                    merged.append(entry)
+                    path = self._entry_path(entry.get("key", ""))
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        logger.info("Memory merge (LLM): '%s' absorbed into '%s'",
+                                    entry.get("key"), new_key)
+            return merged
+        except Exception as e:
+            logger.warning("LLM memory merge failed: %s, skipping merge", e)
+            return []
 
     def delete(self, key: str) -> bool:
         safe = self.sanitize_key(key) if not self.is_valid_key(key) else key

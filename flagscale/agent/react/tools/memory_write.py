@@ -35,9 +35,9 @@ class MemoryWriteTool(Tool):
                 "type": "string",
                 "description": (
                     "Short identifier following naming convention: <scope>_<topic>[_<detail>]. "
-                    "Scope = model name (bagel_, qwen3_), framework (flagscale_, megatron_, te_), "
+                    "Scope = model name (qwen3_, gr00t_), framework (flagscale_, megatron_, te_), "
                     "or env/tool (env_, cuda_, nccl_). "
-                    "Examples: 'bagel_architecture_overview', 'flagscale_native_backend_pattern', "
+                    "Examples: 'qwen3_architecture_overview', 'flagscale_native_backend_pattern', "
                     "'megatron_pipeline_knowledge', 'env_apex_build_fix'. "
                     "Lowercase alphanumeric and underscores only, 2-80 chars. "
                     "NO error messages, hashes, or special characters."
@@ -83,7 +83,7 @@ class MemoryWriteTool(Tool):
                 return (
                     f"ERROR: Invalid memory key '{key}'. "
                     "Key must be 2-80 chars, lowercase alphanumeric and underscores only "
-                    "(e.g. 'bagel_tp_oom', 'parallel_strategy_final'). "
+                    "(e.g. 'qwen3_tp_oom', 'parallel_strategy_final'). "
                     "Do not use error messages, hashes, or special characters as keys."
                 )
             return (

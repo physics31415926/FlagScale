@@ -1,8 +1,10 @@
 """Enforcement gates for ReactAgent — progress, plan, dry-run, training, and phase gates."""
 
+import json
 import logging
 import re
 import time
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,129 @@ class GatesMixin:
         "read_file", "shell", "web_fetch", "find_latest_log",
         "parse_training_metrics", "memory_read", "memory_list",
     })
+
+    # ── LLM call timeout wrapper ─────────────────────────────────────────
+
+    _LLM_JUDGE_TIMEOUT = 30  # seconds
+
+    def _llm_call_with_timeout(self, llm_fn, prompt, timeout=None):
+        """Call an LLM function with a timeout. Returns None on timeout."""
+        timeout = timeout or self._LLM_JUDGE_TIMEOUT
+        result_container = [None]
+        error_container = [None]
+
+        def _call():
+            try:
+                result_container[0] = llm_fn(prompt)
+            except Exception as e:
+                error_container[0] = e
+
+        t = threading.Thread(target=_call, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            logger.warning("LLM judge call timed out after %ds", timeout)
+            return None
+        if error_container[0]:
+            raise error_container[0]
+        return result_container[0]
+
+    # ── LLM-based memory knowledge check (shared by all gates) ──────────
+
+    def _llm_check_memory_has_knowledge(self, entries, knowledge_description: str) -> bool:
+        """Use LLM to judge whether memory entries contain the described knowledge.
+
+        Falls back to keyword heuristic if LLM is unavailable.
+        """
+        if not entries:
+            return False
+
+        llm_fn = getattr(self.session_memory, '_llm_fn', None)
+        if not llm_fn:
+            return False
+
+        # Build concise memory summary for LLM
+        summaries = []
+        for e in entries[:20]:
+            key = e.get("key", "?")
+            content = (e.get("content") or "")[:200]
+            summaries.append(f"- [{key}]: {content}")
+
+        if not summaries:
+            return False
+
+        prompt = (
+            "You are checking whether stored memory entries contain specific knowledge.\n\n"
+            f"REQUIRED KNOWLEDGE: {knowledge_description}\n\n"
+            "MEMORY ENTRIES:\n" + "\n".join(summaries) + "\n\n"
+            "Does the memory contain this knowledge (even partially or under a different name)? "
+            "Answer ONLY 'yes' or 'no':"
+        )
+
+        try:
+            response = self._llm_call_with_timeout(llm_fn, prompt)
+            if response is None:
+                return True  # On timeout, don't block
+            return response.strip().lower().startswith("yes")
+        except Exception as e:
+            logger.warning("LLM memory check failed: %s, defaulting to pass", e)
+            return True  # On failure, don't block
+
+    def _llm_judge_is_genuine_megatron_native(self, content: str, path: str) -> bool:
+        """Use LLM to judge whether code with both HF and Megatron symbols is genuinely Megatron-native.
+
+        Returns True if the code is genuine Megatron-native (HF is only for weight loading/reference).
+        Returns False if the code wraps/delegates to HF models at runtime.
+        """
+        llm_fn = getattr(self.session_memory, '_llm_fn', None)
+        if not llm_fn:
+            return False  # Can't judge, block conservatively
+
+        # Truncate content for LLM context
+        code_snippet = content[:3000]
+
+        prompt = (
+            "You are reviewing code for a Megatron Native model implementation.\n\n"
+            "RULE: In Megatron Native (Mode B), ALL components of the model — including frozen "
+            "ones — MUST be implemented using Megatron/TransformerEngine primitives. There is ONE "
+            "top-level MegatronModule that owns everything. Whether a component is frozen "
+            "(requires_grad=False) is a training decision, NOT an architecture decision.\n\n"
+            "HuggingFace model classes are ONLY acceptable for:\n"
+            "- Weight conversion utilities (loading HF checkpoint → Megatron state_dict)\n"
+            "- Reference comparison during testing\n"
+            "- Config parsing\n\n"
+            "HuggingFace models are NOT acceptable as:\n"
+            "- Runtime model components (self.backbone = HFModel(...))\n"
+            "- Forward pass delegates (output = self.hf_model(input))\n"
+            "- Submodules that process data during training\n"
+            "- 'Frozen feature extractors' loaded from HF pretrained checkpoints\n\n"
+            "CRITICAL: 'The component is frozen / has no gradient / is just a feature extractor' "
+            "is NOT a valid reason to use HF models. Frozen components must STILL be Megatron-native "
+            "because: (1) unified checkpoint conversion, (2) future unfreezing, (3) TP memory "
+            "distribution even for frozen params, (4) architectural consistency.\n\n"
+            f"FILE: {path}\n"
+            f"CODE:\n```\n{code_snippet}\n```\n\n"
+            "QUESTION: Is this code genuinely Megatron-native (ALL components — including any "
+            "frozen backbone/encoder — use Megatron/TE layers), or does it use HuggingFace "
+            "models for any runtime component (even frozen ones)?\n\n"
+            "Answer ONLY: {\"genuine_native\": true} or {\"genuine_native\": false}"
+        )
+
+        try:
+            response = self._llm_call_with_timeout(llm_fn, prompt)
+            if response is None:
+                return False  # On timeout, block conservatively
+            response = response.strip()
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(response[start:end])
+                return bool(data.get("genuine_native", False))
+        except Exception as e:
+            logger.warning("LLM judge for Megatron native check failed: %s", e)
+        return False  # On failure, block conservatively
+
+    # ── Progress gate ───────────────────────────────────────────────────
 
     def _check_progress_gate(self, tool_name):
         """Detect aimless exploration vs purposeful deep reading.
@@ -491,9 +616,26 @@ class GatesMixin:
         r'(tools/checkpoint/|flagscale/models/|megatron/.*model|model_provider|spec\.py|'
         r'pretrain_|train_.*\.py|data/.*dataset)'
     )
+    _SHELL_WRITE_PATTERN = re.compile(
+        r'cat\s*>|tee\s+|>\s*/|echo\s.*>|printf\s.*>|python3?\s.*<<',
+        re.IGNORECASE
+    )
     _MIN_READS_BEFORE_PORTING_WRITE = 8
 
     _PORTING_PATH_EARLY_READ_LIMIT = 8
+
+    def _extract_shell_write_target(self, cmd):
+        """Extract file path from shell write commands like 'cat > path' or 'tee path'."""
+        m = re.search(r'(?:cat|echo|printf)\s*>\s*(\S+)', cmd)
+        if m:
+            return m.group(1).strip("'\"")
+        m = re.search(r'tee\s+(\S+)', cmd)
+        if m:
+            return m.group(1).strip("'\"")
+        m = re.search(r'>\s*(\S+\.(?:py|yaml|yml|json))', cmd)
+        if m:
+            return m.group(1).strip("'\"")
+        return ""
 
     def _check_porting_path_gate(self, tool_name, arguments):
         """Block until user confirms porting path (Mode B/C).
@@ -539,15 +681,18 @@ class GatesMixin:
 
     # Mode-specific signal patterns for deviation detection
     _MODE_B_SIGNALS = re.compile(
-        r'megatron.*native|layer_spec|ColumnParallelLinear|RowParallelLinear|'
+        r'layer_spec|ColumnParallelLinear|RowParallelLinear|'
+        r'TEDotProductAttention|TransformerLayer|VocabParallelEmbedding|'
         r'tensor.model.parallel|pipeline.model.parallel|'
-        r'get_gpt_layer_with_transformer_engine|MegatronModule|'
-        r'mode\s*b\b',
+        r'get_gpt_layer_with_transformer_engine|'
+        r'mode\s*b\b|megatron\s*native',
         re.IGNORECASE,
     )
     _MODE_C_SIGNALS = re.compile(
         r'HuggingFace\s*(?:Module|Wrapper)|FSDP2?|hf_module|'
         r'wrap.*existing.*model|from_pretrained.*wrapper|'
+        r'MegatronModule.*wrap|wrap.*MegatronModule|'
+        r'keep.*(?:HF|huggingface|existing).*model|'
         r'mode\s*c\b',
         re.IGNORECASE,
     )
@@ -705,9 +850,10 @@ class GatesMixin:
             f"\n\n[VERIFICATION LADDER] Stage is '{self._verification_stage}'. "
             f"Verify the whole model before full training:\n"
             f"1. Weights: load_state_dict(strict=True) — zero missing/unexpected keys\n"
-            f"2. Forward: real data batch → finite loss\n"
+            f"2. Forward: REAL data batch (NOT dummy/torch.rand) → finite loss\n"
             f"3. Backward: --train-iters 20, verify loss decreases\n"
             f"4. Distributed: target TP/PP, check no hang\n"
+            f"ALL verification uses real data pipeline — dummy data is forbidden.\n"
             f"Record each stage with workspace_experiment update."
         )
 
@@ -724,29 +870,28 @@ class GatesMixin:
 
     _PIPELINE_KNOWLEDGE_DIMENSIONS = {
         "train_script_anatomy": re.compile(
-            r'train_gpt\.py|train_qwen3_vl\.py|train_qwen2_5_vl\.py'
+            r'train_gpt|train_qwen|train_llava|train_gr00t|train_.*\.py|forward_step|get_batch'
         ),
         "model_provider_and_builder": re.compile(
-            r'model_provider\.py|gpt_builders\.py'
+            r'model_provider|gpt_builders|_model\.py|_builders\.py'
         ),
         "megatron_layer_spec_system": re.compile(
-            r'spec_utils\.py|gpt_layer_specs\.py|TransformerLayerSubmodules'
+            r'spec_utils|gpt_layer_specs|layer_specs|TransformerLayerSubmodules'
         ),
         "training_loop": re.compile(
-            r'training/training\.py'
+            r'training/training\.py|pretrain|training\.py'
         ),
         "flagscale_custom_models": re.compile(
-            r'flagscale/models/megatron/.*/layer_specs\.py|flagscale/models/megatron/.*_model\.py'
+            r'flagscale/models/|flagscale.*megatron.*model|megatron_native/'
         ),
         "parallelism_system": re.compile(
-            r'parallel_state\.py|tensor_parallel.*layers\.py|pipeline_parallel.*schedules\.py'
+            r'parallel_state|tensor_parallel|pipeline_parallel|parallel.*layers'
         ),
         "te_attention_system": re.compile(
-            r'transformer_engine.*attention.*dot_product|transformer_engine.*backends'
-            r'|megatron.*extensions.*transformer_engine'
+            r'transformer_engine|extensions.*transformer'
         ),
     }
-    _MIN_PIPELINE_DIMENSIONS = 6
+    _MIN_PIPELINE_DIMENSIONS = 5
 
     _PIPELINE_KNOWLEDGE_KEYWORDS = (
         "get_batch", "forward_step", "loss_func", "model_provider",
@@ -762,10 +907,36 @@ class GatesMixin:
         """Hard block: require pipeline knowledge acquisition AND persistence before porting writes."""
         if not self._porting_mode:
             return ""
-        if tool_name not in ("write_file", "edit_file"):
+        if tool_name in ("write_file", "edit_file"):
+            target = arguments.get("path", "") or arguments.get("file_path", "")
+        elif tool_name == "shell":
+            cmd = arguments.get("command", "")
+            if not self._SHELL_WRITE_PATTERN.search(cmd):
+                return ""
+            target = self._extract_shell_write_target(cmd)
+            if not target:
+                return ""
+        else:
             return ""
-        target = arguments.get("path", "") or arguments.get("file_path", "")
         if not self._PORTING_WRITE_PATHS.search(target):
+            return ""
+
+        # If knowledge already persisted, skip Phase 1 (reading check)
+        if self._pipeline_knowledge_persisted:
+            # Phase 3 only
+            if not self._pipeline_knowledge_confirmed:
+                if not hasattr(self, '_pipeline_confirm_block_count'):
+                    self._pipeline_confirm_block_count = 0
+                self._pipeline_confirm_block_count += 1
+                if self._pipeline_confirm_block_count >= 3:
+                    self._pipeline_knowledge_confirmed = True
+                    return ""
+                return (
+                    "\n\n[KNOWLEDGE CONFIRMATION GATE] You've read the code and persisted knowledge. "
+                    "Now CONFIRM: for THIS specific porting task, is your knowledge sufficient?\n\n"
+                    "You MUST include in your response ONE of these markers:\n"
+                    "[PIPELINE_KNOWLEDGE_CONFIRMED: YES]\n"
+                )
             return ""
 
         # Phase 1: Check reading coverage of pipeline knowledge dimensions
@@ -787,18 +958,20 @@ class GatesMixin:
                 "te_attention_system": "TransformerEngine attention: read TEDotProductAttention (megatron/core/extensions/transformer_engine.py) AND TE's DotProductAttention/backends (transformer_engine/pytorch/attention/) — understand attn_mask_type, qkv_format, backend selection, CP integration",
             }
             missing_list = "\n".join(f"  - {dim_descs[m]}" for m in sorted(missing))
+            # Pick the first missing dimension as the concrete next action
+            first_missing = sorted(missing)[0]
+            first_action = dim_descs[first_missing]
             return (
                 f"\n\n[PIPELINE COMPREHENSION GATE] You're writing porting code but haven't "
                 f"studied the training pipeline deeply enough. Covered {len(covered)}/{self._MIN_PIPELINE_DIMENSIONS} "
                 f"required dimensions.\n\n"
                 f"Missing knowledge:\n{missing_list}\n\n"
-                f"Model porting requires understanding the FULL end-to-end flow: "
-                f"data loading → model construction (layer_spec) → forward/loss → training loop → parallelism.\n"
-                f"The layer_spec system (ModuleSpec + TransformerLayerSubmodules in Megatron-LM-FL) "
-                f"is the backbone — it defines how TE layers, attention, MLP are composed.\n"
-                f"The parallelism system (initialize_model_parallel, TP/PP/DP/CP/EP/SP) is the "
-                f"infrastructure — model modules use TP primitives internally.\n"
-                f"Read these files FIRST, then write code."
+                f"▶ YOUR NEXT ACTION: Use read_file to read the files listed above. "
+                f"Start with: {first_action}\n\n"
+                f"Even if you believe you already understand the pipeline from prior reading, "
+                f"this gate requires you to actually open and read these specific files in this session. "
+                f"The gate tracks which files you've read — it will unblock automatically once you've covered enough dimensions.\n\n"
+                f"Do NOT attempt to write code again until this gate clears."
             )
 
         # Phase 2: Check knowledge persistence
@@ -808,11 +981,14 @@ class GatesMixin:
                 "Now PERSIST your understanding before writing.\n\n"
                 "Call memory_write(key='megatron_pipeline_knowledge', content='...') with a "
                 "structured summary covering:\n"
-                "- How data flows (get_batch → model input)\n"
+                "- How data flows (get_batch → model input) — THIS IS CRITICAL, not optional\n"
                 "- How models are constructed (model_provider → layer_spec → TE layers)\n"
                 "- The layer_spec system: ModuleSpec, TransformerLayerSubmodules, how FlagScale extends it\n"
                 "- Parallelism: initialize_model_parallel, TP (ColumnParallelLinear), PP (schedules), CP/EP/SP\n"
                 "- How to add a new model (what files to create, what to register)\n\n"
+                "IMPORTANT: Data pipeline integration is EQUALLY important as model adaptation. "
+                "Your summary MUST cover how get_batch provides data to the model, including "
+                "parallelism-aware data distribution (broadcast_data, pre_process/post_process).\n\n"
                 "KEY MUST BE exactly 'megatron_pipeline_knowledge'.\n"
                 "Your memory must mention at least 10 of the 14 required keywords. "
                 "This knowledge must survive context compaction. Write it NOW."
@@ -878,6 +1054,820 @@ class GatesMixin:
             f"Read at least one file from each missing category before writing porting code."
         )
 
+    # ── Data→Model interface contract gate ─────────────────────────────
+
+    _MODEL_CODE_PATHS = re.compile(
+        r'(model|forward|backbone|head|encoder|decoder|transformer|attention|mlp).*\.py$'
+    )
+    _DATA_MODEL_INTERFACE_MEMORY_KEY = "data_model_interface"
+
+    def _check_data_model_interface_gate(self, tool_name, arguments):
+        """HARD BLOCK: Require data→model interface documentation before writing model code.
+
+        The LLM must explicitly document:
+        1. What the data pipeline outputs (keys, shapes, dtypes)
+        2. What the model's forward() expects as input
+        3. How data pipeline output maps to model input
+
+        Without this, the model's forward signature is guesswork, and the entire
+        model will need to be rewritten when real data is connected.
+        """
+        if not self._porting_mode:
+            return ""
+        if tool_name not in ("write_file", "edit_file", "shell"):
+            return ""
+
+        if tool_name in ("write_file", "edit_file"):
+            path = arguments.get("path", "") or arguments.get("file_path", "")
+            content = arguments.get("content", "") or arguments.get("new_string", "")
+        else:
+            cmd = arguments.get("command", "")
+            if not self._SHELL_WRITE_PATTERN.search(cmd):
+                return ""
+            path = self._extract_shell_write_target(cmd) or ""
+            content = cmd
+
+        if not path:
+            return ""
+
+        # Only trigger for model implementation files
+        is_model_code = (
+            self._MODEL_CODE_PATHS.search(path) and
+            any(kw in content for kw in (
+                "def forward(", "def __init__(", "class ", "MegatronModule",
+            ))
+        )
+        if not is_model_code:
+            return ""
+
+        # Check if data→model interface has been documented in memory (LLM-based judgment)
+        entries = self.session_memory.list_entries()
+        has_interface_doc = self._llm_check_memory_has_knowledge(
+            entries,
+            "data-to-model interface documentation: what the data pipeline outputs, "
+            "what the model's forward() expects as input, and how they map together"
+        )
+
+        if has_interface_doc:
+            return ""
+
+        # Anti-loop: if this gate has blocked too many times, auto-pass
+        if not hasattr(self, '_data_interface_gate_blocks'):
+            self._data_interface_gate_blocks = 0
+        self._data_interface_gate_blocks += 1
+        if self._data_interface_gate_blocks > 5:
+            logger.warning("data_model_interface gate: auto-passing after %d blocks", self._data_interface_gate_blocks)
+            return ""
+
+        # Quick heuristic: if the code being written already shows data interface awareness, pass
+        content_has_interface_awareness = (
+            "get_batch" in content and
+            any(kw in content for kw in (
+                "input_ids", "attention_mask", "labels", "pixel_values",
+                "tokenizer", "data_path", "batch[",
+            ))
+        )
+        if content_has_interface_awareness:
+            return ""
+
+        return (
+            "[DATA→MODEL INTERFACE GATE — BLOCKED]\n\n"
+            "You are writing model code WITHOUT documenting the data→model interface contract.\n\n"
+            "This is the #1 cause of porting rework: the model's forward() signature is designed "
+            "in isolation, then when real data is connected, everything needs to be rewritten "
+            "because the model expects different input keys/shapes/dtypes than what the data "
+            "pipeline actually produces.\n\n"
+            "BEFORE writing model code, you MUST document the data→model interface:\n\n"
+            "1. **Data pipeline output**: What does get_batch / the dataloader produce?\n"
+            "   - Exact dict keys (e.g., 'input_ids', 'attention_mask', 'pixel_values')\n"
+            "   - Tensor shapes for each key (e.g., [B, seq_len], [B, C, H, W])\n"
+            "   - Dtypes (int64 for tokens, float32/bfloat16 for images)\n\n"
+            "2. **Model forward() input**: What does the model expect?\n"
+            "   - Parameter names in forward() signature\n"
+            "   - Expected shapes and dtypes for each parameter\n"
+            "   - Which parameters are optional vs required\n\n"
+            "3. **Mapping**: How does data output → model input?\n"
+            "   - Key renaming (e.g., 'pixel_values' → 'images')\n"
+            "   - Shape transforms (e.g., flatten, pad, reshape)\n"
+            "   - Any preprocessing between get_batch and model.forward\n\n"
+            "4. **Parallelism contract** (MANDATORY — without this, Megatron integration FAILS):\n"
+            "   - TP: How is input broadcast to all TP ranks? (broadcast_data)\n"
+            "   - PP: Which inputs go to first stage vs last stage? (pre_process/post_process)\n"
+            "   - DP: How are micro-batches distributed? (sampler)\n"
+            "   - CP/EP/SP: Any special handling for context/expert/sequence parallelism?\n"
+            "   A data pipeline without parallelism awareness is NOT a valid Megatron data pipeline.\n\n"
+            "▶ YOUR NEXT ACTION:\n"
+            "1. Read the source model's forward() to see what inputs it expects\n"
+            "2. Read the source training script's data loading to see what get_batch produces\n"
+            "3. Read an existing Megatron train_*.py to see how parallelism is handled in get_batch\n"
+            "4. Save the interface contract (including parallelism plan) to memory:\n"
+            "   memory_write(key='data_model_interface', content='...')\n\n"
+            "This contract is your SINGLE SOURCE OF TRUTH for both model and data implementation. "
+            "Design them together, not separately.\n\n"
+            "🚫 Do NOT use dummy/synthetic data (torch.rand/zeros) to 'test' the model. "
+            "ALL verification must use real data through the real pipeline."
+        )
+
+    # ── Component mapping gate ───────────────────────────────────────────
+
+    def _check_component_mapping_gate(self, tool_name, arguments):
+        """HARD BLOCK: Require Megatron component inventory + per-component mapping before writing model code.
+
+        Enforces first-principles thinking: start from what Megatron provides,
+        then map each source component to its Megatron equivalent.
+        'Too complex' or 'too much work' are NOT valid reasons to skip Megatron primitives.
+        Only genuine technical impossibility justifies using vanilla torch.
+        """
+        if not self._porting_mode:
+            return ""
+        if not hasattr(self, '_confirmed_porting_path'):
+            return ""
+        if self._confirmed_porting_path != "mode_b":
+            return ""
+        if tool_name not in ("write_file", "edit_file"):
+            return ""
+
+        path = arguments.get("path", "") or arguments.get("file_path", "")
+        content = arguments.get("content", "") or arguments.get("new_string", "")
+        if not path or not content:
+            return ""
+        if not self._MODEL_CODE_PATHS.search(path):
+            return ""
+
+        # Only trigger for actual implementation code
+        has_impl = any(kw in content for kw in (
+            "def forward(", "def __init__(", "class ", "MegatronModule",
+        ))
+        if not has_impl:
+            return ""
+
+        # Check if component mapping already validated this session
+        if getattr(self, '_component_mapping_validated', False):
+            return ""
+
+        # Check memory for component mapping via LLM judge
+        entries = self.session_memory.list_entries()
+        if not entries:
+            return self._component_mapping_block_message()
+
+        has_mapping = self._llm_judge_component_mapping_quality(entries)
+        if has_mapping:
+            self._component_mapping_validated = True
+            return ""
+
+        # Anti-loop: auto-pass after too many blocks
+        if not hasattr(self, '_component_mapping_blocks'):
+            self._component_mapping_blocks = 0
+        self._component_mapping_blocks += 1
+        if self._component_mapping_blocks > 6:
+            logger.warning("component_mapping gate: auto-passing after %d blocks", self._component_mapping_blocks)
+            self._component_mapping_validated = True
+            return ""
+
+        return self._component_mapping_block_message()
+
+    def _component_mapping_block_message(self):
+        return (
+            "[COMPONENT MAPPING GATE — BLOCKED]\n\n"
+            "Before writing model code, you MUST document a Megatron component mapping.\n\n"
+            "Step 1: SCAN available Megatron/TE components (read the actual files):\n"
+            "  Top-level models:\n"
+            "    - GPTModel, LLaVAModel (megatron/core/models/)\n"
+            "    - CLIPViTModel (megatron/core/models/vision/)\n"
+            "    - TransformerBlock (megatron/core/transformer/transformer_block.py)\n"
+            "  Mid-level layers:\n"
+            "    - TransformerLayer (megatron/core/transformer/transformer_layer.py)\n"
+            "    - SelfAttention, CrossAttention (megatron/core/transformer/attention.py)\n"
+            "    - MLP with gated variants (megatron/core/transformer/mlp.py)\n"
+            "    - MoE layer (megatron/core/transformer/moe/)\n"
+            "  TE (TransformerEngine) layers:\n"
+            "    - TEDotProductAttention (flash/fused backends, CP integration)\n"
+            "    - TE ColumnParallelLinear / RowParallelLinear (FP8 capable)\n"
+            "    - FusedLayerNorm, FusedRMSNorm\n"
+            "  Primitives:\n"
+            "    - ColumnParallelLinear, RowParallelLinear (megatron/core/tensor_parallel/layers.py)\n"
+            "    - VocabParallelEmbedding\n"
+            "    - RotaryEmbedding (megatron/core/models/common/embeddings/)\n"
+            "  FlagScale custom:\n"
+            "    - Check flagscale/models/megatron/ for existing implementations\n\n"
+            "Step 2: MAP each source model component → Megatron target:\n"
+            "  Format per component:\n"
+            "    'SourceClass.layer_name → MegatronEquivalent (reason)'\n"
+            "  OR:\n"
+            "    'SourceClass.layer_name → vanilla torch (TECHNICAL reason: ...)'\n\n"
+            "  INVALID reasons for vanilla torch:\n"
+            "    ✗ 'too complex', 'too much work', 'will add later'\n"
+            "    ✗ 'other models in the repo don't do this'\n"
+            "    ✗ 'keep as-is for initial porting'\n"
+            "    ✗ 'frozen / no gradient / feature extractor — no need for native'\n"
+            "    ✗ 'no TP benefit for frozen module'\n"
+            "    ✗ 'backbone is frozen so use HF directly'\n"
+            "  VALID reasons:\n"
+            "    ✓ 'per-joint MLP with variable input dims — ColumnParallelLinear requires fixed dims'\n"
+            "    ✓ 'adaptive norm injection into cross-attention — no TE equivalent for this pattern'\n"
+            "    ✓ 'flow-matching noise schedule — pure math, no neural network layer involved'\n\n"
+            "Step 3: Save to memory:\n"
+            "  memory_write(key='megatron_component_mapping', content='...')\n\n"
+            "▶ YOUR NEXT ACTION:\n"
+            "1. Read megatron/core/transformer/ files to understand available components\n"
+            "2. Read the source model's __init__() to list all components\n"
+            "3. Create the mapping table and save to memory\n\n"
+            "The mapping is your CONTRACT — implementation must follow it."
+        )
+
+    def _llm_judge_component_mapping_quality(self, entries) -> bool:
+        """Use LLM to validate that the component mapping is genuine and complete."""
+        llm_fn = getattr(self.session_memory, '_llm_fn', None)
+        if not llm_fn:
+            # No LLM available — fall back to keyword heuristic
+            return self._component_mapping_keyword_check(entries)
+
+        # Build memory summary
+        summaries = []
+        for e in entries[:25]:
+            key = e.get("key", "?")
+            content = (e.get("content") or "")[:400]
+            if any(kw in key.lower() or kw in content.lower() for kw in (
+                "component", "mapping", "inventory", "megatron_component",
+                "primitive", "migration", "blueprint",
+            )):
+                summaries.append(f"- [{key}]: {content}")
+
+        if not summaries:
+            return False
+
+        prompt = (
+            "You are validating a Megatron component mapping for model porting.\n\n"
+            "STRICT RULES:\n"
+            "- Every source model component (attention, MLP, norm, embedding, encoder, decoder) "
+            "MUST be mapped to a Megatron/TE equivalent OR have a TECHNICAL justification.\n"
+            "- ALL components must be Megatron-native — including frozen/non-trainable ones.\n"
+            "- Valid technical justifications: 'no Megatron equivalent exists for X because Y', "
+            "'TE does not support this attention pattern', "
+            "'component has non-standard topology that cannot be expressed as TransformerLayer'\n"
+            "- INVALID justifications (MUST reject): 'too complex', 'too much work', "
+            "'keep as-is for now', 'will add later', 'not worth the effort', "
+            "'other models don't do this', 'pragmatic approach', 'initial porting', "
+            "'frozen so no need for native', 'no gradient so keep HF', "
+            "'just a feature extractor', 'no TP benefit for frozen module', "
+            "'backbone is frozen so use existing HF model'\n"
+            "- CRITICAL: 'frozen/no_grad/feature_extractor' is NEVER a valid reason to skip "
+            "Megatron-native implementation. Frozen components still need: unified checkpoint "
+            "conversion, future unfreezing support, TP memory distribution, architectural consistency.\n"
+            "- TP support is per-component (some may not need it), but even without TP, "
+            "the component must use Megatron primitives (not HF classes).\n"
+            "- The mapping must show awareness of Megatron's component hierarchy:\n"
+            "  Top-level: GPTModel, LLaVAModel, TransformerBlock\n"
+            "  Mid-level: TransformerLayer, SelfAttention, CrossAttention, MLP\n"
+            "  Primitives: ColumnParallelLinear, RowParallelLinear, TEDotProductAttention, "
+            "VocabParallelEmbedding, FusedLayerNorm/RMSNorm, RotaryEmbedding\n"
+            "- A mapping that says 'wrap HF model in MegatronModule' is NOT valid.\n"
+            "- A mapping that says 'keep backbone as-is' without technical justification is NOT valid.\n"
+            "- A mapping that says 'backbone is frozen → use HF/vanilla torch' is NOT valid.\n\n"
+            "MEMORY ENTRIES:\n" + "\n".join(summaries) + "\n\n"
+            "Does this mapping meet ALL the requirements above?\n"
+            "Answer ONLY: {\"valid\": true} or {\"valid\": false, \"reason\": \"...\"}"
+        )
+
+        try:
+            response = self._llm_call_with_timeout(llm_fn, prompt)
+            if response is None:
+                logger.warning("LLM judge for component mapping timed out, falling back to heuristic")
+                return self._component_mapping_keyword_check(entries)
+            response = response.strip()
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(response[start:end])
+                result = bool(data.get("valid", False))
+                if not result:
+                    reason = data.get("reason", "unknown")
+                    logger.info("Component mapping rejected by LLM judge: %s", reason)
+                return result
+        except Exception as e:
+            logger.warning("LLM judge for component mapping failed: %s", e)
+
+        # On failure, fall back to keyword heuristic
+        return self._component_mapping_keyword_check(entries)
+
+    def _component_mapping_keyword_check(self, entries) -> bool:
+        """Fallback heuristic: check if memory has component mapping keywords."""
+        all_content = " ".join(
+            (e.get("content") or "") + " " + (e.get("key") or "")
+            for e in entries
+        ).lower()
+
+        # Must mention Megatron component hierarchy
+        hierarchy_keywords = [
+            "transformerlayer", "transformerblock", "columnparallellinear",
+            "rowparallellinear", "tedotproductattention",
+        ]
+        hierarchy_count = sum(1 for kw in hierarchy_keywords if kw in all_content)
+        if hierarchy_count < 3:
+            return False
+
+        # Must have mapping language (→ or "maps to" or "equivalent")
+        mapping_signals = ["→", "maps to", "equivalent", "replace with", "rebuild using"]
+        has_mapping = any(sig in all_content for sig in mapping_signals)
+        if not has_mapping:
+            return False
+
+        # Must NOT have lazy justifications as the primary approach
+        lazy_signals = ["keep as-is", "keep as is", "wrap", "wrapper", "pragmatic",
+                        "frozen so", "frozen →", "frozen->", "no gradient",
+                        "feature extractor", "no need for native"]
+        lazy_count = sum(1 for sig in lazy_signals if sig in all_content)
+        if lazy_count > hierarchy_count:
+            return False
+
+        return True
+
+    # ── Migration blueprint gate ──────────────────────────────────────────
+
+    def _check_migration_blueprint_gate(self, tool_name, arguments):
+        """HARD BLOCK: Mode 2 (Megatron Native) requires a migration blueprint before writing code.
+
+        The LLM must document a complete migration blueprint that maps:
+        1. Source forward logic → Megatron Native forward (component-by-component)
+        2. Source data pipeline → Megatron get_batch design
+        3. Source optimizer/scheduler → Megatron training config
+
+        This prevents the #1 failure mode: LLM reads source code, then immediately
+        tries to import/wrap/inherit instead of reimplementing with Megatron primitives.
+        By forcing the blueprint first, the LLM commits to a rewrite plan before touching code.
+        """
+        if not self._porting_mode:
+            return ""
+        if not hasattr(self, '_confirmed_porting_path'):
+            return ""
+        if self._confirmed_porting_path != "mode_b":
+            return ""
+        if tool_name not in ("write_file", "edit_file", "shell"):
+            return ""
+
+        if tool_name in ("write_file", "edit_file"):
+            path = arguments.get("path", "") or arguments.get("file_path", "")
+            content = arguments.get("content", "") or arguments.get("new_string", "")
+        else:
+            cmd = arguments.get("command", "")
+            if not self._SHELL_WRITE_PATTERN.search(cmd):
+                return ""
+            path = self._extract_shell_write_target(cmd) or ""
+            content = cmd
+
+        if not path:
+            return ""
+
+        # Only trigger for model/train implementation files
+        is_impl_code = (
+            self._MODEL_CODE_PATHS.search(path) or
+            re.search(r'(pretrain_|train_).*\.py$', path)
+        )
+        if not is_impl_code:
+            return ""
+
+        # Must contain actual implementation (not just reading/analysis)
+        has_impl = any(kw in content for kw in (
+            "def forward(", "def __init__(", "class ", "def get_batch",
+            "def model_provider", "def forward_step",
+        ))
+        if not has_impl:
+            return ""
+
+        # Check if migration blueprint exists in memory (LLM-based)
+        entries = self.session_memory.list_entries()
+        has_blueprint = self._llm_check_memory_has_knowledge(
+            entries,
+            "migration blueprint that references a component-by-component mapping with specific "
+            "Megatron primitives for each source component (not just 'use MegatronModule wrapper' "
+            "or 'keep as-is' — must have concrete per-component decisions like "
+            "'attention → TEDotProductAttention', 'MLP → ColumnParallelLinear + RowParallelLinear')"
+        )
+
+        if has_blueprint:
+            return ""
+
+        # Check if content itself demonstrates blueprint awareness
+        # (mentions specific Megatron primitives for specific source components)
+        has_mapping_awareness = (
+            bool(self._MEGATRON_NATIVE_INDICATORS.search(content)) and
+            any(kw in content for kw in (
+                "ColumnParallelLinear", "RowParallelLinear",
+                "TEDotProductAttention", "TransformerLayer",
+            ))
+        )
+        if has_mapping_awareness:
+            return ""
+
+        detail = (
+            "[MIGRATION BLUEPRINT GATE — BLOCKED]\n\n"
+            "Mode 2 (Megatron Native) implementation BLOCKED. No migration blueprint found.\n\n"
+            "Before writing ANY model or training code, you MUST document a migration blueprint "
+            "that maps source implementation → Megatron Native implementation. This prevents "
+            "the common failure of reading source code and then trying to import/wrap it "
+            "instead of reimplementing with Megatron primitives.\n\n"
+            "Your blueprint must cover:\n\n"
+            "**0. Megatron-Core Survey** — what components already exist?\n"
+            "   Check megatron/core/models/, megatron/core/transformer/, flagscale/models/megatron/\n"
+            "   Priority: Megatron high-level model > TE layer > Megatron primitive > compose > torch\n\n"
+            "**1. Forward Logic Mapping** (source component → Megatron target):\n"
+            "   For EACH component: source class → Megatron equivalent (or 'compose' / 'custom torch')\n"
+            "   Frozen components are still part of the model — use Megatron primitives + requires_grad=False\n"
+            "   'Frozen' is NEVER a reason to skip native implementation. Reasons:\n"
+            "   - Unified checkpoint conversion (one converter for the whole model)\n"
+            "   - Future unfreezing (architecture must support it without rewrite)\n"
+            "   - TP memory distribution (even frozen params can be sharded)\n"
+            "   - Architectural consistency (one top-level MegatronModule owns everything)\n"
+            "   TP support is per-component — assess whether each component benefits from TP.\n"
+            "   Even without TP, use Megatron primitives (ColumnParallelLinear with gather_output=True).\n"
+            "   PREFER TransformerEngine (TE) layers wherever possible:\n"
+            "   - Attention → TEDotProductAttention (supports flash/fused backends, CP integration)\n"
+            "   - Linear → TE's ColumnParallelLinear/RowParallelLinear (FP8 capable)\n"
+            "   - LayerNorm → TE's FusedLayerNorm or RMSNorm\n"
+            "   - Full transformer block → TransformerLayer with TE submodules via layer_spec\n"
+            "   Only fall back to vanilla torch when TE has no equivalent (e.g., custom gating, per-joint encoders)\n\n"
+            "**2. Data Pipeline Mapping** (source preprocessing → Megatron get_batch):\n"
+            "   Steps, parallelism distribution, output format (keys, shapes, dtypes)\n\n"
+            "**3. Optimizer/Scheduler Mapping** (source training config → Megatron args):\n"
+            "   - Source: optimizer type, lr, betas, weight_decay, warmup, scheduler\n"
+            "   - Target: corresponding Megatron args (--lr, --adam-beta1/2, --lr-warmup-iters, etc.)\n"
+            "   - Grad clipping, loss scaling, precision settings\n\n"
+            "Save this blueprint to memory:\n"
+            "  memory_write(key='migration_blueprint', content='...')\n\n"
+            "▶ YOUR NEXT ACTION (in this order):\n"
+            "1. Read the source model's __init__() and forward() to understand the architecture\n"
+            "2. SURVEY Megatron-Core's available components — check what already exists:\n"
+            "   - megatron/core/models/ (GPTModel, CLIPViTModel, LLaVAModel, etc.)\n"
+            "   - megatron/core/transformer/ (TransformerLayer, layer specs)\n"
+            "   - megatron/core/extensions/transformer_engine.py (TE integration)\n"
+            "   - flagscale/models/megatron/ (existing ported models as reference)\n"
+            "   For each source component, ask: does Megatron/TE already have this?\n"
+            "3. Read the source training script's data pipeline and optimizer config\n"
+            "4. Write the blueprint: source component → TE/Megatron component (or 'compose' / 'custom')\n"
+            "5. Save blueprint to memory, THEN start implementing"
+        )
+        return {
+            "name": "migration_blueprint",
+            "description": "Mode 2 requires a migration blueprint before writing code",
+            "reason": "Writing model code but no blueprint found in memory",
+            "detail": detail,
+        }
+
+    # ── Megatron Native integrity gate ─────────────────────────────────
+
+    _HF_IMPORT_PATTERNS = re.compile(
+        r'from\s+transformers\s+import\s+\w+|'
+        r'from\s+transformers\.models\.\w+|'
+        r'AutoModel\w*\.from_pretrained|'
+        r'(Siglip|Clip|Llama|Qwen|Mistral|Gemma|Phi)\w*(Model|ForCausalLM|VisionModel|Encoder)',
+        re.IGNORECASE
+    )
+    _REUSE_SOURCE_MODEL_PATTERNS = re.compile(
+        r'\.from_pretrained\s*\(|'
+        r'\.from_config\s*\(|'
+        r'AutoModel\w*\s*\.\s*from_|'
+        r'# (?:reuse|wrap|import|use)\s+(?:original|source|existing|HF)',
+        re.IGNORECASE
+    )
+    _MEGATRON_NATIVE_INDICATORS = re.compile(
+        r'ColumnParallelLinear|RowParallelLinear|TEDotProductAttention|'
+        r'TransformerLayer|ModuleSpec|TransformerLayerSubmodules|'
+        r'tensor_model_parallel|set_input_tensor|layer_spec|'
+        r'VocabParallelEmbedding|FusedLayerNorm|TENorm|'
+        r'megatron\.core\.tensor_parallel|megatron\.core\.transformer'
+    )
+
+    def _check_megatron_native_integrity_gate(self, tool_name, arguments):
+        """HARD BLOCK: Detect Mode 2 (Megatron Native) that actually uses HF models internally.
+
+        If the porting path is mode_b (Megatron Native), ALL model components MUST use
+        Megatron's parallelism primitives (ColumnParallelLinear, TEDotProductAttention, etc.).
+        This includes frozen/non-trainable components — 'frozen' is a training decision,
+        not an architecture decision. Importing HuggingFace models directly defeats the
+        entire purpose of Megatron Native porting — it breaks unified checkpoint conversion,
+        prevents future unfreezing, and fragments the architecture.
+        """
+        if not self._porting_mode:
+            return ""
+        if not hasattr(self, '_confirmed_porting_path'):
+            return ""
+        if self._confirmed_porting_path != "mode_b":
+            return ""
+        if tool_name not in ("write_file", "edit_file", "shell"):
+            return ""
+
+        if tool_name in ("write_file", "edit_file"):
+            path = arguments.get("path", "") or arguments.get("file_path", "")
+            content = arguments.get("content", "") or arguments.get("new_string", "")
+        else:
+            cmd = arguments.get("command", "")
+            if not self._SHELL_WRITE_PATTERN.search(cmd):
+                return ""
+            path = self._extract_shell_write_target(cmd) or ""
+            content = cmd
+
+        if not path:
+            return ""
+
+        # Only check model implementation files
+        if not self._MODEL_CODE_PATHS.search(path):
+            return ""
+
+        # Check if content imports HF models or reuses source VLA models
+        has_hf_imports = bool(self._HF_IMPORT_PATTERNS.search(content))
+        has_reuse_source = bool(self._REUSE_SOURCE_MODEL_PATTERNS.search(content))
+        if not has_hf_imports and not has_reuse_source:
+            return ""
+
+        # Check if content ALSO uses Megatron native primitives
+        has_megatron_primitives = bool(self._MEGATRON_NATIVE_INDICATORS.search(content))
+        if has_megatron_primitives:
+            # Mixed code: has both HF imports AND Megatron primitives.
+            # Use LLM judge to determine if this is genuine Megatron-native code that
+            # references HF for weight conversion/comparison, or a wrapper that sprinkles
+            # Megatron symbols to bypass this gate.
+            if self._llm_judge_is_genuine_megatron_native(content, path):
+                return ""
+            # LLM says it's a wrapper disguised with Megatron imports
+            return (
+                "[MEGATRON NATIVE INTEGRITY GATE — BLOCKED]\n\n"
+                "Your code imports HuggingFace models AND has some Megatron symbols, but the "
+                "core architecture is still wrapping/delegating to HF models rather than "
+                "rebuilding with Megatron primitives.\n\n"
+                "⚠️ Adding a few Megatron imports to a wrapper does NOT make it Megatron Native.\n"
+                "The model's forward pass must flow through Megatron/TE layers, not through "
+                "HF model.forward().\n\n"
+                "⚠️ 'The component is frozen / no gradient / feature extractor' is NOT a valid "
+                "reason to use HF models. ALL components must be Megatron-native for:\n"
+                "- Unified checkpoint conversion (one converter for the whole model)\n"
+                "- Future unfreezing (architecture supports it without rewrite)\n"
+                "- TP memory distribution (even frozen params can be sharded)\n"
+                "- Architectural consistency (one top-level MegatronModule)\n\n"
+                "The correct approach:\n"
+                "1. READ the source model's forward() to understand the ALGORITHM\n"
+                "2. REWRITE using TE/Megatron primitives — the forward logic flows through "
+                "TransformerLayer, TEDotProductAttention, ColumnParallelLinear, etc.\n"
+                "3. HF imports are ONLY acceptable for weight loading/conversion utilities, "
+                "NOT as runtime model components.\n"
+                "4. Set requires_grad=False for frozen components AFTER building them natively.\n\n"
+                "▶ YOUR NEXT ACTION:\n"
+                "Remove the HF model as a runtime component. Rebuild its layers using "
+                "Megatron primitives.\n"
+                "Reference: `flagscale/models/megatron/qwen2_5_vl/`, `flagscale/models/megatron/qwen3_vl/`"
+            )
+
+        violation_type = (
+            "uses .from_pretrained() or .from_config() to load existing model classes"
+            if has_reuse_source and not has_hf_imports
+            else "imports HuggingFace models"
+        )
+
+        return (
+            "[MEGATRON NATIVE INTEGRITY GATE — BLOCKED]\n\n"
+            f"You chose Mode 2 (Megatron Native) but your model code {violation_type} "
+            "WITHOUT using any Megatron parallelism primitives.\n\n"
+            "⚠️ 'Megatron Native' means REWRITING the model logic using Megatron primitives "
+            "and TransformerEngine (TE), NOT importing/wrapping existing model classes.\n\n"
+            "⚠️ ALL components must be native — including frozen/non-trainable ones. "
+            "'Frozen' is a training config decision (requires_grad=False), not an architecture "
+            "decision. A frozen component still needs Megatron primitives for unified checkpoint "
+            "conversion, future unfreezing, and TP memory distribution.\n\n"
+            "The correct approach:\n"
+            "1. READ the source model's forward() to understand the ALGORITHM\n"
+            "2. REWRITE using TE/Megatron primitives (prefer TE where available):\n"
+            "   - nn.Linear → ColumnParallelLinear / RowParallelLinear (TE, FP8 capable)\n"
+            "   - Self-attention → TEDotProductAttention (flash/fused backends)\n"
+            "   - Transformer blocks → TransformerLayer with TE submodules via layer_spec\n"
+            "   - LayerNorm/RMSNorm → TE FusedLayerNorm / FusedRMSNorm\n"
+            "   - Embeddings → VocabParallelEmbedding\n"
+            "   Only use vanilla torch when no TE/Megatron equivalent exists.\n"
+            "3. The forward() logic (how tensors flow) can be the same\n"
+            "4. The IMPLEMENTATION of each component must use TE/Megatron primitives\n"
+            "5. For frozen components: build natively, then set requires_grad=False\n\n"
+            "▶ YOUR NEXT ACTION:\n"
+            "Read the source model's forward() and __init__() to extract the algorithm.\n"
+            "Then implement it from scratch using TE/Megatron primitives.\n"
+            "Reference: `flagscale/models/megatron/qwen2_5_vl/`, `flagscale/models/megatron/qwen3_vl/`"
+        )
+
+    # ── Mode B design integrity gate ──────────────────────────────────
+
+    _WRAPPER_DESIGN_SIGNALS = re.compile(
+        r'wrap.*(?:HF|huggingface|existing).*model|'
+        r'keep.*(?:HF|huggingface|existing).*(?:model|module)|'
+        r'(?:HF|huggingface).*model.*(?:inside|within)|'
+        r'(?:DDP|FSDP|DistributedDataParallel).*only|'
+        r'data.parallel.only|'
+        r'(?:not|don.t|skip).*(?:TP|tensor.parallel|pipeline.parallel)|'
+        r'frozen.*(?:skip|keep|use.*HF|use.*existing|no.*need|don.t.*need)|'
+        r'(?:no.*gradient|no.*train).*(?:skip|keep|use.*HF|don.t.*need)|'
+        r'(?:backbone|encoder|vision).*frozen.*(?:as.is|HF|existing|load.*pretrained)',
+        re.IGNORECASE,
+    )
+
+    _WRAPPER_CODE_SIGNALS = re.compile(
+        r'self\.\w+\s*=\s*\w+(Model|ForCausalLM|VisionModel|Encoder)\s*\(|'
+        r'self\.\w+\s*=\s*\w+\.from_pretrained\s*\(|'
+        r'self\.\w+\s*=\s*\w+\.from_config\s*\(|'
+        r'(?:output|hidden|features)\s*=\s*self\.\w+\s*\(\s*(?:input|x|hidden|pixel)|'
+        r'self\.(?:backbone|encoder|vision_model)\s*=\s*None|'
+        r'torch\.no_grad.*self\.(?:backbone|encoder|vision)',
+        re.IGNORECASE,
+    )
+
+    def _check_mode_b_design_integrity_gate(self, tool_name, arguments):
+        """HARD BLOCK: detect wrapper code in write_file/edit_file during Mode B porting.
+
+        Blocks model code that instantiates HF model classes as runtime submodules.
+        """
+        if not self._porting_mode:
+            return ""
+        if not hasattr(self, '_confirmed_porting_path'):
+            return ""
+        if self._confirmed_porting_path != "mode_b":
+            return ""
+        if tool_name not in ("write_file", "edit_file"):
+            return ""
+
+        path = arguments.get("path", "") or arguments.get("file_path", "")
+        content = arguments.get("content", "") or arguments.get("new_string", "")
+        if not path or not content:
+            return ""
+        if not self._MODEL_CODE_PATHS.search(path):
+            return ""
+        # Detect code that instantiates HF models as runtime submodules
+        has_wrapper_code = bool(self._WRAPPER_CODE_SIGNALS.search(content))
+        if not has_wrapper_code:
+            return ""
+        # Check if it also has real Megatron primitives as the primary architecture
+        has_megatron_primitives = bool(self._MEGATRON_NATIVE_INDICATORS.search(content))
+        if has_megatron_primitives:
+            # Mixed — defer to megatron_native_integrity gate's LLM judge
+            return ""
+        return (
+            "[MODE B DESIGN INTEGRITY GATE — BLOCKED]\n\n"
+            "Your model code instantiates HuggingFace model classes as runtime submodules. "
+            "This is a wrapper approach (Mode C), NOT Megatron Native (Mode B).\n\n"
+            "In Mode B, the model's __init__ must construct ALL layers from Megatron/TE primitives:\n"
+            "- TransformerLayer (with layer_spec)\n"
+            "- TEDotProductAttention\n"
+            "- ColumnParallelLinear / RowParallelLinear\n"
+            "- VocabParallelEmbedding\n"
+            "- FusedLayerNorm / TENorm\n\n"
+            "This applies to ALL components — including frozen/non-trainable ones.\n"
+            "'Frozen' is a training decision (requires_grad=False), not an architecture decision.\n"
+            "A frozen component must still be Megatron-native for unified checkpoint conversion, "
+            "future unfreezing, and architectural consistency.\n\n"
+            "HF model classes (SiglipVisionModel, Qwen2ForCausalLM, etc.) must NOT appear "
+            "as self.xxx = HFModel(...) in the Megatron-native implementation.\n\n"
+            "▶ YOUR NEXT ACTION:\n"
+            "Read the source HF model's __init__() and forward() to extract the algorithm, "
+            "then rebuild using Megatron/TE primitives. For frozen components, build natively "
+            "then set requires_grad=False.\n"
+            "Reference: `flagscale/models/megatron/qwen2_5_vl/`, `flagscale/models/megatron/qwen3_vl/`"
+        )
+
+    def _check_mode_b_design_integrity_soft_gate(self, tool_name, arguments):
+        """Soft warning: detect wrapper/DDP-only design language in plans or memory during Mode B."""
+        if not self._porting_mode:
+            return ""
+        if not hasattr(self, '_confirmed_porting_path'):
+            return ""
+        if self._confirmed_porting_path != "mode_b":
+            return ""
+        if tool_name not in ("plan_create", "plan_update", "memory_write"):
+            return ""
+        if getattr(self, '_mode_b_design_warnings', 0) >= 2:
+            return ""
+
+        content = arguments.get("content", "") or arguments.get("plan", "")
+        if not content:
+            return ""
+
+        if not self._WRAPPER_DESIGN_SIGNALS.search(content):
+            return ""
+
+        # Check if it also mentions real Mode B primitives — if so, might be mixed/valid
+        has_real_primitives = bool(re.search(
+            r'ColumnParallelLinear|RowParallelLinear|TEDotProductAttention|'
+            r'TransformerLayer|layer_spec|VocabParallelEmbedding',
+            content
+        ))
+        if has_real_primitives:
+            return ""
+
+        if not hasattr(self, '_mode_b_design_warnings'):
+            self._mode_b_design_warnings = 0
+        self._mode_b_design_warnings += 1
+
+        detail = (
+            "\n\n[MODE B DESIGN WARNING] Your plan/design describes a wrapper or DDP-only approach, "
+            "but the user confirmed Mode B (Megatron Native).\n\n"
+            "Mode B means ALL components — including frozen ones — use Megatron primitives:\n"
+            "- Rebuild model layers using Megatron primitives and TransformerEngine (TE)\n"
+            "- Prefer TE layers: TEDotProductAttention, ColumnParallelLinear, RowParallelLinear, "
+            "TransformerLayer with TE submodules\n"
+            "- TP support is per-component (assess each component), but even without TP, "
+            "use Megatron primitives (not HF classes)\n"
+            "- Use layer_spec system for model construction\n"
+            "- Use broadcast_data in get_batch for TP data distribution\n\n"
+            "CRITICAL: 'Component is frozen / no gradient / feature extractor' is NOT a valid "
+            "reason to use HF models. Frozen components must still be Megatron-native for: "
+            "unified checkpoint conversion, future unfreezing, TP memory distribution.\n\n"
+            "There is ONE top-level MegatronModule. Every submodule lives inside it. "
+            "Freeze/unfreeze is set via requires_grad — it is never an architecture decision.\n\n"
+            "Wrapping an existing HF model inside MegatronModule is Mode C, not Mode B.\n"
+            "Refer to existing Megatron-native models: flagscale/models/megatron/qwen2_5_vl/, "
+            "flagscale/models/megatron/qwen3_vl/"
+        )
+        return {
+            "name": "mode_b_design_integrity",
+            "description": "Detects wrapper/DDP-only design in Mode B porting plans",
+            "reason": "Plan describes wrapping existing model instead of rebuilding with Megatron primitives",
+            "detail": detail,
+        }
+
+    # ── Megatron primitives usage gate ─────────────────────────────────
+
+    _VANILLA_TORCH_PATTERNS = re.compile(
+        r'nn\.Linear\(|nn\.Embedding\(|nn\.LayerNorm\(|'
+        r'F\.scaled_dot_product_attention|'
+        r'torch\.nn\.functional\.scaled_dot_product_attention'
+    )
+
+    def _check_megatron_primitives_usage_gate(self, tool_name, arguments):
+        """Soft warning: Mode 2 code uses ONLY vanilla torch with zero Megatron primitives.
+
+        Priority for Megatron Native implementation:
+        1. Megatron has a ready primitive → use it directly
+        2. Can be assembled from Megatron primitives → compose them
+        3. No Megatron equivalent exists → then use torch
+
+        This gate only fires when the code is ENTIRELY vanilla torch (suggesting
+        the LLM didn't even try to use Megatron primitives). Mixed usage is fine —
+        some custom ops legitimately need torch when Megatron has no equivalent.
+
+        Fires at most 3 times per session.
+        """
+        if not self._porting_mode:
+            return ""
+        if not hasattr(self, '_confirmed_porting_path'):
+            return ""
+        if self._confirmed_porting_path != "mode_b":
+            return ""
+        if tool_name not in ("write_file", "edit_file"):
+            return ""
+        if getattr(self, '_primitives_usage_warnings', 0) >= 3:
+            return ""
+
+        path = arguments.get("path", "") or arguments.get("file_path", "")
+        content = arguments.get("content", "") or arguments.get("new_string", "")
+
+        if not self._MODEL_CODE_PATHS.search(path):
+            return ""
+
+        # Count vanilla torch usage — need significant amount to trigger
+        vanilla_matches = self._VANILLA_TORCH_PATTERNS.findall(content)
+        if len(vanilla_matches) < 5:
+            return ""  # Small amount is fine (custom ops, small projections)
+
+        # If ANY Megatron primitives are present, the LLM is trying — don't warn
+        has_megatron = bool(self._MEGATRON_NATIVE_INDICATORS.search(content))
+        if has_megatron:
+            return ""
+
+        if not hasattr(self, '_primitives_usage_warnings'):
+            self._primitives_usage_warnings = 0
+        self._primitives_usage_warnings += 1
+
+        detail = (
+            "\n\n[MEGATRON PRIMITIVES WARNING] Your Mode 2 model code uses "
+            f"{len(vanilla_matches)} vanilla torch modules (nn.Linear, nn.Embedding, etc.) "
+            "with zero Megatron primitives.\n\n"
+            "Priority for Megatron Native (prefer TE wherever possible):\n"
+            "  1. Megatron has a high-level model → USE IT (GPTModel, CLIPViTModel, LLaVAModel)\n"
+            "  2. TransformerEngine (TE) layer available → USE IT:\n"
+            "     - Attention: TEDotProductAttention (flash/fused backends, CP-aware)\n"
+            "     - Linear: ColumnParallelLinear / RowParallelLinear (FP8 capable)\n"
+            "     - Norm: TE FusedLayerNorm / RMSNorm\n"
+            "     - Full block: TransformerLayer with TE submodules via layer_spec\n"
+            "  3. Megatron primitive without TE → USE IT (VocabParallelEmbedding, etc.)\n"
+            "  4. Can be composed from Megatron/TE primitives → compose them\n"
+            "  5. No Megatron/TE equivalent at all → THEN use torch\n\n"
+            "TE is NOT mandatory, but strongly preferred — it enables FP8, fused kernels, "
+            "and seamless CP/TP integration. Only skip TE when the component has no TE equivalent "
+            "(e.g., custom gating, per-joint encoders, specialized loss functions).\n\n"
+            "A file with 5+ nn.Linear and zero Megatron/TE imports suggests you're writing "
+            "a pure-torch reimplementation instead of using Megatron's high-performance modules.\n"
+            "Survey megatron/core/models/ and flagscale/models/megatron/ first."
+        )
+        return {
+            "name": "megatron_primitives_usage",
+            "description": "Checks model code for Megatron primitive usage",
+            "reason": f"{len(vanilla_matches)} vanilla torch modules with zero Megatron imports",
+            "detail": detail,
+        }
+
     # ── Data pipeline comprehension gate ────────────────────────────────
 
     _DATA_WRITE_PATHS = re.compile(
@@ -902,6 +1892,18 @@ class GatesMixin:
         if not self._DATA_WRITE_PATHS.search(target):
             return ""
 
+        # Use LLM to check if memory contains data pipeline understanding
+        entries = self.session_memory.list_entries()
+        has_pipeline_knowledge = self._llm_check_memory_has_knowledge(
+            entries,
+            "data pipeline understanding: source data format, processing/tokenization steps, "
+            "and how data enters the model (get_batch, dataloader, dataset class)"
+        )
+        if has_pipeline_knowledge:
+            self._data_pipeline_understood = True
+            return ""
+
+        # Fallback: check file read coverage
         data_reads = 0
         covered = set()
         for path in self._files_read_this_session:
@@ -909,6 +1911,9 @@ class GatesMixin:
                 if pattern.search(path):
                     covered.add(cat)
                     data_reads += 1
+
+        if data_reads >= self._MIN_DATA_READS and len(covered) >= self._MIN_DATA_CATEGORIES:
+            return ""
 
         issues = []
         if data_reads < self._MIN_DATA_READS:
@@ -926,9 +1931,6 @@ class GatesMixin:
                 "Missing categories:\n" +
                 "\n".join(f"    - {descs[m]}" for m in sorted(missing))
             )
-
-        if not issues:
-            return ""
 
         return (
             "\n\n[DATA PIPELINE GATE] You must understand the full data pipeline before "
@@ -965,15 +1967,13 @@ class GatesMixin:
         if not is_data_pipeline:
             return ""
 
-        # Check if parallelism strategy has been documented
+        # Check if parallelism strategy has been documented (LLM-based)
         entries = self.session_memory.list_entries()
-        has_parallelism_doc = any(
-            any(kw in (e.get("content") or "").lower()
-                for kw in ("tp=", "pp=", "dp=", "ep=", "cp=", "sp=",
-                           "tensor parallel", "pipeline parallel", "data parallel",
-                           "expert parallel", "context parallel", "sequence parallel",
-                           "broadcast_data", "parallelism strategy", "parallel strategy"))
-            for e in entries
+        has_parallelism_doc = self._llm_check_memory_has_knowledge(
+            entries,
+            "parallelism strategy documentation: tensor parallel (TP), pipeline parallel (PP), "
+            "data parallel (DP), expert parallel (EP), context parallel (CP), or sequence parallel (SP) "
+            "configuration and how data/model is distributed across ranks"
         )
 
         # Check if content mentions parallelism handling
@@ -992,6 +1992,9 @@ class GatesMixin:
         return (
             "[DATA PARALLELISM GATE — BLOCKED]\n\n"
             "Data pipeline implementation BLOCKED. Parallelism strategy not documented.\n\n"
+            "⚠️ CRITICAL PRINCIPLE: A data pipeline without parallelism awareness is a FAILED "
+            "Megatron integration. There is NO valid Megatron data pipeline that ignores parallelism. "
+            "This is not optional — it is the fundamental contract of distributed training.\n\n"
             "In distributed training, data pipeline MUST be designed with ALL parallelism dimensions:\n"
             "- TP (Tensor Parallel): All TP ranks receive IDENTICAL input\n"
             "  → Use broadcast_data() from megatron.training.utils\n"
@@ -1011,7 +2014,179 @@ class GatesMixin:
             "3. Identify which ranks need which data and in what format\n"
             "4. Consider special cases: MoE routing, long sequences, packed samples\n"
             "5. Save to memory (workspace_experiment or memory_write)\n\n"
-            "Data pipeline and parallelism are NOT separable — design them together.\n"
+            "Data pipeline and parallelism are NOT separable — they are ONE design.\n"
+            "If you write get_batch without broadcast_data/pre_process/post_process, "
+            "it WILL deadlock or produce wrong results at runtime."
+        )
+
+    # ── Train script data pipeline completeness gate ────────────────────
+
+    _TRAIN_SCRIPT_PATH = re.compile(r'(pretrain_|train_).*\.py$')
+
+    def _check_train_script_data_pipeline_gate(self, tool_name, arguments):
+        """HARD BLOCK: Ensure train script properly integrates data pipeline.
+
+        When writing train_xxx.py, the LLM often treats it as purely a model adapter
+        (model_provider + forward_step) and either stubs get_batch or omits data
+        pipeline considerations entirely. This gate enforces that data pipeline
+        integration is treated as equally important as model adaptation.
+        """
+        if not self._porting_mode:
+            return ""
+        if tool_name not in ("write_file", "edit_file", "shell"):
+            return ""
+
+        if tool_name in ("write_file", "edit_file"):
+            path = arguments.get("path", "") or arguments.get("file_path", "")
+            content = arguments.get("content", "") or arguments.get("new_string", "")
+        else:
+            cmd = arguments.get("command", "")
+            if not self._SHELL_WRITE_PATTERN.search(cmd):
+                return ""
+            path = self._extract_shell_write_target(cmd) or ""
+            content = cmd
+
+        if not self._TRAIN_SCRIPT_PATH.search(path):
+            return ""
+
+        has_model_provider = "model_provider" in content or "def forward_step" in content
+        if not has_model_provider:
+            return ""
+
+        has_get_batch = "def get_batch" in content or "get_batch" in content
+        has_real_data_logic = any(kw in content for kw in (
+            "tokenizer", "input_ids", "attention_mask", "labels",
+            "data_path", "dataset", "DataLoader", "data_config",
+            "image", "pixel_values", "multimodal",
+        ))
+        has_parallelism_in_data = any(kw in content for kw in (
+            "broadcast_data", "get_data_parallel",
+            "pre_process", "post_process",
+            "tensor_model_parallel", "pipeline_model_parallel",
+        ))
+        uses_dummy_data = any(kw in content for kw in (
+            "torch.rand(", "torch.randn(", "torch.zeros(",
+            "torch.ones(", "dummy", "fake_data", "random_tensor",
+            "placeholder", "mock_batch", "synthetic",
+        ))
+
+        issues = []
+        if uses_dummy_data:
+            issues.append(
+                "DUMMY/FAKE DATA DETECTED — using torch.rand/zeros/ones or synthetic data "
+                "is STRICTLY FORBIDDEN during porting. You MUST use real data pipeline integration"
+            )
+        if not has_get_batch:
+            issues.append("Missing get_batch() — data pipeline entry point is absent")
+        elif not has_real_data_logic:
+            issues.append(
+                "get_batch() appears to be a stub or placeholder — "
+                "no real data loading logic (tokenizer, input_ids, data_path, etc.)"
+            )
+        if not has_parallelism_in_data:
+            issues.append(
+                "No parallelism handling in data flow — "
+                "missing broadcast_data/pre_process/post_process/parallel group references"
+            )
+
+        if not issues:
+            return ""
+
+        return (
+            "[TRAIN SCRIPT DATA PIPELINE GATE — BLOCKED]\n\n"
+            "Your train script is incomplete: data pipeline integration is EQUALLY important "
+            "as model adaptation. A train script is NOT just model_provider + forward_step.\n\n"
+            "Issues found:\n" +
+            "\n".join(f"  - {i}" for i in issues) + "\n\n"
+            "🚫 DUMMY DATA IS STRICTLY FORBIDDEN:\n"
+            "   Do NOT use torch.rand/randn/zeros/ones as input data for verification.\n"
+            "   Do NOT create synthetic/fake/placeholder batches.\n"
+            "   ALL verification must use REAL data pipeline with actual data loading.\n\n"
+            "A complete train script MUST include:\n"
+            "1. get_batch() — REAL data loading, tokenization, and formatting\n"
+            "   - Connect to actual dataset (data_path from config)\n"
+            "   - Real tokenization and preprocessing\n"
+            "   - Correct keys/shapes/dtypes for the model's forward()\n"
+            "2. Parallelism-aware data distribution:\n"
+            "   - broadcast_data() for TP rank consistency\n"
+            "   - pre_process/post_process guards for PP stages\n"
+            "   - Correct micro-batch handling for DP\n"
+            "3. Data format alignment with model expectations:\n"
+            "   - Input tensor names matching model forward() signature\n"
+            "   - Proper padding, masking, and label construction\n\n"
+            "▶ YOUR NEXT ACTION: Before writing this train script, read an existing "
+            "train_*.py (e.g., train_gpt.py or a VL train script) to understand how "
+            "get_batch integrates with the training loop. Then implement get_batch with "
+            "REAL data logic and parallelism support — not a stub, not dummy data.\n\n"
+            "Data pipeline is NOT something to 'add later after checkpoint works'. "
+            "A train script without proper data integration WILL fail at runtime."
+        )
+
+    # ── No dummy data gate ─────────────────────────────────────────────
+
+    _DUMMY_DATA_PATTERNS = re.compile(
+        r'torch\.(rand|randn|zeros|ones|empty)\s*\(|'
+        r'dummy[_\s]*(data|batch|input|tensor)|'
+        r'fake[_\s]*(data|batch|input|tensor)|'
+        r'random[_\s]*(input|batch|tensor)|'
+        r'synthetic[_\s]*(data|batch)|'
+        r'placeholder[_\s]*(data|batch)',
+        re.IGNORECASE
+    )
+
+    def _check_no_dummy_data_gate(self, tool_name, arguments):
+        """HARD BLOCK: Forbid dummy/synthetic data for model verification during porting.
+
+        During model porting, ALL verification must use real data pipeline.
+        Using torch.rand/zeros/ones as model input hides data integration bugs
+        that only surface later, wasting time.
+        """
+        if not self._porting_mode:
+            return ""
+        if tool_name not in ("write_file", "edit_file", "shell"):
+            return ""
+
+        if tool_name in ("write_file", "edit_file"):
+            path = arguments.get("path", "") or arguments.get("file_path", "")
+            content = arguments.get("content", "") or arguments.get("new_string", "")
+        else:
+            cmd = arguments.get("command", "")
+            content = cmd
+            path = ""
+
+        if not content:
+            return ""
+
+        # Only check files/commands that involve model invocation for verification
+        # (not model definition files that happen to define forward())
+        is_model_invocation = any(kw in content for kw in (
+            "model(", "model.forward(", "output = model",
+            "verify", "test_forward", "sanity_check", "inference",
+        ))
+        # Model definition files (class with def forward) are NOT verification
+        is_model_definition = "class " in content and "def forward(" in content
+        if not is_model_invocation or is_model_definition:
+            return ""
+
+        if not self._DUMMY_DATA_PATTERNS.search(content):
+            return ""
+
+        return (
+            "[NO DUMMY DATA GATE — BLOCKED]\n\n"
+            "🚫 DUMMY/SYNTHETIC DATA IS STRICTLY FORBIDDEN for model verification during porting.\n\n"
+            "You are attempting to verify the model using torch.rand/zeros/ones or synthetic data. "
+            "This is NOT allowed because:\n"
+            "1. Dummy data hides data pipeline integration bugs\n"
+            "2. Shape/dtype mismatches between real data and model only surface with real data\n"
+            "3. You will have to redo this verification anyway once real data is connected\n"
+            "4. It creates a false sense of progress — 'model works' with dummy data means nothing\n\n"
+            "▶ YOUR NEXT ACTION: Implement the REAL data pipeline first:\n"
+            "1. Read the existing train_*.py to understand get_batch interface\n"
+            "2. Implement get_batch with real data loading (tokenizer, data_path, etc.)\n"
+            "3. Use the real get_batch output to verify the model\n\n"
+            "ALL verification must flow through the real data pipeline. "
+            "There are NO exceptions — not for 'quick checks', not for 'just testing shapes', "
+            "not for 'I'll add real data later'. Real data integration comes FIRST."
         )
 
     # ── Lightweight understanding check (non-porting tasks) ─────────────
@@ -1024,6 +2199,87 @@ class GatesMixin:
         "example_config": re.compile(r'(example|sample|template|default).*\.(yaml|yml|toml)', re.IGNORECASE),
         "existing_config": re.compile(r'(config|conf).*\.(yaml|yml|toml|py)', re.IGNORECASE),
     }
+
+    # ── Parallelism assessment gate ──────────────────────────────────────
+
+    _TRAINING_CONFIG_PATTERNS = re.compile(
+        r'conf/.*\.(yaml|yml)$|train.*config.*\.(yaml|yml)$'
+    )
+
+    def _check_parallelism_assessment_gate(self, tool_name, arguments):
+        """Soft warning: training config written without parallelism feasibility assessment.
+
+        When writing training YAML configs, the agent should have already assessed
+        which parallelism strategies are feasible for this model based on its actual
+        dimensions (hidden_size, num_heads, num_layers, seq_len). Without this,
+        the config may specify strategies that don't work (e.g., TP=8 when num_kv_heads=4)
+        or miss strategies that would be beneficial.
+
+        Fires at most twice per session.
+        """
+        if not self._porting_mode and not self._data_prep_mode:
+            return ""
+        if tool_name not in ("write_file", "edit_file"):
+            return ""
+        if getattr(self, '_parallelism_assessment_warnings', 0) >= 2:
+            return ""
+
+        target = arguments.get("path", "") or arguments.get("file_path", "")
+        if not self._TRAINING_CONFIG_PATTERNS.search(target):
+            return ""
+
+        content = arguments.get("content", "") or arguments.get("new_string", "")
+        # Only trigger if config mentions parallelism settings
+        mentions_parallelism = any(
+            kw in content
+            for kw in ("tensor_model_parallel", "pipeline_model_parallel",
+                       "context_parallel", "expert_model_parallel",
+                       "sequence_parallel", "data_parallel",
+                       "tp_size", "pp_size", "cp_size", "ep_size")
+        )
+        if not mentions_parallelism:
+            return ""
+
+        # Check if parallelism assessment has been documented in memory (LLM-based)
+        entries = self.session_memory.list_entries()
+        has_assessment = self._llm_check_memory_has_knowledge(
+            entries,
+            "parallelism feasibility assessment: whether model dimensions (num_heads, hidden_size) "
+            "are divisible by TP/PP/EP degrees, and recommended parallelism strategy"
+        )
+
+        if has_assessment:
+            return ""
+
+        # Check if content itself shows assessment awareness
+        content_lower = content.lower()
+        has_inline_assessment = (
+            "num_heads" in content_lower and
+            ("divisible" in content_lower or "feasib" in content_lower)
+        )
+        if has_inline_assessment:
+            return ""
+
+        if not hasattr(self, '_parallelism_assessment_warnings'):
+            self._parallelism_assessment_warnings = 0
+        self._parallelism_assessment_warnings += 1
+
+        return (
+            "\n\n[PARALLELISM ASSESSMENT WARNING] You are writing a training config with "
+            "parallelism settings but have not documented a parallelism feasibility assessment.\n\n"
+            "Before choosing TP/PP/CP/SP/EP values, assess feasibility based on actual model dimensions:\n"
+            "- TP: num_heads must be divisible by TP degree (also num_kv_heads for GQA)\n"
+            "- PP: stages must be roughly balanced in params (max/min < 2x)\n"
+            "- SP: only useful with TP, and only if seq_len × hidden is large\n"
+            "- CP: only useful if seq_len > 4096\n"
+            "- EP: only if model has MoE layers\n"
+            "- If model fits on single GPU (params × 18 < GPU_mem × 0.8), TP/PP add overhead without benefit\n\n"
+            "Save assessment to memory (memory_write key='parallelism_assessment') with:\n"
+            "1. Model dimensions (hidden, heads, kv_heads, layers, seq_len, total params)\n"
+            "2. Per-strategy feasibility verdict\n"
+            "3. Recommended combination for target GPU count\n"
+            "4. Strategies explicitly NOT recommended and why"
+        )
 
     def _check_config_understanding(self, tool_name, arguments):
         """Soft reminder: read docs/examples before writing configs from scratch.
@@ -1095,6 +2351,7 @@ class GatesMixin:
             cmd = arguments.get("command", "")
             if re.search(r'convert.*checkpoint|checkpoint.*convert|ckpt.*convert|convert.*ckpt', cmd, re.I):
                 if current_idx < phase_order.index("checkpoint_conversion"):
+                    next_phase = phase_order[current_idx + 1] if current_idx + 1 < len(phase_order) else "unknown"
                     return (
                         f"[PHASE ORDERING GATE — BLOCKED]\n\n"
                         f"Current phase: {current_phase}\n"
@@ -1102,16 +2359,30 @@ class GatesMixin:
                         f"Required order:\n"
                         f"1. Complete model structure implementation\n"
                         f"2. Verify structure completeness (all components present)\n"
-                        f"3. Implement data pipeline with parallelism support\n"
+                        f"3. Implement data pipeline with parallelism support ← EQUALLY IMPORTANT as model\n"
                         f"4. THEN convert checkpoint\n\n"
-                        f"Converting checkpoint before data pipeline is ready wastes time — "
-                        f"data pipeline design may reveal missing model interfaces.\n"
+                        f"⚠ Data pipeline integration (get_batch, data loading, parallelism-aware distribution) "
+                        f"is NOT optional and NOT something to 'add later'. It must be implemented BEFORE "
+                        f"checkpoint conversion because runtime verification requires real data flow.\n\n"
+                        f"▶ YOUR NEXT ACTION: Complete the '{next_phase}' phase first. "
+                        f"Even if you believe the model structure is ready, you must explicitly "
+                        f"advance through each phase in order. "
+                        f"Use plan_update to mark the current phase done when its requirements are met.\n\n"
+                        f"Do NOT attempt checkpoint conversion again until you reach that phase."
                     )
 
-        # Detect data pipeline implementation
-        if tool_name == "write_file":
-            path = arguments.get("path", "")
-            content = arguments.get("content", "")
+        # Detect data pipeline implementation (write_file or shell write)
+        if tool_name in ("write_file", "shell"):
+            if tool_name == "write_file":
+                path = arguments.get("path", "")
+                content = arguments.get("content", "")
+            else:
+                cmd = arguments.get("command", "")
+                if not self._SHELL_WRITE_PATTERN.search(cmd):
+                    path, content = "", ""
+                else:
+                    path = self._extract_shell_write_target(cmd) or ""
+                    content = cmd
             is_data_pipeline = (
                 "get_batch" in content or
                 "dataset" in path.lower() or
@@ -1127,7 +2398,11 @@ class GatesMixin:
                     f"1. Complete model structure\n"
                     f"2. Verify structure completeness\n"
                     f"3. THEN implement data pipeline\n\n"
-                    f"Data pipeline must be designed with the final model structure in mind.\n"
+                    f"▶ YOUR NEXT ACTION: Finish the current phase ('{current_phase}') first. "
+                    f"If you're in 'structure_implementation', verify all model components are present. "
+                    f"If you're in 'structure_verification', run import tests and shape checks.\n\n"
+                    f"Even if you believe the model is complete, the gate requires explicit verification "
+                    f"before moving to data pipeline. Do NOT attempt data pipeline code again until the phase advances."
                 )
 
         # Detect training launch
@@ -1142,10 +2417,98 @@ class GatesMixin:
                         f"Complete these phases first:\n"
                         f"- Model structure implementation and verification\n"
                         f"- Data pipeline with parallelism support\n"
-                        f"- Checkpoint conversion\n"
+                        f"- Checkpoint conversion\n\n"
+                        f"▶ YOUR NEXT ACTION: Complete the '{current_phase}' phase. "
+                        f"Do NOT launch training until all prior phases are done."
                     )
 
         return ""
+
+    # ── Model completeness check gate ────────────────────────────────────
+
+    def _check_model_completeness_gate(self, tool_name, arguments):
+        """Soft warning: model class written without all enumerated components.
+
+        When writing a top-level model class (__init__ with self.xxx = ...),
+        checks whether the documented structure enumeration in memory contains
+        components that are NOT present in the code being written. This catches
+        the common mistake of implementing a model shell that's missing submodules.
+
+        Fires at most 3 times per session.
+        """
+        if not self._porting_mode:
+            return ""
+        if tool_name not in ("write_file", "edit_file"):
+            return ""
+        if getattr(self, '_model_completeness_warnings', 0) >= 3:
+            return ""
+
+        path = arguments.get("path", "") or arguments.get("file_path", "")
+        content = arguments.get("content", "") or arguments.get("new_string", "")
+
+        # Only trigger for model implementation files with class definitions
+        if not self._MODEL_CODE_PATHS.search(path):
+            return ""
+        if "class " not in content or "def __init__" not in content:
+            return ""
+
+        # Extract self.xxx assignments from the written code
+        written_attrs = set(re.findall(r'self\.(\w+)\s*=', content))
+        if len(written_attrs) < 2:
+            return ""  # Too small to be a top-level model
+
+        # Check memory for structure enumeration (use semantic search)
+        relevant = self.session_memory.query_relevant(
+            ["component", "checklist", "structure", "enumeration", "module", "submodules", "porting"],
+            max_tokens=2000
+        )
+        enumeration_content = ""
+        for e in relevant:
+            enumeration_content += (e.get("content") or "") + "\n"
+
+        if not enumeration_content.strip():
+            return ""  # No enumeration to check against
+
+        # Extract component names from enumeration (look for patterns like
+        # "vision_encoder", "self.xxx", "- xxx", "[ ] xxx")
+        enum_components = set()
+        for m in re.finditer(
+            r'(?:self\.|(?:^|\n)\s*[-\[\]✓✗ ]*\s*)(\w+(?:_\w+)+)',
+            enumeration_content
+        ):
+            name = m.group(1)
+            if len(name) > 3 and name not in ('__init__', 'forward', 'def_forward'):
+                enum_components.add(name)
+
+        if not enum_components:
+            return ""
+
+        # Find components in enumeration but NOT in written code
+        missing = enum_components - written_attrs
+        # Filter out common false positives (method names, non-module attrs)
+        missing = {m for m in missing if not m.startswith(('num_', 'has_', 'is_', 'use_'))}
+
+        if len(missing) < 2:
+            return ""  # Minor gap, don't warn
+
+        if not hasattr(self, '_model_completeness_warnings'):
+            self._model_completeness_warnings = 0
+        self._model_completeness_warnings += 1
+
+        missing_list = ", ".join(sorted(missing)[:8])
+        return (
+            f"\n\n[MODEL COMPLETENESS WARNING] Your model class is missing components "
+            f"that appear in your structure enumeration:\n"
+            f"  Missing: {missing_list}\n"
+            f"  Written: {len(written_attrs)} attrs, Enumerated: {len(enum_components)} components\n\n"
+            f"A ported model must own ALL submodules from the source — including frozen ones. "
+            f"Excluding components (even 'frozen' ones) breaks unified checkpoint conversion "
+            f"and prevents future unfreezing. Whether a component is trained is a config "
+            f"decision (requires_grad), not an architecture decision.\n"
+            f"Check your enumeration and include all components in __init__.\n"
+            f"If these components are genuinely not needed (e.g., inference-only heads), "
+            f"document why in a comment."
+        )
 
     def _check_structure_completeness_gate(self, tool_name, arguments):
         """HARD BLOCK: Prevent checkpoint conversion before model structure is verified complete.
@@ -1182,13 +2545,12 @@ class GatesMixin:
         if getattr(self, '_structure_completeness_verified', False):
             return ""
 
-        # Check memory for structure enumeration evidence
+        # Check memory for structure enumeration evidence (LLM-based)
         entries = self.session_memory.list_entries()
-        has_enumeration = any(
-            any(kw in (e.get("content") or "").lower()
-                for kw in ("component checklist", "structure enumeration", "all components",
-                           "module tree", "total parameters", "porting checklist"))
-            for e in entries
+        has_enumeration = self._llm_check_memory_has_knowledge(
+            entries,
+            "model structure enumeration or porting checklist: a list of all source model components, "
+            "module tree, parameter counts, or component-by-component porting status"
         )
 
         if has_enumeration:
@@ -1909,10 +3271,12 @@ class GatesMixin:
     # ── Consolidated gate dispatch ─────────────────────────────────────
 
     def _run_pre_execution_gates(self, tool_name, arguments):
-        """Run all pre-execution gates. Returns (hard_block, warnings).
+        """Run all pre-execution gates. Returns (hard_block, soft_warnings).
 
-        hard_block: str or None — if set, tool execution is blocked and this is returned.
-        warnings: str — concatenated soft warnings to append to tool result.
+        hard_block: dict or None — if set, tool execution is blocked.
+            dict keys: name, description, reason, detail
+        soft_warnings: list of dicts — soft warnings to append to tool result.
+            Each dict has: name, description, reason, detail
         """
         # Hard-block gates (return immediately if triggered)
         hard_block_gates = [
@@ -1922,31 +3286,111 @@ class GatesMixin:
             self._check_porting_path_gate,
             self._check_porting_path_deviation_gate,
             self._check_pipeline_comprehension_gate,
+            self._check_data_model_interface_gate,
+            self._check_component_mapping_gate,
+            self._check_migration_blueprint_gate,
+            self._check_mode_b_design_integrity_gate,
+            self._check_megatron_native_integrity_gate,
             self._check_data_pipeline_gate,
             self._check_data_parallelism_gate,
+            self._check_train_script_data_pipeline_gate,
+            self._check_no_dummy_data_gate,
             self._check_understanding_verification_gate,
             self._check_component_isolation_gate,
             self._check_phase_ordering_gate,
             self._check_structure_completeness_gate,
             self._check_experiment_gate,
         ]
+        if not hasattr(self, '_gate_block_counts'):
+            self._gate_block_counts = {}
+        if not hasattr(self, '_gate_overrides_pending'):
+            self._gate_overrides_pending = {}
+
         for gate in hard_block_gates:
-            warning = gate(tool_name, arguments)
-            if warning:
-                return warning, ""
+            # Check permanent exemption BEFORE running gate (avoids expensive LLM calls)
+            fn_name = gate.__name__
+            pre_override_key = fn_name.replace("_check_", "").replace("_gate", "").upper()
+            if hasattr(self, '_gate_permanently_passed') and pre_override_key in self._gate_permanently_passed:
+                continue
+
+            result = gate(tool_name, arguments)
+            if result:
+                # Normalize to dict
+                if isinstance(result, dict):
+                    gate_info = result
+                    warning = result["detail"]
+                    override_key = result["name"].upper().replace(" ", "_")
+                else:
+                    override_key = pre_override_key
+                    gate_info = {"name": override_key.lower(), "description": "", "reason": "", "detail": result}
+                    warning = result
+
+                # Check if LLM has declared an override for this gate
+                if override_key in self._gate_overrides_pending:
+                    reason = self._gate_overrides_pending.pop(override_key)
+                    logger.info(
+                        "Gate %s OVERRIDDEN by LLM declaration. Reason: %s",
+                        gate_info["name"], reason
+                    )
+                    self._gate_block_counts.pop(gate_info["name"], None)
+                    # Permanent exemption: once overridden, don't block this gate again
+                    if not hasattr(self, '_gate_permanently_passed'):
+                        self._gate_permanently_passed = set()
+                    self._gate_permanently_passed.add(override_key)
+                    continue  # Let it through
+
+                self._gate_block_counts[gate_info["name"]] = self._gate_block_counts.get(gate_info["name"], 0) + 1
+                count = self._gate_block_counts[gate_info["name"]]
+                if count >= 3:
+                    warning += (
+                        f"\n\n🚨 CRITICAL: This gate has blocked you {count} times. "
+                        f"You are stuck in a loop. Your current approach WILL NOT WORK.\n\n"
+                        f"MANDATORY: Read the '▶ YOUR NEXT ACTION' section above and do EXACTLY that. "
+                        f"Even if you believe you have already satisfied the requirements, "
+                        f"the gate disagrees — follow its instructions literally. "
+                        f"Do NOT attempt any write/create operation until the gate clears. "
+                        f"Do NOT try to bypass via shell (cat >, tee, heredoc). "
+                        f"The gate tracks your actual actions, not your beliefs about them.\n\n"
+                        f"However, if you are ABSOLUTELY CERTAIN your approach is correct and "
+                        f"the gate is wrong, you may declare an override:\n"
+                        f"[GATE_OVERRIDE: {override_key}] Reason: <detailed justification why this gate does not apply>\n"
+                        f"The override is one-shot: it passes this gate ONCE on your next tool call."
+                    )
+                elif count >= 2:
+                    warning += (
+                        f"\n\n⚠ This gate has blocked you {count} times consecutively. "
+                        f"You are repeating the same blocked action without addressing the requirements above. "
+                        f"STOP attempting this action and complete the prerequisites FIRST. "
+                        f"Do NOT try to bypass this gate using shell commands (cat >, tee, python heredoc). "
+                        f"Follow the '▶ YOUR NEXT ACTION' instruction above.\n\n"
+                        f"If you are CERTAIN this gate does not apply to your situation, "
+                        f"you may declare an override in your response:\n"
+                        f"[GATE_OVERRIDE: {override_key}] Reason: <detailed justification>\n"
+                        f"The override is one-shot and requires a clear, specific reason."
+                    )
+                else:
+                    # First block — mention override exists but encourage following the gate
+                    warning += (
+                        f"\n\n💡 If after reading the above you are CERTAIN this gate does not apply "
+                        f"(e.g., your model genuinely doesn't need this step), you may override:\n"
+                        f"[GATE_OVERRIDE: {override_key}] Reason: <why this gate is inapplicable>\n"
+                        f"But first, seriously consider whether the gate's requirements are valid for your case."
+                    )
+                gate_info["detail"] = warning
+                return gate_info, []
 
         # Progress gate (special: returns tuple)
         progress_warning, progress_hard_block = self._check_progress_gate(tool_name)
         if progress_hard_block:
-            return progress_warning, ""
+            return {"name": "progress", "description": "Progress stall detection", "reason": "No substantial progress for extended period", "detail": progress_warning}, []
 
         # Plan creation gate (hard block if "TOOL NOT EXECUTED" in result)
         plan_gate_warning = self._check_plan_creation_gate(tool_name)
         if plan_gate_warning and "TOOL NOT EXECUTED" in plan_gate_warning:
-            return plan_gate_warning, ""
+            return {"name": "plan_creation", "description": "Plan creation prerequisite", "reason": "Started implementation without creating a plan", "detail": plan_gate_warning}, []
 
         # Soft-warning gates (collected and appended to result)
-        soft_warnings = []
+        soft_results = []
         soft_gates = [
             self._check_reading_depth_gate,
             self._check_reading_quality,
@@ -1959,6 +3403,10 @@ class GatesMixin:
             self._check_config_model_consistency_gate,
             self._check_environment_consistency_gate,
             self._check_tp_compatibility_gate,
+            self._check_parallelism_assessment_gate,
+            self._check_model_completeness_gate,
+            self._check_megatron_primitives_usage_gate,
+            self._check_mode_b_design_integrity_soft_gate,
             self._check_component_integration_gate,
             self._check_error_escalation,
             self._check_source_reading_gate,
@@ -1971,26 +3419,30 @@ class GatesMixin:
         for gate in soft_gates:
             w = gate(tool_name, arguments)
             if w:
-                soft_warnings.append(w)
-                if len(soft_warnings) >= _MAX_SOFT_WARNINGS:
+                if isinstance(w, dict):
+                    soft_results.append(w)
+                else:
+                    name = gate.__name__.replace("_check_", "").replace("_gate", "").replace("_", " ")
+                    soft_results.append({"name": name, "description": "", "reason": "", "detail": w})
+                if len(soft_results) >= _MAX_SOFT_WARNINGS:
                     break
 
         if plan_gate_warning:
-            soft_warnings.append(plan_gate_warning)
+            soft_results.append({"name": "plan_creation", "description": "", "reason": "", "detail": plan_gate_warning})
         if progress_warning:
-            soft_warnings.append(progress_warning)
+            soft_results.append({"name": "progress", "description": "", "reason": "", "detail": progress_warning})
 
         # Plan maintenance gate (soft warning only)
         plan_maint_warning = self._check_plan_maintenance_gate(tool_name)
         if plan_maint_warning:
-            soft_warnings.append(plan_maint_warning)
+            soft_results.append({"name": "plan_maintenance", "description": "", "reason": "", "detail": plan_maint_warning})
 
         # Config validation hint after YAML write
         config_hint = self._check_config_validation_hint(tool_name)
         if config_hint:
-            soft_warnings.append(config_hint)
+            soft_results.append({"name": "config_validation", "description": "", "reason": "", "detail": config_hint})
 
-        return None, "\n".join(soft_warnings)
+        return None, soft_results
 
     def _run_post_execution_gates(self, cmd, result):
         """Run post-execution gates on shell results. Returns additional info to append."""

@@ -86,24 +86,22 @@ NEVER launch training without creating the experiment AND adding an attempt firs
 
 For model porting/migration work:
 - Read BOTH source and target implementations completely before writing any code
-- Analysis is per-component, but implementation is whole-model: build the complete nested Module first, don't verify components in isolation
-- Checkpoint conversion: map ALL weights into the nested structure in one pass (strict=True, zero missing keys)
-- After conversion, use `inspect_checkpoint` to verify shapes/dtypes/numerical health
-- Use real data immediately — never synthetic/dummy tensors. Real data surfaces tokenizer, preprocessing, and shape issues instantly
-- Verification: load_state_dict passes → forward with real data produces finite loss → loss decreases over steps
+- Document the data→model interface contract BEFORE writing model code (keys, shapes, dtypes, parallelism distribution)
+- Data pipeline MUST include parallelism strategy from day one — no "add parallelism later"
+- Implementation is whole-model: build the complete nested Module first, don't verify components in isolation
+- MEGATRON NATIVE MEANS NATIVE: Mode 2 uses Megatron parallel primitives (ColumnParallelLinear, TEDotProductAttention, TransformerLayer, etc.) — not vanilla torch, not HF imports. Priority: Megatron primitive > compose from primitives > torch (only when no Megatron equivalent). One top-level MegatronModule owns ALL components including frozen ones. See model-porter skill for details.
+- ALL COMPONENTS NATIVE — NO EXCEPTIONS: Whether a component is frozen/non-trainable is a TRAINING decision (requires_grad=False), NEVER an architecture decision. Every submodule — vision encoder, LLM backbone, projection, action head — must be Megatron-native. Reasons: (1) unified checkpoint conversion, (2) future unfreezing without rewrite, (3) TP memory distribution for frozen params, (4) architectural consistency.
+- TP IS PER-COMPONENT: Assess each component independently for TP benefit. Some may not need TP (small modules, non-divisible dims). But even without TP, use Megatron primitives — not HF classes.
+- Data pipeline integration is EQUALLY important as model adaptation — implement them together
+- Checkpoint conversion: strict=True, zero missing keys. Use `inspect_checkpoint` to verify. ONE unified converter for the whole model (not separate converters for frozen vs trainable parts).
+- Use real data immediately — NEVER synthetic/dummy tensors
+- Verification: load_state_dict passes → forward with real data → finite loss → loss decreases
 
-For parallelism selection/debugging, data pipelines under parallelism, attention under TP, or OOM/NCCL/hang issues, load the `parallel-strategy` skill.
+For parallelism issues, load the `parallel-strategy` skill.
 
 ### Diagnostic Print Strategy
 
-PROACTIVELY add print statements for shape/dtype/args at module boundaries BEFORE running. This reduces experiment iterations:
-- At model __init__: print all submodule parameter shapes and dtypes
-- At forward entry: print input tensor shapes, dtypes, device
-- At checkpoint load: print loaded key count, sample shapes, any missing/unexpected
-- At data pipeline: print batch keys, shapes, dtypes after get_batch
-- At loss computation: print logits shape, labels shape, mask shape
-
-Remove prints after verification passes. One print run that confirms all shapes is worth more than 5 blind training attempts.""",
+Add prints at module boundaries BEFORE running: __init__ shapes, forward input shapes, checkpoint key counts, batch shapes, loss shapes. Remove after verification passes.""",
 
     "decision": """## Decision Discipline
 

@@ -397,11 +397,14 @@ def tool_done(name, elapsed, detail="", error=False):
 class _ParallelDisplay:
     """In-place updating display for parallel tool execution."""
     _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    _MAX_DISPLAY_LINES = 10  # Show at most this many tool lines
 
     def __init__(self, tool_summaries):
         """tool_summaries: list of (name, args_summary) tuples."""
         self._tools = tool_summaries
         self._n = len(tool_summaries)
+        self._collapsed = self._n > self._MAX_DISPLAY_LINES
+        self._display_n = min(self._n, self._MAX_DISPLAY_LINES)
         self._results = {}  # index -> (elapsed, error)
         self._hints = {}    # index -> hint text for running tools
         self._lock = threading.Lock()
@@ -412,17 +415,19 @@ class _ParallelDisplay:
 
     def start(self):
         if not _use_color() or self._n == 0:
-            for name, args in self._tools:
+            for name, args in self._tools[:self._MAX_DISPLAY_LINES]:
                 icon = _tool_icon(name)
                 label = f"  {icon} {name}"
                 if args:
                     label += f" {args}"
                 _print(dim(label))
+            if self._collapsed:
+                _print(dim(f"  ... and {self._n - self._MAX_DISPLAY_LINES} more"))
             return
-        # Print initial lines with pending indicator
+        # Print initial lines with pending indicator (capped)
         tw = _term_width()
         with _stdout_lock:
-            for name, args in self._tools:
+            for name, args in self._tools[:self._display_n]:
                 icon = _tool_icon(name)
                 label = f"{icon} {name}"
                 if args:
@@ -430,6 +435,8 @@ class _ParallelDisplay:
                 frame = self._FRAMES[0]
                 line = f"  {dim(label)} {dim(frame)}"
                 sys.stdout.write(f"{_truncate_to_width(line, tw)}\n")
+            if self._collapsed:
+                sys.stdout.write(f"  {dim(f'... and {self._n - self._display_n} more')}\n")
             sys.stdout.flush()
         self._thread = threading.Thread(target=self._animate, daemon=True)
         self._thread.start()
@@ -452,7 +459,7 @@ class _ParallelDisplay:
         while not self._stop.is_set():
             self._redraw()
             self._frame += 1
-            self._stop.wait(0.1)
+            self._stop.wait(0.5)
 
     def _redraw(self):
         with self._lock:
@@ -460,11 +467,13 @@ class _ParallelDisplay:
             hints = dict(self._hints)
             extra = self._extra_lines
         tw = _term_width()
+        # collapsed summary line counts as 1 extra display line
+        display_lines = self._display_n + (1 if self._collapsed else 0)
         with _stdout_lock:
-            total_up = self._n + extra
+            total_up = display_lines + extra
             if total_up > 0:
                 sys.stdout.write(f"\033[{total_up}A")
-            for i in range(self._n):
+            for i in range(self._display_n):
                 name, args = self._tools[i]
                 icon = _tool_icon(name)
                 label = f"{icon} {name}"
@@ -489,6 +498,12 @@ class _ParallelDisplay:
                     else:
                         line = f"  {dim(label)} {dim(frame)}"
                 sys.stdout.write(f"\r\033[K{_truncate_to_width(line, tw)}\n")
+            if self._collapsed:
+                done_hidden = sum(1 for i, _ in results.items() if i >= self._display_n)
+                summary = f"  ... and {self._n - self._display_n} more"
+                if done_hidden:
+                    summary += f" ({done_hidden} done)"
+                sys.stdout.write(f"\r\033[K{dim(summary)}\n")
             if extra > 0:
                 sys.stdout.write(f"\033[{extra}B")
             sys.stdout.flush()
@@ -641,6 +656,17 @@ def poll_mode_end(reason, poll_count, total_elapsed, routine_changes=0):
 def warn(message):
     """Display a warning message to the user."""
     _print(f"  {yellow('⚠')} {yellow(message)}")
+
+
+def gate_triggered(name, description, reason, is_hard=True):
+    """Display structured gate trigger info to terminal."""
+    icon = "🚫" if is_hard else "⚠"
+    label = "blocked" if is_hard else "warning"
+    _print(f"  {icon} Gate {label}: {bold(name)}")
+    if description:
+        _print(f"     {dim(description)}")
+    if reason:
+        _print(f"     Reason: {dim(reason)}")
 
 
 def turn_summary(turn_num, elapsed, input_tokens, output_tokens):

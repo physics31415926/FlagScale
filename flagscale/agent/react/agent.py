@@ -83,6 +83,23 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         r'\[PIPELINE_KNOWLEDGE_CONFIRMED:\s*(YES|NO)\]', re.IGNORECASE
     )
 
+    _GATE_OVERRIDE_RE = re.compile(
+        r'\[GATE_OVERRIDE:\s*([A-Z_]+)\]\s*Reason:\s*(.+?)(?:\n|$)',
+        re.IGNORECASE
+    )
+
+    _FROZEN_EXCUSE_PATTERNS = re.compile(
+        r'frozen|no.?grad|requires_grad.*False|'
+        r'feature.extractor|no.trainable|'
+        r'zero.trainable|no.gradient|'
+        r'not.trained|inference.only|'
+        r'no.TP.benefit.*frozen|'
+        r'frozen.*no.need|'
+        r'frozen.*skip|'
+        r'doesn.t.need.*native.*frozen',
+        re.IGNORECASE
+    )
+
     _PORTING_COMPANION_SKILLS = [
         "parallel-strategy",
         "precision-alignment",
@@ -213,6 +230,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         self._analysis_persisted = False  # Analysis persistence gate: True after analysis written
         self._pipeline_knowledge_persisted = False  # Pipeline comprehension gate: True after knowledge persisted
         self._pipeline_knowledge_confirmed = False  # Pipeline comprehension gate: True after LLM confirms
+        self._gate_overrides_pending = {}  # {gate_name: reason} — LLM declared override, next call passes
         self._verification_stage = "none"  # Verification ladder: none -> analysis -> init_ok -> forward_aligned -> backward_ok -> distributed_ok -> full_training
         self._last_compaction_count = 0  # Session resume gate: detect compaction events
         # Phase transition gate
@@ -232,6 +250,9 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         self._sanity_checks_passed = False  # B2: True after 4 sanity checks passed
         self._config_model_verified = False  # B4: True after config-model consistency verified
         self._env_verified = False  # C2: True after environment consistency verified
+        self._env_setup_loaded = False  # True when env-setup skill is loaded
+        self._env_compat_analyzed = False  # True after driver/CUDA/PyTorch compatibility analyzed
+        self._workspace_layout_loaded = False  # True when workspace-layout skill is loaded
         self._component_integration_verified = False  # C4: True after per-component verification
         self._imports_verified = False  # A4: True after critical imports verified
         self._reference_comparison_planned = False  # A2: True after comparison strategy created
@@ -250,21 +271,45 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         self._training_started = False
         self._recently_referenced_skills = set()
 
-        # Pre-check: if pipeline knowledge already exists in memory, skip gate phases
+        # Pre-check: if pipeline knowledge already exists in memory (any key), skip gate phases
         if self.session_memory:
-            entry = self.session_memory.get(self._PIPELINE_KNOWLEDGE_MEMORY_KEY)
-            if entry:
+            for entry in self.session_memory.list_entries():
                 content = entry.get("content", "").lower()
-                kw_hits = sum(1 for kw in self._PIPELINE_KNOWLEDGE_KEYWORDS if kw in content)
+                kw_hits = sum(1 for kw in self._PIPELINE_KNOWLEDGE_KEYWORDS if kw.lower() in content)
                 if kw_hits >= self._MIN_PIPELINE_KEYWORDS_IN_MEMORY:
                     self._pipeline_knowledge_persisted = True
                     self._pipeline_knowledge_confirmed = True
+                    break
 
         # Now refresh system prompt after all state is initialized
         self._refresh_system_prompt()
         atexit.register(self._atexit_hook)
 
     # ── Atexit safety net ───────────────────────────────────────────────
+
+    def _is_frozen_excuse_override(self, reason: str) -> bool:
+        """Reject gate overrides that use 'frozen/no_grad' as justification for skipping native.
+
+        The principle: whether a component is frozen is a TRAINING decision, not an
+        architecture decision. ALL components must be Megatron-native regardless of
+        training status. This method detects override reasons that use frozen/no_grad
+        as the core justification.
+        """
+        if not self._FROZEN_EXCUSE_PATTERNS.search(reason):
+            return False
+        # Check if the reason ALSO contains a genuine technical justification
+        # (e.g., "frozen AND has variable-length input that ColumnParallelLinear can't handle")
+        genuine_technical = re.search(
+            r'variable.*(dim|length|size)|'
+            r'no.*equivalent.*exist|'
+            r'TE.*not.*support|'
+            r'cannot.*express.*as.*TransformerLayer|'
+            r'non.standard.*topology',
+            reason, re.IGNORECASE
+        )
+        if genuine_technical:
+            return False  # Has a real technical reason beyond just "frozen"
+        return True
 
     def _atexit_hook(self):
         """Save conversation on any exit path (safety net for abnormal exits)."""
@@ -461,13 +506,16 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         self._refresh_system_prompt(memory_context=memory_context, plan_context=plan_context)
 
     def _check_proxy(self):
-        """Warn if no proxy is configured and offer to set one."""
+        """Show proxy status and offer to set one if missing."""
         proxy_keys = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
-        has_proxy = any(
-            self.config.shell_env.get(k) or os.environ.get(k)
-            for k in proxy_keys
-        )
-        if has_proxy:
+        proxy_url = None
+        for k in proxy_keys:
+            val = self.config.shell_env.get(k) or os.environ.get(k)
+            if val:
+                proxy_url = val
+                break
+        if proxy_url:
+            print(f"\033[32m✓\033[0m  Proxy: {proxy_url}")
             return
         print("\033[33m⚠  No HTTP proxy detected.\033[0m")
         print("  If your network requires a proxy, shell commands may fail to reach the internet.")
@@ -641,6 +689,9 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             if self.config.auto_skill:
                 self._auto_load_skills(user_input)
 
+            # Check if user confirms the env compat analysis (e.g. "继续", "确认", "ok")
+            self._check_env_compat_user_confirmation(user_input)
+
             self._auto_turn_count = 0
             self._inject_context(user_input)
             self._check_user_porting_confirmation(user_input)
@@ -775,6 +826,150 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                     )
                 return str(content)
         return ""
+
+    def _check_env_compat_llm_confirmation(self, agent_response: str):
+        """LLM judge: did the agent's response present a complete compatibility
+        analysis that qualifies as done (even if user hasn't explicitly confirmed)?
+        This is a lighter check — it detects whether Step 1 was completed."""
+        prompt = (
+            "An AI agent is setting up a training environment and should have "
+            "completed a compatibility analysis (Step 1 of env-setup) before any install.\n\n"
+            "Agent's last response:\n---\n"
+            f"{agent_response[:1500]}\n"
+            "---\n\n"
+            "Does this response contain a COMPLETE compatibility analysis? Criteria:\n"
+            "- Lists driver version and max CUDA version\n"
+            "- Lists required PyTorch and Python versions from FlagScale source\n"
+            "- Lists install methods for ALL four FL deps: Megatron-LM-FL, "
+            "TransformerEngine-FL, Apex, Flash-Attention\n"
+            "- Asks user to confirm\n\n"
+            'Reply ONLY: {"complete": true} or {"complete": false}'
+        )
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            response = self.provider.chat(messages, tools=[])
+            text = (response.get("content") or "").strip()
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(text[start:end])
+                if data.get("complete"):
+                    self._env_compat_analyzed = True
+                    logger.info("Env compat analysis marked complete by LLM judge")
+        except Exception as e:
+            logger.warning("Env compat LLM completeness check failed: %s", e)
+
+    def _check_env_compat_user_confirmation(self, user_input):
+        """Use LLM to judge whether the user has confirmed the env compatibility analysis.
+
+        Called after the agent has presented a compatibility table and the user
+        responds. The LLM determines whether the user's message constitutes
+        confirmation to proceed.
+        """
+        if not self._env_setup_loaded or self._env_compat_analyzed:
+            return
+        # Only worth checking if agent recently presented a compat table
+        recent_msgs = self.history.messages[-6:]
+        has_table = any(
+            "compatibility" in str(m.get("content", "")).lower()
+            and ("driver" in str(m.get("content", "")).lower())
+            for m in recent_msgs
+        )
+        if not has_table:
+            return
+
+        prompt = (
+            "An AI agent has presented an environment compatibility analysis table "
+            "(driver, CUDA, PyTorch, dependency versions) and is waiting for user "
+            "confirmation before proceeding to install.\n\n"
+            f"User's response: \"{user_input}\"\n\n"
+            "Does this user response confirm that the analysis is correct and the "
+            "agent should proceed with creating the environment and installing packages?\n\n"
+            "Consider:\n"
+            '- Direct confirmation: "yes", "继续", "ok", "好的", "确认", "go ahead", '
+            '"proceed", "looks good", etc. → YES\n'
+            '- Questions about the table: "why torch 2.9?", "can we use cuda 12.4?", '
+            '"what about apex version?" → NO (user wants clarification first)\n'
+            '- Mixed: "looks good but can you check flash-attn version?" → YES '
+            '(user approves the overall approach, minor note is not a blocker)\n'
+            '- Off-topic: unrelated questions or new tasks → NO\n\n'
+            'Reply ONLY: {"confirmed": true} or {"confirmed": false}'
+        )
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            response = self.provider.chat(messages, tools=[])
+            text = (response.get("content") or "").strip()
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(text[start:end])
+                if data.get("confirmed"):
+                    self._env_compat_analyzed = True
+                    logger.info("Env compat analysis confirmed by user (LLM judge): %s", user_input[:50])
+        except Exception as e:
+            logger.warning("Env compat judge LLM call failed: %s", e)
+
+    def _inject_env_compat_directive(self):
+        """Push a hard enforcement message into history after env-setup is auto-loaded.
+
+        This directive is injected as a system message that the LLM sees immediately
+        in the next turn, before it can wander off into existing-environment inspection.
+        """
+        if self._env_compat_analyzed:
+            return
+        directive = (
+            "[ENV-SETUP PROTOCOL — READ BEFORE ANY ACTION]\n\n"
+            "The env-setup skill has been loaded. You MUST follow this protocol exactly:\n\n"
+            "**DO NOT inspect existing environments.** Do NOT run pip list, conda list, "
+            "pip show, python -c \"import torch\" against any existing conda env. "
+            "Existing environments are IRRELEVANT — different hardware, different packages.\n\n"
+            "**Your ONLY job right now is Step 1 — Constraint Collection:**\n"
+            "1. nvidia-smi to get driver version → map to max CUDA\n"
+            "2. Read FlagScale requirements files (requirements.txt, requirements/cuda/train.txt)\n"
+            "3. Read FL upstream setup.py (Megatron-LM-FL, TransformerEngine-FL) via web_fetch\n"
+            "4. Write the FULL compatibility table covering ALL 7 components:\n"
+            "   Driver, PyTorch, FlagScale, Megatron-LM-FL, TransformerEngine-FL, Apex, Flash-Attention\n"
+            "5. Present the table and wait for user confirmation\n\n"
+            "**No conda create, no pip install, no conda info --envs until Step 1 is done.**\n\n"
+            "After user confirms the table, annotate your response with [ENV_COMPAT_ANALYZED]."
+        )
+        self.history.append({"role": "user", "content": directive})
+
+    def _check_env_compat_gate(self, tool_name, arguments):
+        """Block conda create / pip install until compatibility analysis is complete.
+
+        Once the user confirms the compatibility table (detected by LLM judge in
+        _check_env_compat_user_confirmation), this gate automatically lifts.
+        No annotation needed from the agent."""
+        if not self._env_setup_loaded or self._env_compat_analyzed:
+            return None
+        if tool_name != "shell":
+            return None
+        cmd = arguments.get("command", "").strip()
+        is_conda_create = bool(re.match(r'conda\s+create', cmd, re.I))
+        is_pip_install = bool(re.match(r'pip\s+install', cmd, re.I))
+        if not (is_conda_create or is_pip_install):
+            return None
+        return (
+            "[ENV COMPAT GATE — TOOL NOT EXECUTED]\n\n"
+            "You are trying to create a conda environment or install packages BEFORE "
+            "analyzing the compatibility matrix.\n\n"
+            "Env-setup Step 1 requires you to:\n"
+            "1. Get the Driver version and map it to max CUDA version\n"
+            "2. Read FlagScale requirements for PyTorch/python constraints\n"
+            "3. Check each core package for compatible versions and install methods:\n"
+            "   - Megatron-LM-FL: pip from FlagScale PyPI first; source build fallback\n"
+            "   - TransformerEngine-FL: pip first; source build (--recursive) fallback\n"
+            "   - Flash-Attention: check CUDA toolkit vs PyTorch CUDA; compile from source\n"
+            "   - Apex: source build with APEX_CUDA_EXT=1\n"
+            "4. Write a compatibility table:\n"
+            "   | Component | Version | Install Method | Notes |\n"
+            "   | Driver | X.X | - | max CUDA Y.Y |\n"
+            "   | PyTorch | X.X | pip | cuXXX |\n"
+            "   | ... | ... | ... | ... |\n"
+            "5. Present the table and ASK THE USER TO CONFIRM.\n"
+            "The system will automatically detect when the user confirms — no annotation needed."
+        )
 
     def _generate_continuation_prompt(self) -> str:
         """Generate continuation prompt with plan context for better direction."""
@@ -971,6 +1166,8 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         turn_output_tokens = 0
         max_iter = self.config.max_iterations
         iteration = 0
+        truncation_retries = 0
+        max_truncation_retries = 2
 
         # Install SIGINT handler so Ctrl+C works even during non-IO phases
         _prev_handler = signal.getsignal(signal.SIGINT)
@@ -1017,29 +1214,43 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                 self._interrupted = True
                 break
             except Exception as e:
-                # Context limit auto-recovery: compact and retry once
+                # Context limit auto-recovery: compact progressively and retry
                 if self._is_context_limit_error(e):
                     display.thinking_clear()
                     logger.warning("Context limit hit, forcing compact and retry: %s", e)
                     print(display.yellow("⚠ Context limit hit — compacting and retrying..."))
-                    self.history.force_compact(target_ratio=0.60)
-                    if self.history._last_compacted_from:
-                        display.context_compacted(
-                            self.history._last_compacted_from,
-                            self.history._last_compacted_to,
-                            compaction_num=self.history.compaction_count,
-                            ratio=self.history.last_compaction_ratio,
-                        )
-                        self.history._last_compacted_from = None
-                        self.history._last_compacted_to = None
-                    messages = self.history.get_messages()
-                    try:
-                        display.thinking()
-                        response, usage = self._call_llm_stream(messages, schemas)
-                    except Exception as e2:
-                        display.thinking_clear()
-                        print(display.red(f"✖ LLM error after compact: {e2}"))
-                        logger.exception("LLM call failed after compact retry")
+                    _recovery_ratios = [0.50, 0.35, 0.25]
+                    # Use actual token count that triggered the error as base limit
+                    _overflow_limit = self.history._actual_input_tokens or self.config.max_context_tokens
+                    recovered = False
+                    for _ratio in _recovery_ratios:
+                        self.history.force_compact(target_ratio=_ratio, base_limit=_overflow_limit)
+                        if self.history._last_compacted_from:
+                            display.context_compacted(
+                                self.history._last_compacted_from,
+                                self.history._last_compacted_to,
+                                compaction_num=self.history.compaction_count,
+                                ratio=self.history.last_compaction_ratio,
+                            )
+                            self.history._last_compacted_from = None
+                            self.history._last_compacted_to = None
+                        messages = self.history.get_messages()
+                        try:
+                            display.thinking()
+                            response, usage = self._call_llm_stream(messages, schemas)
+                            recovered = True
+                            break
+                        except Exception as e2:
+                            display.thinking_clear()
+                            if self._is_context_limit_error(e2):
+                                logger.warning("Still over limit at ratio %.2f, trying more aggressive", _ratio)
+                                continue
+                            print(display.red(f"✖ LLM error after compact: {e2}"))
+                            logger.exception("LLM call failed after compact retry")
+                            break
+                    if not recovered:
+                        print(display.red("✖ Context still too large after aggressive compaction"))
+                        logger.error("All compaction ratios exhausted, cannot recover")
                         break
                 else:
                     display.thinking_clear()
@@ -1076,7 +1287,51 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                     self._pipeline_knowledge_confirmed = True
                     logger.info("Pipeline knowledge confirmed by LLM")
 
+            # Detect env-setup compatibility analysis completion (LLM self-annotation)
+            if not self._env_compat_analyzed and response.get("content"):
+                if "[ENV_COMPAT_ANALYZED]" in response["content"]:
+                    self._env_compat_analyzed = True
+                    logger.info("Env compat analysis confirmed by LLM self-annotation")
+                elif self._env_setup_loaded:
+                    # Also check via LLM if agent seems to be wrapping up analysis
+                    content = response["content"]
+                    has_table_indicators = (
+                        "driver" in content.lower()
+                        and ("pytorch" in content.lower())
+                        and ("table" in content.lower() or "|" in content)
+                    )
+                    if has_table_indicators and not response.get("tool_calls"):
+                        self._check_env_compat_llm_confirmation(content[:800])
+
+            # Detect gate override declarations in LLM response text
+            if response.get("content"):
+                for m in self._GATE_OVERRIDE_RE.finditer(response["content"]):
+                    gate_name = m.group(1).upper()
+                    reason = m.group(2).strip()
+                    # Reject "frozen" excuses for Megatron-native gates
+                    if gate_name in (
+                        "MODE_B_DESIGN_INTEGRITY", "MEGATRON_NATIVE_INTEGRITY",
+                        "COMPONENT_MAPPING", "MIGRATION_BLUEPRINT",
+                    ) and self._is_frozen_excuse_override(reason):
+                        logger.warning(
+                            "Gate override REJECTED for %s — 'frozen' is not a valid reason: %s",
+                            gate_name, reason
+                        )
+                        continue
+                    self._gate_overrides_pending[gate_name] = reason
+                    logger.info("Gate override declared: %s — %s", gate_name, reason)
+
             if not response["tool_calls"]:
+                if response.get("truncated") and truncation_retries < max_truncation_retries:
+                    truncation_retries += 1
+                    logger.info("Response truncated (attempt %d/%d), injecting continuation",
+                                truncation_retries, max_truncation_retries)
+                    display.warn("Response truncated by network, continuing...")
+                    self.history.append({"role": "user", "content":
+                        "[SYSTEM] Your response was truncated due to a network interruption. "
+                        "Continue from where you left off, or proceed with the next step."
+                    })
+                    continue
                 break
 
             print()  # visual gap before tool block
@@ -1205,6 +1460,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         tool_calls = []
         tool_calls_by_id = {}
         current_tool = None
+        stream_truncated = False
         usage = {}
         self._streaming_in_code_block = False
 
@@ -1225,11 +1481,22 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         elif pressure >= 0.75:
             logger.info("Context pressure %.0f%%, approaching limit — consider saving key findings", pressure * 100)
 
+        _overflow_attempts = [0]
+        _OVERFLOW_RATIOS = [0.50, 0.35, 0.25]
+
         def _handle_context_overflow():
-            logger.warning("Context overflow recovery: forcing aggressive compaction")
-            compacted = self.history.force_compact(target_ratio=0.50)
+            attempt = _overflow_attempts[0]
+            if attempt >= len(_OVERFLOW_RATIOS):
+                logger.error("Context overflow: all compaction ratios exhausted, cannot recover")
+                return False
+            ratio = _OVERFLOW_RATIOS[attempt]
+            _overflow_attempts[0] += 1
+            # Use actual token count as base limit — not the configured max
+            overflow_limit = self.history._actual_input_tokens or self.config.max_context_tokens
+            logger.warning("Context overflow recovery (attempt %d): compacting to ratio %.2f of %d",
+                           attempt + 1, ratio, overflow_limit)
+            compacted = self.history.force_compact(target_ratio=ratio, base_limit=overflow_limit)
             if compacted:
-                # Display compaction info before get_messages() resets it
                 if self.history._last_compacted_from:
                     display.context_compacted(
                         self.history._last_compacted_from,
@@ -1249,6 +1516,46 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         )
 
         thinking_cleared = False
+        streaming_trailing_newlines = 0
+        streaming_started = False
+
+        def compress_newlines(text: str, trailing_from_prev: int, is_first: bool) -> tuple:
+            """Compress runs of 3+ newlines to 2, handling cross-chunk boundaries."""
+            import re
+            if not text:
+                return text, trailing_from_prev
+
+            # Strip leading newlines at the very start of stream output
+            if is_first:
+                text = text.lstrip('\n')
+                if not text:
+                    return text, 0
+
+            # Handle cross-chunk boundary: prepend virtual newlines from previous chunk
+            if trailing_from_prev > 0:
+                leading = 0
+                for ch in text:
+                    if ch == '\n':
+                        leading += 1
+                    else:
+                        break
+                total = trailing_from_prev + leading
+                if total >= 3:
+                    keep = max(0, 2 - trailing_from_prev)
+                    text = '\n' * keep + text[leading:]
+
+            # Compress internal runs of 3+ newlines to 2
+            text = re.sub(r'\n{3,}', '\n\n', text)
+
+            # Track trailing newlines for next chunk
+            trailing = 0
+            for ch in reversed(text):
+                if ch == '\n':
+                    trailing += 1
+                else:
+                    break
+
+            return text, trailing
 
         max_stream_retries = 2
         for _stream_attempt in range(1 + max_stream_retries):
@@ -1259,6 +1566,11 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                         thinking_cleared = True
                     if event["type"] == "text":
                         text = event["content"]
+                        # Compress excessive blank lines
+                        text, streaming_trailing_newlines = compress_newlines(
+                            text, streaming_trailing_newlines, not streaming_started)
+                        if text:
+                            streaming_started = True
                         if display._use_color():
                             fence_count = text.count("```")
                             if self._streaming_in_code_block:
@@ -1303,8 +1615,9 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                     display.thinking_clear()
                     thinking_cleared = True
                 if content_parts or tool_calls:
-                    # Partial content received — return what we have
+                    # Partial content received — return what we have, marked as truncated
                     logger.warning("Stream interrupted after partial content: %s", e)
+                    stream_truncated = True
                     break
                 # Context overflow — compact before retrying
                 if _is_context_limit_error(e):
@@ -1340,7 +1653,14 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                 raise
 
         if content_parts:
-            print()
+            # Erase excess trailing blank lines left by the stream
+            if streaming_trailing_newlines > 1 and display._use_color():
+                up = streaming_trailing_newlines - 1
+                display._write(f"\033[{up}A\033[J")
+                print()
+            elif streaming_trailing_newlines == 0:
+                print()
+            # else: already have exactly 1 trailing newline, no extra needed
 
         parsed_tool_calls = None
         if tool_calls:
@@ -1352,7 +1672,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                     arguments = {}
                 parsed_tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": arguments})
 
-        return {"content": "".join(content_parts) or None, "tool_calls": parsed_tool_calls}, usage
+        return {"content": "".join(content_parts) or None, "tool_calls": parsed_tool_calls, "truncated": stream_truncated}, usage
 
     # ── Tool execution ───────────────────────────────────────────────────
 
@@ -1446,6 +1766,15 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         if dedup_indices:
             logger.info("Deduped %d identical tool calls in batch", len(dedup_indices))
 
+        # Cap batch size — LLM generating 20+ calls in one response is almost always a loop/hallucination
+        _MAX_BATCH = 20
+        capped_indices = set()
+        if len(tool_calls) > _MAX_BATCH:
+            logger.warning("Batch has %d tool calls, capping to %d", len(tool_calls), _MAX_BATCH)
+            for i in range(_MAX_BATCH, len(tool_calls)):
+                capped_indices.add(i)
+            display.warn(f"Batch capped: {len(tool_calls)} tool calls reduced to {_MAX_BATCH} (excess blocked)")
+
         # Gate checks for parallel calls — count all read-only tools toward progress gate
         # and block the entire batch if gates fire
         for tc in tool_calls:
@@ -1520,7 +1849,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                             denied.add(i)
 
         results = [None] * len(tool_calls)
-        skip_indices = denied | dedup_indices
+        skip_indices = denied | dedup_indices | capped_indices
 
         # Rule: non-read shell commands cannot run in parallel — serialize them
         write_shell_indices = []
@@ -1552,8 +1881,20 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             hard_block, soft_warnings = self._run_pre_execution_gates(tc["name"], tc.get("arguments", {}))
             if hard_block:
                 skip_indices.add(i)
-                results[i] = hard_block
-                display.warn(f"Gate blocked parallel tool: {tc['name']}")
+                tool_name_blocked = tc["name"]
+                if isinstance(hard_block, dict):
+                    display.gate_triggered(hard_block["name"], hard_block.get("description", ""), hard_block.get("reason", ""), is_hard=True)
+                    block_text = hard_block["detail"]
+                else:
+                    display.warn(f"Gate blocked parallel tool: {tool_name_blocked}")
+                    block_text = hard_block
+                prefix = (
+                    f"⛔ TOOL NOT EXECUTED — your `{tool_name_blocked}` call was blocked and had NO effect. "
+                    f"No file was written, no command was run.\n\n"
+                )
+                if "TOOL NOT EXECUTED" not in block_text and "NOT EXECUTED" not in block_text:
+                    block_text = prefix + block_text
+                results[i] = block_text
 
         to_run = [
             (i, tc) for i, tc in enumerate(tool_calls) if i not in skip_indices
@@ -1563,6 +1904,11 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         for i in dedup_indices:
             orig = seen_calls[(tool_calls[i]["name"], json.dumps(tool_calls[i].get("arguments", {}), sort_keys=True))]
             results[i] = f"[DEDUP: identical to call #{orig + 1} in this batch, skipped]"
+        for i in capped_indices:
+            results[i] = (
+                f"[BATCH CAPPED — TOOL NOT EXECUTED] Only {_MAX_BATCH} tool calls allowed per response. "
+                "Issue remaining calls in the next response."
+            )
 
         # Show all tool names upfront, then one spinner for the batch
         tool_summaries = []
@@ -1575,7 +1921,7 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                 args = tc.get("arguments", {})
                 parts = []
                 for k, v in list(args.items())[:2]:
-                    s = str(v)
+                    s = str(v).replace("\n", " ").replace("\r", "")
                     if len(s) > 60:
                         s = s[:57] + "..."
                     parts.append(f'{k}="{s}"' if isinstance(v, str) else f'{k}={s}')
@@ -1653,22 +1999,36 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
 
         # Pre-execution gates — hard block if triggered
         hard_block, soft_warnings = self._run_pre_execution_gates(tool_name, arguments)
+
+        # Env-setup compatibility gate: block conda create / pip install before
+        # the compatibility matrix is analyzed and confirmed by the user.
+        env_compat_block = self._check_env_compat_gate(tool_name, arguments)
+        if env_compat_block:
+            hard_block = env_compat_block if not hard_block else hard_block
+
         if hard_block:
-            # Extract gate name from message for display
-            import re as _re
-            gate_match = _re.search(r'\[([A-Z][A-Z_ ]+?)(?:\s*[—\-\]])', hard_block)
-            gate_label = gate_match.group(1).strip() if gate_match else "GATE"
-            display.warn(f"Gate blocked: {gate_label}")
-            return hard_block
+            if isinstance(hard_block, dict):
+                display.gate_triggered(hard_block["name"], hard_block.get("description", ""), hard_block.get("reason", ""), is_hard=True)
+                block_text = hard_block["detail"]
+            else:
+                import re as _re
+                gate_match = _re.search(r'\[([A-Z][A-Z_ ]+?)(?:\s*[—\-\]])', hard_block)
+                display.warn(f"Gate blocked: {gate_match.group(1).strip() if gate_match else 'GATE'}")
+                block_text = hard_block
+            prefix = (
+                f"⛔ TOOL NOT EXECUTED — your `{tool_name}` call was blocked and had NO effect. "
+                f"No file was written, no command was run.\n\n"
+            )
+            if "TOOL NOT EXECUTED" not in block_text and "NOT EXECUTED" not in block_text:
+                block_text = prefix + block_text
+            return block_text
 
         def _fmt_arg(k, v):
-            s = str(v)
+            s = str(v).replace("\n", " ").replace("\r", "")
             if k in ("content", "new_string", "old_string") and len(s) > 100:
-                lines = s.split('\n')
-                if len(lines) > 3:
-                    s = f"{lines[0][:80]}... ({len(lines)} lines, {len(s)} chars)"
-                else:
-                    s = s[:100] + f"... ({len(s)} chars)"
+                s = s[:97] + "..."
+            elif len(s) > 60:
+                s = s[:57] + "..."
             if isinstance(v, str):
                 return f'{k}="{s}"'
             return f'{k}={s}'
@@ -1778,11 +2138,29 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         # Track porting mode activation
         if tool_name == "load_skill" and not error:
             skill_name = arguments.get("name", "")
+            # Auto-load requires + suggests chain (not just summary)
+            deps = self.skill_manager.get_dependency_closure([skill_name])
+            for dep_name in deps:
+                if dep_name != skill_name and dep_name not in self._loaded_skills:
+                    try:
+                        dep_content = self.skill_manager.load(dep_name)
+                        dep_content = self._maybe_summarize_skill(dep_name, dep_content)
+                        self._loaded_skills.add(dep_name)
+                        self._active_skill_content[dep_name] = dep_content
+                        self._skill_load_iterations[dep_name] = self._total_iterations
+                        display.skill_auto_loaded(dep_name)
+                    except Exception:
+                        pass
             if "model-porter" in skill_name:
                 self._porting_mode = True
                 self._auto_load_companion_skills(self._PORTING_COMPANION_SKILLS)
             if "data-prep" in skill_name:
                 self._data_prep_mode = True
+            if "env-setup" in skill_name:
+                self._env_setup_loaded = True
+                self._inject_env_compat_directive()
+            if "workspace-layout" in skill_name:
+                self._workspace_layout_loaded = True
             # Strip "SUCCESS: Skill '...' loaded.\n\n" prefix from tool result
             skill_content = result
             prefix_end = result.find("\n\n")
@@ -1795,6 +2173,20 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             # Replace result with short placeholder — full content is in system prompt
             result = f"[Skill '{skill_name}' loaded — content available in system context]"
 
+            # Also require workspace-layout to be loaded for env-setup
+            if "env-setup" in skill_name and not self._workspace_layout_loaded:
+                try:
+                    ws_content = self.skill_manager.load("workspace-layout")
+                    ws_content = self._maybe_summarize_skill("workspace-layout", ws_content)
+                    self._loaded_skills.add("workspace-layout")
+                    self._active_skill_content["workspace-layout"] = ws_content
+                    self._skill_load_iterations["workspace-layout"] = self._total_iterations
+                    self._workspace_layout_loaded = True
+                    result += "\n\n[Auto-loaded workspace-layout — conda envs must use shared storage, NOT /tmp]"
+                    display.skill_auto_loaded("workspace-layout")
+                except Exception:
+                    result += "\n\n[WARNING: workspace-layout skill not found — create conda envs in shared storage, not /tmp]"
+
         # Track analysis persistence
         if tool_name in ("workspace_experiment", "memory_write") and not error:
             content = arguments.get("content", "")
@@ -1806,16 +2198,14 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                 if self._verification_stage == "none":
                     self._verification_stage = "analysis"
 
-        # Track pipeline knowledge persistence (fixed key only)
+        # Track pipeline knowledge persistence (content-based, any key)
         if tool_name == "memory_write" and not error:
-            key = arguments.get("key", "")
-            if key == self._PIPELINE_KNOWLEDGE_MEMORY_KEY:
-                content = arguments.get("content", "").lower()
-                kw_hits = sum(1 for kw in self._PIPELINE_KNOWLEDGE_KEYWORDS if kw in content)
-                if kw_hits >= self._MIN_PIPELINE_KEYWORDS_IN_MEMORY:
-                    self._pipeline_knowledge_persisted = True
-                    logger.info("Pipeline knowledge persisted (%d/%d keywords)",
-                                kw_hits, len(self._PIPELINE_KNOWLEDGE_KEYWORDS))
+            content = arguments.get("content", "").lower()
+            kw_hits = sum(1 for kw in self._PIPELINE_KNOWLEDGE_KEYWORDS if kw.lower() in content)
+            if kw_hits >= self._MIN_PIPELINE_KEYWORDS_IN_MEMORY:
+                self._pipeline_knowledge_persisted = True
+                logger.info("Pipeline knowledge persisted via key '%s' (%d/%d keywords)",
+                            arguments.get("key", ""), kw_hits, len(self._PIPELINE_KNOWLEDGE_KEYWORDS))
 
         # Detect training started for skill lifecycle
         if not self._training_started and not error:
@@ -2155,11 +2545,27 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
                 display.warn(f"Auto-loaded skill based on error pattern")
 
         # Inject soft warnings from pre-execution gates — deduplicated
-        all_warning_parts = [soft_warnings, phase_warning]
-        for warning_text in all_warning_parts:
+        if isinstance(soft_warnings, list) and soft_warnings:
+            for gate_info in soft_warnings:
+                display.gate_triggered(gate_info["name"], gate_info.get("description", ""), gate_info.get("reason", ""), is_hard=False)
+            warning_text = "\n".join(g["detail"] for g in soft_warnings)
             if warning_text and warning_text != self._last_gate_warning:
                 result = warning_text + "\n" + result
                 self._last_gate_warning = warning_text
+        elif isinstance(soft_warnings, str) and soft_warnings:
+            if soft_warnings != self._last_gate_warning:
+                result = soft_warnings + "\n" + result
+                self._last_gate_warning = soft_warnings
+                first_line = soft_warnings.strip().splitlines()[0][:120]
+                display.warn(f"Gate soft warning: {first_line}")
+        if phase_warning and phase_warning != self._last_gate_warning:
+            result = phase_warning + "\n" + result
+            self._last_gate_warning = phase_warning
+            if isinstance(phase_warning, dict):
+                display.gate_triggered(phase_warning["name"], phase_warning.get("description", ""), phase_warning.get("reason", ""), is_hard=False)
+            else:
+                first_line = phase_warning.strip().splitlines()[0][:120]
+                display.warn(f"Gate soft warning: {first_line}")
 
         # Post-launch informational gates — append to training output
         if tool_name == "shell" and not error:
@@ -2180,6 +2586,10 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
         if self._tool_calls_since_save >= self._AUTOSAVE_INTERVAL:
             self._tool_calls_since_save = 0
             self._save_conversation()
+
+        # Reset gate block counters on successful tool execution
+        if hasattr(self, '_gate_block_counts'):
+            self._gate_block_counts.clear()
 
         display.tool_done(tool_name, elapsed, detail=detail, error=error)
         return result
@@ -2336,19 +2746,16 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             try:
                 content = self.skill_manager.load(name)
                 content = self._maybe_summarize_skill(name, content)
-                tool_call_id = f"auto_{uuid.uuid4().hex[:8]}"
-                fake_response = {
-                    "content": None,
-                    "tool_calls": [{"id": tool_call_id, "name": "load_skill", "arguments": {"name": name}}],
-                }
-                self.history.append(self.provider.format_assistant_message(fake_response))
-                self.history.append(self.provider.format_tool_result(
-                    tool_call_id, f"[Skill '{name}' loaded — content available in system context]"))
                 self._loaded_skills.add(name)
                 self._active_skill_content[name] = content
                 self._skill_load_iterations[name] = self._total_iterations
                 if "data-prep" in name:
                     self._data_prep_mode = True
+                if "env-setup" in name:
+                    self._env_setup_loaded = True
+                    self._inject_env_compat_directive()
+                if "workspace-layout" in name:
+                    self._workspace_layout_loaded = True
                 display.skill_auto_loaded(name)
             except Exception:
                 pass
@@ -2358,32 +2765,18 @@ class ReactAgent(PromptMixin, CompactionMixin, GatesMixin, JudgesMixin, Commands
             return
         candidates = self._skill_judge(user_input)
 
-        for skill_name in candidates:
-            try:
-                content = self.skill_manager.load(skill_name)
-                content = self._maybe_summarize_skill(skill_name, content)
-                tool_call_id = f"auto_{uuid.uuid4().hex[:8]}"
-                fake_response = {
-                    "content": None,
-                    "tool_calls": [{"id": tool_call_id, "name": "load_skill", "arguments": {"name": skill_name}}],
-                }
-                self.history.append(self.provider.format_assistant_message(fake_response))
-                # Short placeholder in history — full content lives in system prompt via _active_skill_content
-                self.history.append(self.provider.format_tool_result(
-                    tool_call_id, f"[Skill '{skill_name}' loaded — content available in system context]"))
-                self._loaded_skills.add(skill_name)
-                # Track for skill lifecycle management
-                self._active_skill_content[skill_name] = content
-                self._skill_load_iterations[skill_name] = self._total_iterations
-                # Activate mode flags (same as _post_tool_execution)
-                if "model-porter" in skill_name:
-                    self._porting_mode = True
-                    self._auto_load_companion_skills(self._PORTING_COMPANION_SKILLS)
-                if "data-prep" in skill_name:
-                    self._data_prep_mode = True
-                display.skill_auto_loaded(skill_name)
-            except Exception:
-                pass
+        # Resolve full dependency closure: requires (strong) + suggests (weak)
+        all_to_load = self.skill_manager.get_dependency_closure(candidates)
+        self._auto_load_companion_skills(all_to_load)
+
+        # Also auto-load suggests of the primary candidates (in case the dep
+        # closure didn't capture them — get_dependency_closure includes both)
+        for skill_name in all_to_load:
+            if "model-porter" in skill_name and not self._porting_mode:
+                self._porting_mode = True
+                self._auto_load_companion_skills(self._PORTING_COMPANION_SKILLS)
+            if "data-prep" in skill_name:
+                self._data_prep_mode = True
 
 class _PluginShellTool:
     """A tool loaded from a JSON spec that wraps a shell command template."""

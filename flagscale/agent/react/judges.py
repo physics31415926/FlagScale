@@ -154,15 +154,19 @@ class JudgesMixin:
         "Conversation context: {conversation_context}\n"
         "Available skills:\n{skills_list}\n"
         "Already loaded: {loaded}\n\n"
+        "IMPORTANT — dependency chains:\n"
+        "{dependency_chains}\n\n"
         "Rules:\n"
         "- Only suggest a skill if it's clearly relevant to the user's request\n"
         "- If the user explicitly names a skill or task that maps to one, suggest it\n"
         "- If the request is ambiguous or general, suggest nothing\n"
         "- Never suggest a skill that's already loaded\n"
-        "- For training tasks: suggest 'train-run'\n"
+        "- For environment setup/installing: suggest both 'env-setup' AND 'workspace-layout' (global rule: workspace-layout is REQUIRED for ANY env creation, code download, conda install, or pip install task)\n"
+        "- For creating conda envs, downloading code/models/data: always include 'workspace-layout' first\n"
+        "- For training tasks: suggest 'train-run' (which requires workspace-layout — include it too)\n"
         "- For model porting/migration: suggest 'model-porter'\n"
-        "- For environment setup: suggest 'env-setup'\n"
-        "- For monitoring: suggest 'train-monitor'\n\n"
+        "- For monitoring: suggest 'train-monitor'\n"
+        "- The system will automatically load all requires/suggests of each skill you select — you only need to select the primary skill\n\n"
         "Reply with ONLY a JSON object:\n"
         '  {{"skills": ["skill-name"]}} or {{"skills": []}}'
     )
@@ -188,11 +192,26 @@ class JudgesMixin:
         skills_list = "\n".join(f"- {s['name']}: {s['description']}" for s in skills)
         loaded = ", ".join(self._loaded_skills) if self._loaded_skills else "(none)"
 
+        # Build dependency chain info for the judge
+        dep_lines = []
+        for s in skills:
+            reqs = s.get("requires", [])
+            suggs = s.get("suggests", [])
+            if reqs or suggs:
+                parts = []
+                if reqs:
+                    parts.append(f"requires=[{','.join(reqs)}]")
+                if suggs:
+                    parts.append(f"suggests=[{','.join(suggs)}]")
+                dep_lines.append(f"  {s['name']}: {'; '.join(parts)}")
+        dependency_chains = "\n".join(dep_lines) if dep_lines else "(none)"
+
         prompt = self._SKILL_JUDGE_PROMPT.format(
             user_input=user_input[:500],
             conversation_context=self._get_recent_conversation_context(),
             skills_list=skills_list,
             loaded=loaded,
+            dependency_chains=dependency_chains,
         )
         try:
             messages = [{"role": "user", "content": prompt}]

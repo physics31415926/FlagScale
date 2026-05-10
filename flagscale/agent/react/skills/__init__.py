@@ -50,6 +50,8 @@ class SkillManager:
                             "description": meta.get("description", ""),
                             "keywords": meta.get("keywords", []),
                             "parameters": meta.get("parameters", []),
+                            "requires": meta.get("requires", []) or [],
+                            "suggests": meta.get("suggests", []) or [],
                         }
                     except Exception:
                         seen_paths[skill_file] = {"name": entry, "description": "", "keywords": [], "parameters": []}
@@ -120,6 +122,53 @@ class SkillManager:
             body = body.replace(f"{{{k}}}", str(v))
 
         return f"<skill name=\"{skill_name}\">\n{body}\n</skill>"
+
+    def get_meta(self, name: str) -> Dict:
+        """Get skill frontmatter metadata without loading full content."""
+        mapping = self._scan()
+        skill_file = mapping.get(name)
+        if skill_file is None:
+            return {}
+        try:
+            meta, _ = self._parse_file(skill_file)
+            return meta
+        except Exception:
+            return {}
+
+    def get_dependency_closure(self, names: list, _seen: set | None = None) -> list:
+        """Return a topologically sorted list of skill names to load, including
+        all transitive `requires` and `suggests` of the given skills.
+
+        `requires` are loaded first (strong deps), then the skill itself,
+        then `suggests` (weak deps). Circular references are skipped.
+        """
+        if _seen is None:
+            _seen = set()
+        result = []
+        for name in names:
+            if name in _seen:
+                continue
+            _seen.add(name)
+            meta = self.get_meta(name)
+            if not meta:
+                continue
+            # Depth-first: load requires first
+            reqs = meta.get("requires", []) or []
+            for dep in reqs:
+                if dep not in _seen:
+                    sub_result = self.get_dependency_closure([dep], _seen)
+                    result.extend(sub_result)
+            # Then the skill itself (if not already added by depends chain)
+            # We add the skill name separately so the caller loads it
+            if name not in [r for r in result]:
+                result.append(name)
+            # Then suggests (weak deps, loaded after)
+            suggs = meta.get("suggests", []) or []
+            for sug in suggs:
+                if sug not in _seen:
+                    sub_result = self.get_dependency_closure([sug], _seen)
+                    result.extend(sub_result)
+        return result
 
     def load_summary(self, name: str) -> str | None:
         """Load SUMMARY.md for a skill if it exists. Returns None if no summary available."""

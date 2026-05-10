@@ -44,6 +44,19 @@ Set up a complete FlagScale training environment on a GPU server. All dependenci
 
 Environment setup is a constraint satisfaction problem. Collect ALL constraints first, solve for compatible versions, then install once.
 
+### CRITICAL: Source-of-truth principle
+
+**NEVER reference or inspect existing environments when determining what to install.** Existing environments (even `flagscale-train`, even on the same machine) may have different hardware, editable installs pointing to other workspaces, patched packages, or stale versions. They tell you NOTHING useful about what the CURRENT environment needs.
+
+The ONLY valid sources of truth for dependency versions are:
+1. FlagScale's own `requirements/*.txt`, `setup.py`, `setup.cfg`, `pyproject.toml`
+2. The upstream repos of FL-customized dependencies: Megatron-LM-FL, TransformerEngine-FL
+3. The actual hardware (driver version, GPU type) — queried fresh with nvidia-smi
+
+**Do NOT run `pip list`, `conda list`, `pip show` in any existing environment.** Do NOT look at what another environment has installed. These are irrelevant and misleading.
+
+### General rules
+
 1. ALL installs go into the target conda environment — NEVER install into base or current environment. Use `conda run -n <env> pip install ...` for every pip command. To check dependency versions without installing, read setup.cfg/pyproject.toml from the source repo or use `pip index versions <pkg>`.
 2. Try pip install with pinned versions (fast, from FlagScale PyPI)
 3. If pip fails, fall back to source clone + build
@@ -56,7 +69,7 @@ Environment setup is a constraint satisfaction problem. Collect ALL constraints 
 
 ## Step 1: Constraint Collection (NO installs in this step)
 
-Collect all version constraints before installing anything.
+Collect ALL version constraints before installing anything. Do NOT look at existing environments.
 
 ### 1a. Hardware constraint — driver → max CUDA
 
@@ -75,51 +88,77 @@ Driver → max CUDA version (for PyTorch wheel selection):
 - Driver 530.x → CUDA ≤ 12.1 → wheels: cu118, cu121
 - Driver 520.x → CUDA ≤ 11.8 → wheels: cu118
 
-### 1b. Framework constraint — required PyTorch / Python versions
+### 1b. FlagScale framework constraint — read from source
 
-For FlagScale: read `requirements.txt` and Megatron-LM-FL's setup requirements.
-For other frameworks (ESPnet, DeepSpeed, Fairseq, etc.): fetch setup.cfg / pyproject.toml from the source repo:
+Read FlagScale's own dependency declarations (NOT from any installed environment):
 
 ```bash
-# Option A: fetch from GitHub raw URL (no install needed)
-web_fetch https://raw.githubusercontent.com/<org>/<repo>/master/setup.cfg
-
-# Option B: clone with --depth 1 and read locally
-git clone --depth 1 <repo_url> /tmp/<repo>
-grep -A 20 "install_requires" /tmp/<repo>/setup.cfg
-grep "python_requires" /tmp/<repo>/setup.cfg
+cat requirements.txt
+cat requirements/cuda/train.txt
+cat requirements/cuda/base.txt
+cat setup.py
 ```
 
-Extract: `torch>=X.Y.Z`, `python_requires>=X.Y`, and any other critical deps.
+Also fetch the setup configs of the two FL forks to check their torch/python requirements:
 
-### 1c. Recipe/config constraint — additional packages
-
-Read the specific training recipe or config to check for additional requirements:
-- Flash-Attention (requires specific CUDA compute capability)
-- DeepSpeed, Apex, TransformerEngine
-- Domain-specific packages (e.g., ESPnet's `espnet[s2t]` extras)
-
-### 1d. Solve — find the intersection
-
-Write out the constraint table explicitly, then present options to the user:
-
-```
-Example:
-  Driver 535.154 → max CUDA 12.4
-  ESPnet setup.cfg → torch >= 2.3.1, python >= 3.10
-  Available PyTorch wheels for cu121: 2.3.1, 2.4.0, 2.4.1, 2.5.0, ...
-  Available PyTorch wheels for cu124: 2.4.0, 2.5.0, ...
-
-  Options:
-    A. torch==2.3.1+cu121 — lowest compatible, best stability with third-party libs (recommended)
-    B. torch==2.4.0+cu124 — newer, more CUDA features
-    C. torch==2.5.0+cu124 — latest, flash-attn/apex may not be adapted yet
-  Python: 3.11. Which do you prefer?
+```bash
+# Megatron-LM-FL: check setup.py for torch/python_requires
+web_fetch https://raw.githubusercontent.com/flagos-ai/Megatron-LM-FL/main/setup.py
+# TransformerEngine-FL: check setup.py for torch/python/minor version requirements
+web_fetch https://raw.githubusercontent.com/flagos-ai/TransformerEngine-FL/main/setup.py
 ```
 
-Default recommendation: lowest PyTorch + highest compatible CUDA (most stable + best GPU features). But always let the user choose.
+### 1c. FL-customized dependency analysis (as important as PyTorch itself)
 
-If no valid intersection exists, STOP and tell the user why (e.g., framework requires torch>=2.6 but no compatible wheel for this driver).
+FlagScale requires four FL-customized / special packages. ALL four are MANDATORY:
+
+| Package | Source | Install method (primary) | Fallback |
+|---------|--------|-------------------------|----------|
+| Megatron-LM-FL | flagos-ai PyPI / GitHub | pip from FlagScale PyPI | source build |
+| TransformerEngine-FL | flagos-ai PyPI / GitHub | pip from FlagScale PyPI | source build (--recursive) |
+| Apex | NVIDIA GitHub | source build (APEX_CUDA_EXT=1) | N/A — must build from source |
+| Flash-Attention | Dao-AILab GitHub | source build (--no-deps) | N/A — must build from source |
+
+For each, analyze:
+- **Megatron-LM-FL & TransformerEngine-FL**: Check the PyPI index URL `https://resource.flagos.net/repository/flagos-pypi-hosted/simple` for available versions. If a compatible wheel exists, use it (fast). If the wheel fails or is outdated, fall back to source build.
+- **Apex**: Always source build. Must compile with `APEX_CUDA_EXT=1` matching PyTorch's CUDA version. Check that the nvcc toolkit version matches torch.version.cuda (not just driver CUDA version).
+- **Flash-Attention**: Always source build. The version must match the installed PyTorch version. Use `--no-deps` to prevent pip from upgrading PyTorch. Check: GPU compute capability ≥ 8.0 required for flash-attn v2.x.
+
+### 1d. Solve — write the FULL compatibility table
+
+Write a COMPLETE compatibility table covering ALL components. Do NOT skip to Step 2 until this table is written and verified:
+
+```
+COMPATIBILITY ANALYSIS TABLE
+============================
+Hardware: N×GPU_TYPE, Driver DRI_VER → max CUDA CUDA_MAX
+FlagScale requirements:
+  Python: py_req
+  PyTorch: torch_req
+  CUDA toolkit required: cuda_toolkit_needed
+
+| # | Component | Required Version | Install Method | Notes |
+|---|-----------|-----------------|---------------|-------|
+| 1 | Conda env | python=py_ver | conda create | name: env_name |
+| 2 | PyTorch | torch_ver+cuXXX | pip | --extra-index-url https://download.pytorch.org/whl/cuXXX |
+| 3 | FlagScale | editable | pip -e ".[cuda-train]" | from project root |
+| 4 | Megatron-LM-FL | mlm_ver | pip/source | FlagScale PyPI / git clone + build |
+| 5 | TransformerEngine-FL | te_ver | pip/source | FlagScale PyPI / git clone --recursive + build |
+| 6 | Apex | master | source build | git clone NVIDIA/apex + APEX_CUDA_EXT=1 |
+| 7 | Flash-Attention | fa_ver | source build | --no-deps to protect PyTorch |
+```
+
+CRITICAL CHECKLIST before proceeding:
+- [ ] All versions in the table are derived from FlagScale source files (NOT existing envs)
+- [ ] CUDA toolkit version matches PyTorch's CUDA (not driver's)
+- [ ] GPU compute capability ≥ required by flash-attn
+- [ ] Megatron-LM-FL wheel exists on FlagScale PyPI at the needed version
+- [ ] TransformerEngine-FL wheel exists on FlagScale PyPI at the needed version
+- [ ] Apex build flags include APEX_CUDA_EXT=1
+- [ ] Flash-attn install uses --no-deps
+
+Present the table and ASK FOR CONFIRMATION. Do NOT proceed to Step 2 until the user confirms.
+After confirmation, annotate your response with [ENV_COMPAT_ANALYZED].
 
 ## Step 2: Conda Environment
 

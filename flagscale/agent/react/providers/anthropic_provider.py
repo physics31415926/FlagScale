@@ -18,10 +18,30 @@ class AnthropicProvider(LLMProvider):
     def __init__(self, model: str, api_key: str, base_url: str = None, max_tokens: int = 8192):
         self._model = model
         self._max_tokens = max_tokens
-        kwargs = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = anthropic.Anthropic(**kwargs)
+        self._api_key = api_key
+        self._base_url = base_url
+        self._is_third_party = base_url and "anthropic.com" not in base_url
+        self._auth_mode = None  # Will be auto-detected on first call
+        self._client = self._build_client()
+
+    def _build_client(self):
+        """Build Anthropic client with current auth mode."""
+        kwargs = {"api_key": self._api_key}
+        if self._base_url:
+            kwargs["base_url"] = self._base_url
+            if self._is_third_party and self._auth_mode == "bearer":
+                kwargs["api_key"] = "placeholder"
+                kwargs["default_headers"] = {"Authorization": f"Bearer {self._api_key}"}
+        return anthropic.Anthropic(**kwargs)
+
+    def _switch_auth_and_retry(self):
+        """Switch from x-api-key to Bearer auth after a 401."""
+        if self._auth_mode == "bearer":
+            return False  # Already tried Bearer, nothing more to do
+        logger.info("Received 401 with x-api-key auth, switching to Bearer auth for third-party endpoint")
+        self._auth_mode = "bearer"
+        self._client = self._build_client()
+        return True
 
     def _split_system(self, messages):
         """Separate system message from chat messages (Anthropic requires this)."""
@@ -45,7 +65,13 @@ class AnthropicProvider(LLMProvider):
 
     def chat(self, messages: List[Dict[str, Any]], tools: List[dict]) -> Dict[str, Any]:
         kwargs = self._build_kwargs(messages, tools)
-        response = self._client.messages.create(**kwargs)
+        try:
+            response = self._client.messages.create(**kwargs)
+        except anthropic.AuthenticationError:
+            if self._is_third_party and self._switch_auth_and_retry():
+                response = self._client.messages.create(**kwargs)
+            else:
+                raise
 
         content = None
         tool_calls = None
@@ -62,7 +88,17 @@ class AnthropicProvider(LLMProvider):
     def chat_stream(self, messages: List[Dict[str, Any]], tools: List[dict]) -> Iterator[Dict[str, Any]]:
         kwargs = self._build_kwargs(messages, tools)
 
-        with self._client.messages.stream(**kwargs) as stream:
+        try:
+            stream_ctx = self._client.messages.stream(**kwargs)
+            stream = stream_ctx.__enter__()
+        except anthropic.AuthenticationError:
+            if self._is_third_party and self._switch_auth_and_retry():
+                stream_ctx = self._client.messages.stream(**kwargs)
+                stream = stream_ctx.__enter__()
+            else:
+                raise
+
+        try:
             for event in stream:
                 if event.type == "content_block_start":
                     block = event.content_block
@@ -84,6 +120,8 @@ class AnthropicProvider(LLMProvider):
                     }
             except Exception:
                 pass
+        finally:
+            stream_ctx.__exit__(None, None, None)
         yield {"type": "done"}
 
     def format_assistant_message(self, response: Dict[str, Any]) -> Dict[str, Any]:

@@ -373,15 +373,24 @@ class HistoryManager:
             return self._last_inflation_ratio
         return self._last_inflation_ratio
 
-    def force_compact(self, target_ratio: float = 0.50) -> bool:
-        """Force compaction to a target ratio. Returns True if compaction occurred."""
+    def force_compact(self, target_ratio: float = 0.50, base_limit: int = None) -> bool:
+        """Force compaction to a target ratio. Returns True if compaction occurred.
+
+        Args:
+            target_ratio: Target ratio (0.0-1.0) of the base limit
+            base_limit: Base limit to calculate target from. If None, uses self.max_context_tokens.
+                        When recovering from overflow, pass the actual token count that triggered the error.
+        """
         estimated = sum(_message_tokens(m) for m in self._messages)
         actual = self._actual_input_tokens or 0
         current = max(estimated, actual)
         inflation = self._get_inflation_ratio()
 
+        # Use actual limit if provided (for overflow recovery), otherwise use configured limit
+        effective_limit = base_limit if base_limit is not None else self.max_context_tokens
+
         # Target in *real* tokens, then deflate to local-estimate space
-        real_target = int(self.max_context_tokens * target_ratio)
+        real_target = int(effective_limit * target_ratio)
         local_target = int(real_target / inflation)
 
         if current <= real_target:
@@ -389,18 +398,29 @@ class HistoryManager:
 
         logger.warning(
             "Force compact: estimated=%d, actual=%d, inflation=%.2f, "
-            "real_target=%d, local_target=%d",
-            estimated, actual, inflation, real_target, local_target,
+            "base_limit=%d, real_target=%d, local_target=%d",
+            estimated, actual, inflation, effective_limit, real_target, local_target,
         )
 
-        keep_recent = min(KEEP_RECENT, max(len(self._messages) - 2, 1))
+        # Scale keep_recent with target_ratio — more aggressive ratio = fewer kept
+        if target_ratio <= 0.25:
+            keep_recent = min(4, max(len(self._messages) - 2, 1))
+        elif target_ratio <= 0.35:
+            keep_recent = min(8, max(len(self._messages) - 2, 1))
+        else:
+            keep_recent = min(KEEP_RECENT, max(len(self._messages) - 2, 1))
+
         result = []
         for i, msg in enumerate(self._messages):
             is_recent = (i >= len(self._messages) - keep_recent)
             if msg.get("role") == "system":
                 result.append(msg)
             elif is_recent:
-                result.append(msg)
+                # For very aggressive compaction, truncate even recent messages
+                if target_ratio <= 0.25:
+                    result.append(_truncate_message(msg, max_chars=800))
+                else:
+                    result.append(msg)
             else:
                 result.append(_truncate_message(msg))
 
@@ -419,11 +439,12 @@ class HistoryManager:
 
         result = self._inject_summary(result)
         self._messages = result
-        # Keep _actual_input_tokens to preserve inflation ratio memory
         self._compaction_count += 1
         final_estimated = sum(_message_tokens(m) for m in self._messages)
         self._last_compacted_from = estimated
         self._last_compacted_to = final_estimated
+        # Reset actual tokens — stale value would mislead next compaction attempt
+        self._actual_input_tokens = None
         logger.info("Force compact done: %d -> %d estimated tokens (≈%d real)",
                     estimated, final_estimated, int(final_estimated * inflation))
         return True

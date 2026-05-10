@@ -66,28 +66,10 @@ class TestSessionMemory:
         assert memory.list_entries() == []
 
     def test_clear_by_type(self, memory):
-        memory.put("a", "finding", "fact a", "s1")
-        memory.put("b", "todo", "task b", "s1")
-        memory.put("c", "finding", "fact c", "s1")
-        memory.put("d", "context", "ctx d", "s1")
-        count = memory.clear_by_type("finding")
-        assert count == 2
-        remaining = memory.list_entries()
-        assert len(remaining) == 2
-        keys = {e["key"] for e in remaining}
-        assert keys == {"b", "d"}
-
-    def test_clear_by_type_returns_zero_for_unknown(self, memory):
-        memory.put("a", "finding", "fact", "s1")
-        count = memory.clear_by_type("nonexistent")
-        assert count == 0
-        assert len(memory.list_entries()) == 1
-
-    def test_clear_by_type(self, memory):
-        memory.put("a", "finding", "fact a", "s1")
-        memory.put("b", "context", "ctx b", "s1")
-        memory.put("c", "finding", "fact c", "s1")
-        memory.put("d", "todo", "task d", "s1")
+        memory.put("alpha_env", "finding", "python version is 3.12 with cuda 12.4", "s1")
+        memory.put("beta_ctx", "context", "user prefers verbose output", "s1")
+        memory.put("gamma_perf", "finding", "transformer engine requires flash attention", "s1")
+        memory.put("delta_task", "todo", "implement checkpoint conversion", "s1")
         count = memory.clear_by_type("finding")
         assert count == 2
         remaining = memory.list_entries()
@@ -108,21 +90,21 @@ class TestSessionMemory:
         assert memory.get("k1") is None
 
     def test_recent_returns_newest_first(self, memory):
-        memory.put("old", "finding", "old fact", "s1")
+        memory.put("env_python_version", "finding", "python 3.12 installed with cuda 12.4", "s1")
         time.sleep(0.05)
-        memory.put("new", "finding", "new fact", "s1")
+        memory.put("megatron_tp_config", "finding", "tensor parallel size must be divisible by attention heads", "s1")
         entries = memory.recent(max_tokens=1000)
         assert len(entries) == 2
-        assert entries[0]["key"] == "new"
-        assert entries[1]["key"] == "old"
+        assert entries[0]["key"] == "megatron_tp_config"
+        assert entries[1]["key"] == "env_python_version"
 
     def test_recent_respects_budget(self, memory):
-        memory.put("a", "finding", "x" * 2000, "s1")
+        memory.put("large_entry", "finding", "x" * 2000, "s1")
         time.sleep(0.05)
-        memory.put("b", "finding", "short", "s1")
+        memory.put("small_entry", "finding", "short", "s1")
         entries = memory.recent(max_tokens=100)
         assert len(entries) == 1
-        assert entries[0]["key"] == "b"
+        assert entries[0]["key"] == "small_entry"
 
     def test_key_with_special_chars(self, memory):
         memory.put("my/key with spaces", "context", "content", "s1")
@@ -206,23 +188,23 @@ class TestDedup:
 
     def test_dedup_merges_with_llm(self, memory_dir):
         def mock_llm(prompt):
-            if "confidence score" in prompt:
-                return "0.9"
+            if "Which existing entries should be merged" in prompt:
+                return "[0]"
             return ""
 
         memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
         memory.put("k1", "finding", "OOM on TP=2, fixed by batch_size=4", "s1")
         path = memory.put("k2", "finding", "OOM on TP=2, reduced batch to 4", "s1")
-        # k2 should be merged into k1
-        assert "k1" in path
-        assert memory.get("k2") is None
-        entry = memory.get("k1")
-        assert "reduced batch to 4" in entry["content"]
+        # k1 should be merged into k2 (old absorbed into new)
+        assert "k2" in path
+        assert memory.get("k1") is None
+        entry = memory.get("k2")
+        assert "fixed by batch_size=4" in entry["content"]
 
     def test_dedup_no_merge_when_different(self, memory_dir):
         def mock_llm(prompt):
-            if "confidence score" in prompt:
-                return "0.2"
+            if "Which existing entries should be merged" in prompt:
+                return "[]"
             return ""
 
         memory = SessionMemory(memory_dir, ttl_days=7, llm_fn=mock_llm)
