@@ -1,8 +1,7 @@
 """Tests for phase-based schema filtering (Layer 3)."""
 
 import pytest
-from collections import deque
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from flagscale.agent.react.tools import ToolRegistry
 from flagscale.agent.react.tools.base import Tool
@@ -70,48 +69,15 @@ class TestPhaseDetection:
     """Test _detect_tool_phase logic in isolation."""
 
     def _make_agent_stub(self):
-        """Create a minimal object with the phase detection method."""
-        from flagscale.agent.react.agent import ReactAgent
+        """Create a minimal object with the filtered schemas method."""
+        from flagscale.agent.react.agent import (
+            WorkerAgent, _PHASE_TOOL_SETS, _CORE_TOOLS,
+        )
 
-        # We'll test the method logic directly by creating a mock
         agent = MagicMock()
-        agent._last_tool_calls_deque = deque(maxlen=5)
-        agent._PHASE_TOOL_SETS = ReactAgent._PHASE_TOOL_SETS
-        agent._CORE_TOOLS = ReactAgent._CORE_TOOLS
         agent._extra_tools_next_iter = set()
-        agent._detect_tool_phase = ReactAgent._detect_tool_phase.__get__(agent)
-        agent._get_filtered_schemas = ReactAgent._get_filtered_schemas.__get__(agent)
+        agent._get_filtered_schemas = WorkerAgent._get_filtered_schemas.__get__(agent)
         return agent
-
-    def test_default_phase_when_empty(self):
-        agent = self._make_agent_stub()
-        assert agent._detect_tool_phase() == "default"
-
-    def test_monitoring_phase(self):
-        agent = self._make_agent_stub()
-        agent._last_tool_calls_deque.append("shell")
-        agent._last_tool_calls_deque.append("monitor")
-        assert agent._detect_tool_phase() == "monitoring"
-
-    def test_planning_phase(self):
-        agent = self._make_agent_stub()
-        agent._last_tool_calls_deque.append("plan_create")
-        agent._last_tool_calls_deque.append("plan_update")
-        agent._last_tool_calls_deque.append("shell")
-        assert agent._detect_tool_phase() == "planning"
-
-    def test_training_phase(self):
-        agent = self._make_agent_stub()
-        agent._last_tool_calls_deque.append("workspace_experiment")
-        agent._last_tool_calls_deque.append("parse_training_metrics")
-        assert agent._detect_tool_phase() == "training"
-
-    def test_default_phase_mixed_tools(self):
-        agent = self._make_agent_stub()
-        agent._last_tool_calls_deque.append("shell")
-        agent._last_tool_calls_deque.append("read_file")
-        agent._last_tool_calls_deque.append("write_file")
-        assert agent._detect_tool_phase() == "default"
 
     def test_filtered_schemas_monitoring(self):
         agent = self._make_agent_stub()

@@ -499,7 +499,7 @@ def agent(
 ):
     """Start the FlagScale interactive agent, or run a single query."""
     from flagscale.agent.react.config import AgentConfig
-    from flagscale.agent.react.agent import ReactAgent
+    from flagscale.agent.react.agent import WorkerAgent
 
     if config:
         cfg = AgentConfig.from_yaml(str(config))
@@ -515,7 +515,7 @@ def agent(
     if query:
         cfg.confirm_commands = False
 
-    agent_instance = ReactAgent(cfg)
+    agent_instance = WorkerAgent(cfg)
     agent_instance.run(single_shot_query=query)
 
 

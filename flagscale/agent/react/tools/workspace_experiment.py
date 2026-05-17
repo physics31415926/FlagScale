@@ -17,10 +17,12 @@ class WorkspaceExperimentTool(Tool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "add_attempt", "update_last_attempt", "finalize", "read", "list"],
+                "enum": ["create", "add_attempt", "update_last_attempt", "finalize",
+                         "read", "list", "compare", "diff_last_attempts"],
                 "description": "Action to perform.",
             },
-            "name": {"type": "string", "description": "Experiment name (required for all actions except list)."},
+            "name": {"type": "string", "description": "Experiment name (required for all actions except list). For compare: baseline experiment."},
+            "name2": {"type": "string", "description": "Second experiment name (for compare action only — the experiment to compare against baseline)."},
             "purpose": {"type": "string", "description": "Why this experiment exists (for create)."},
             "hypothesis": {"type": "string", "description": "What you expect to happen and why (for create)."},
             "change": {
@@ -151,5 +153,20 @@ class WorkspaceExperimentTool(Tool):
                 return "(no experiments yet)"
             lines = [f"- {e['name']} ({e['status']}, {e['attempts']} attempts)" for e in experiments]
             return "\n".join(lines)
+
+        elif action == "compare":
+            name1 = kwargs.get("name")  # First experiment name
+            name2 = kwargs.get("name2")
+            if not name1 or not name2:
+                return "ERROR: Both 'name' (baseline) and 'name2' (experiment) required for compare."
+            result = self._manager.compare(name1, name2)
+            return result["summary"]
+
+        elif action == "diff_last_attempts":
+            name = kwargs.get("name")
+            if not name:
+                return "ERROR: name required for diff_last_attempts."
+            result = self._manager.diff_last_attempts(name)
+            return result["summary"]
 
         return f"ERROR: Unknown action '{action}'."

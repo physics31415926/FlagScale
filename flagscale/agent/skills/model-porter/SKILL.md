@@ -26,6 +26,357 @@ parameters:
     description: "Name for the ported model (used in directory names)"
 requires: [env-setup, train-config, data-prep, train-run]
 suggests: [topo-detect, parallel-strategy, precision-alignment]
+activate_on: [is_migration]
+constraints:
+  # ── Megatron Native Integrity ───────────────────────────────────
+  - id: all_components_native
+    description: "All model components use Megatron primitives — no HF/PyTorch classes in model files"
+    phases: ["implementation"]
+    severity: warning
+    max_reminders: 5
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/megatron/**/*.py"
+    content_rules:
+      - match: "nn.Linear"
+        mode: contains
+      - match: "nn.Embedding"
+        mode: contains
+      - match: "nn.LayerNorm"
+        mode: contains
+      - match: "from transformers"
+        mode: contains
+      - match: "from huggingface"
+        mode: contains
+      - match: "AutoModel"
+        mode: contains
+    reminder: >
+      ⛔ MEGATRON NATIVE VIOLATION: Found PyTorch/HF class usage in model file.
+      ALL components — including frozen ones — MUST use Megatron primitives:
+      - nn.Linear → ColumnParallelLinear or RowParallelLinear
+      - nn.Embedding → VocabParallelEmbedding
+      - nn.LayerNorm → Megatron's LayerNorm
+      - No HuggingFace imports in model code
+      Frozen components are NOT exempt. See SKILL.md §Important Notes.
+
+  - id: no_hf_model_wrapper
+    description: "Megatron-native mode must not wrap/delegate to HF models internally"
+    phases: ["implementation"]
+    severity: error
+    max_reminders: 3
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/megatron/**/*.py"
+    content_rules:
+      - match: "AutoModel.from_pretrained"
+        mode: contains
+      - match: "model.forward("
+        mode: contains
+    reminder: >
+      ⛔ Your code imports HuggingFace models AND has some Megatron symbols, but the
+      core architecture is still wrapping/delegating to HF models. Adding Megatron
+      imports to a wrapper does NOT make it Megatron Native. The forward pass must
+      flow through Megatron/TE layers, not HF model.forward().
+      'Frozen' is NOT a valid excuse — ALL components must be Megatron-native.
+
+  - id: mode_b_design_integrity
+    description: "Mode B (Megatron Native with source backbone) must forward through Megatron layers"
+    phases: ["implementation"]
+    severity: warning
+    max_reminders: 4
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/megatron/**/*.py"
+    content_rules:
+      - match: "def forward("
+        mode: contains
+    result_rules: []
+    reminder: >
+      In Mode B (Megatron Native wrapping a frozen source backbone), the model's forward()
+      MUST flow through Megatron/TE layers — NOT delegate to HF model.forward().
+      The source backbone weights may be loaded, but the forward computation path
+      must be Megatron-native. This is a non-negotiable architectural requirement.
+
+  # ── Checkpoint Converter ────────────────────────────────────────
+  - id: unified_checkpoint_converter
+    description: "ONE unified checkpoint converter for the ENTIRE model"
+    phases: ["implementation"]
+    severity: warning
+    max_reminders: 3
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/checkpoint/**/*.py"
+    content_rules:
+      - match: "frozen"
+        mode: contains
+      - match: "no_grad"
+        mode: contains
+    reminder: >
+      ⛔ Use ONE checkpoint converter for the ENTIRE model.
+      Do NOT write separate converters for different components.
+      One converter maps ALL source weights to Megatron format in a single pass.
+
+  - id: checkpoint_verified
+    description: "Checkpoint conversion must be verified by reloading and checking keys/shapes/count"
+    phases: ["verification"]
+    severity: warning
+    max_reminders: 2
+    trigger_on:
+      tool: "shell"
+    content_rules: []
+    result_rules:
+      - match: "(?i)torch\\.save|save_checkpoint"
+        mode: regex
+    reminder: >
+      ⚠ Checkpoint saved without verification. Verify by reloading and checking:
+      key count, parameter shapes, and total parameter count match expectations.
+
+  - id: checkpoint_missed_keys_audit
+    description: "When checkpoint conversion shows missed/skipped keys, audit the FULL list"
+    phases: ["verification"]
+    severity: warning
+    max_reminders: 2
+    trigger_on:
+      tool: "shell"
+    result_rules:
+      - match: "(?i)missed|skipped|unexpected"
+        mode: regex
+    reminder: >
+      ⚠ Checkpoint conversion has missed/skipped/unexpected keys.
+      Audit the FULL list by grouping keys by top-level prefix.
+      Do not assume they are harmless based on a partial sample.
+
+  # ── Data Pipeline ───────────────────────────────────────────────
+  - id: no_dummy_data
+    description: "Verification must use real data pipeline, not dummy tensors"
+    phases: ["implementation", "verification"]
+    severity: error
+    max_reminders: 4
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/*.py"
+    content_rules:
+      - match: "torch.zeros"
+        mode: contains
+      - match: "torch.randn"
+        mode: contains
+      - match: "torch.ones"
+        mode: contains
+    reminder: >
+      ⛔ DUMMY DATA FORBIDDEN: Verification must use REAL data pipeline.
+      Dummy data hides tokenizer bugs, format bugs, and shape bugs.
+      Implement get_batch that reads actual .bin/.idx or WebDataset files.
+      See model-porter skill: 'get_batch is a porting deliverable'.
+
+  - id: train_script_has_real_data
+    description: "Training script get_batch must load real data, not generate synthetic"
+    phases: ["implementation", "verification"]
+    severity: warning
+    max_reminders: 4
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/train_*.py"
+    content_rules:
+      - match: "get_batch"
+        mode: not_contains
+    reminder: >
+      ⛔ DATA PIPELINE ISSUE: get_batch must load REAL data files.
+      The training script should have a get_batch function that reads
+      actual data files. See model-porter skill for the interface spec.
+
+  # ── Model Completeness ──────────────────────────────────────────
+  - id: structure_completeness
+    description: "All source model submodules must be present in Megatron model"
+    phases: ["implementation"]
+    severity: warning
+    max_reminders: 3
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/megatron/**/*.py"
+    content_rules:
+      - match: "self\\."
+        mode: regex
+    reminder: >
+      Verify that ALL source model submodules are registered as attributes
+      (self.xxx) in the top-level Megatron Module. Missing a submodule means
+      it won't be included in state_dict() and won't receive gradients.
+
+  - id: imports_all_megatron
+    description: "Model files must not import from HF/transformers"
+    phases: ["implementation", "verification"]
+    severity: warning
+    max_reminders: 3
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/megatron/**/*.py"
+    content_rules:
+      - match: "from transformers import"
+        mode: contains
+      - match: "from transformers.model"
+        mode: contains
+      - match: "import transformers"
+        mode: contains
+    reminder: >
+      ⛔ Model implementation files should NOT import from HuggingFace/transformers.
+      Use Megatron/TE primitives exclusively in model code.
+      Weight loading utilities can have HF imports, but NOT model forward() code.
+
+  # ── Config Consistency ──────────────────────────────────────────
+  - id: config_model_consistency
+    description: "Training config must match model architecture parameters"
+    phases: ["implementation", "verification"]
+    severity: warning
+    max_reminders: 2
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/conf/**/*.yaml"
+    content_rules: []
+    reminder: >
+      After writing training config, verify it matches model architecture:
+      hidden_size, num_layers, num_attention_heads, num_kv_heads, ffn_hidden_size.
+      Mismatch causes silent correctness bugs.
+
+  - id: parallelism_assessment
+    description: "Training config written without parallelism feasibility check"
+    phases: ["implementation"]
+    severity: warning
+    max_reminders: 2
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/conf/**/*.yaml"
+    content_rules:
+      - match: "tensor_model_parallel_size"
+        mode: contains
+    reminder: >
+      Training config specifies parallelism strategy. Verify it's feasible:
+      - TP size must divide num_attention_heads
+      - PP size must be ≤ num_layers
+      - For GQA models, TP must be ≤ num_kv_heads * 2
+      Infeasible parallelism silently wastes GPU resources or crashes.
+
+  # ── Environment ─────────────────────────────────────────────────
+  - id: pip_downgrade_warning
+    description: "pip install that upgrades/downgrades critical packages (torch, numpy, etc.)"
+    phases: ["*"]
+    severity: warning
+    max_reminders: 3
+    trigger_on:
+      tool: "shell"
+    result_rules:
+      - match: "(?i)(uninstalled|downgraded|upgraded).*(torch|numpy|cuda|cudnn|nccl)"
+        mode: regex
+    reminder: >
+      ⚠ pip upgraded/downgraded a critical package (torch, numpy, CUDA-related).
+      This may break runtime compatibility. Verify with: python -c "import torch; print(torch.__version__)"
+
+  - id: env_consistency
+    description: "Environment must be verified after setup (CUDA/PyTorch/driver compatibility)"
+    phases: ["analysis"]
+    severity: warning
+    max_reminders: 1
+    trigger_on:
+      tool: "shell"
+    content_rules: []
+    result_rules: []
+    reminder: >
+      After setting up the environment, verify runtime compatibility:
+      nvidia-smi, python -c "import torch; print(torch.cuda.is_available())",
+      and check driver/CUDA/PyTorch version alignment.
+
+  # ── Loss Sanity ─────────────────────────────────────────────────
+  - id: loss_random_warning
+    description: "Training ce_loss near ln(vocab_size) indicates random output — check weight loading"
+    phases: ["verification"]
+    severity: error
+    max_reminders: 2
+    trigger_on:
+      tool: "shell"
+    result_rules:
+      - match: "(?i)(ce_loss|lm_loss|loss).*(10\\.[4-9]|11\\.[0-9]|12\\.[0-9])"
+        mode: regex
+    reminder: >
+      ⛔ Training loss near ln(vocab_size) (~10.4-12.0) indicates RANDOM OUTPUT.
+      This means weights were NOT loaded correctly. Check:
+      1. Checkpoint converter mapped all keys
+      2. Model state_dict loaded without missing/unexpected keys
+      3. Tokenizer vocabulary is correct
+
+  # ── Workspace / Source Code Provenance ───────────────────────────
+  - id: code_provenance_mismatch
+    description: "Reading code from a different workspace than current"
+    phases: ["analysis", "implementation"]
+    severity: warning
+    max_reminders: 2
+    trigger_on:
+      tool: "shell"
+    result_rules:
+      - match: "(?i)/workspace/"
+        mode: regex
+    reminder: >
+      ⚠ Code provenance mismatch: you may be reading from a different workspace
+      than the current one. Verify you're reading the actually installed code,
+      not a different environment's copy.
+
+  - id: no_cross_env_package_copy
+    description: "Never cp packages between conda/pip environments"
+    phases: ["*"]
+    severity: error
+    max_reminders: 1
+    trigger_on:
+      tool: "shell"
+    content_rules:
+      - match: "cp.*site-packages"
+        mode: regex
+      - match: "cp -r.*conda"
+        mode: regex
+    reminder: >
+      ⛔ NEVER copy packages between environments with cp -r.
+      Use pip install or conda install instead. cp bypasses dependency
+      resolution and breaks the environment.
+
+  # ── Experiment Tracking ─────────────────────────────────────────
+  - id: training_failure_update_experiment
+    description: "After training crash/error, update experiment record before debugging"
+    phases: ["verification"]
+    severity: warning
+    max_reminders: 2
+    trigger_on:
+      tool: "shell"
+    result_rules:
+      - match: "(?i)(traceback|runtimeerror|exitcode=[1-9])"
+        mode: regex
+    reminder: >
+      ⚠ Training failed — update the experiment via workspace_experiment with
+      the failure reason before debugging or relaunching. This keeps the
+      experiment tracking accurate.
+
+  - id: training_success_update_experiment
+    description: "After training completes, update experiment with final metrics"
+    phases: ["verification"]
+    severity: info
+    max_reminders: 1
+    trigger_on:
+      tool: "shell"
+    result_rules:
+      - match: "(?i)(completed|finished|all.*steps.*done)"
+        mode: regex
+    reminder: >
+      Training completed successfully — update the experiment entry with
+      final metrics and reflection via workspace_experiment.
+
+  # ── Config Validation ───────────────────────────────────────────
+  - id: config_not_validated
+    description: "YAML config written but not validated"
+    phases: ["implementation"]
+    severity: info
+    max_reminders: 2
+    trigger_on:
+      tool: "write_file"
+      path_match: "**/*.yaml"
+    content_rules: []
+    reminder: >
+      Config file written. Call validate_config(path='...') to check for
+      structural errors before launching training.
 ---
 
 # Model Porter
