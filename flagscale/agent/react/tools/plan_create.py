@@ -1,10 +1,13 @@
 """Plan create tool — create a structured task plan."""
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, ToolEffect
+
+_EFFECT_PLAN_WRITE = ToolEffect(reads=frozenset({"plan"}), writes=frozenset({"plan"}))
 
 
 class PlanCreateTool(Tool):
     name = "plan_create"
+    effects = _EFFECT_PLAN_WRITE
     description = (
         "Create a task plan with ordered steps for complex multi-step work. "
         "Use when starting environment setup, model porting, training runs, "

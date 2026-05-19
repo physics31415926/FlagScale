@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_SHELL
 
 FATAL_PATTERNS = [
     r"rm\s+-[^\s]*r[^\s]*f\s+/\s*$",
@@ -180,7 +180,9 @@ def _inject_proxy_exports(command: str, env: dict) -> str:
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
         val = env.get(var)
         if val:
-            exports.append(f'export {var}="{val}"')
+            # Use shlex.quote to prevent shell injection via proxy values
+            import shlex
+            exports.append(f'export {var}={shlex.quote(val)}')
     if not exports:
         return command
     return " && ".join(exports) + " && " + command
@@ -339,6 +341,7 @@ def _protect_self_kill(command: str) -> str:
 
 class ShellTool(Tool):
     name = "shell"
+    effects = EFFECT_SHELL
     description = "Execute a shell command and return its output (stdout + stderr)."
     parameters = {
         "type": "object",
@@ -457,8 +460,8 @@ class ShellTool(Tool):
                 env=run_env,
             )
 
-            stdout_chunks = []
-            stderr_chunks = []
+            stdout_chunks: list = []
+            stderr_chunks: list = []
 
             def _read_stream(stream, buf):
                 for line in stream:
@@ -478,10 +481,12 @@ class ShellTool(Tool):
                     display._active_spinner.set_hint(f"⏳ Waiting {secs}s")
 
             start = time.time()
+            # First health check at 15s, then LLM decides (default 60s)
             next_check = min(15, self._remind_interval)
             long_run_approved = True
             last_output_snapshot = ""
             stall_count = 0
+            health_reason = ""  # last health judge verdict for display
             while proc.poll() is None:
                 elapsed = time.time() - start
                 if elapsed > next_check:
@@ -520,6 +525,7 @@ class ShellTool(Tool):
                             )
                         else:
                             reason = decision.get("reason", "")
+                            health_reason = reason
                             if reason:
                                 if quiet and parallel_index is not None:
                                     from flagscale.agent.react import display
@@ -588,7 +594,9 @@ class ShellTool(Tool):
                             from flagscale.agent.react import display
                             if display._active_spinner:
                                 display._active_spinner.stop()
-                            lines_out = [f"\033[2m   ⏳ [{time_str}] Recent output:\033[0m"]
+                            # Include health judge verdict in the output line
+                            health_note = f"\n   🩺 {health_reason}\n" if health_reason else ""
+                            lines_out = [f"\033[2m   ⏳ [{time_str}]{health_note}   Recent output:\033[0m"]
                             for line in recent[-5:]:
                                 lines_out.append(f"\033[2m   │ {line.rstrip()}\033[0m")
                             with display._stdout_lock:
@@ -653,7 +661,9 @@ class ShellTool(Tool):
             if proc and proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=3)
-            partial = "".join(stdout_chunks) + "".join(stderr_chunks)
+            partial = "".join(stdout_chunks) + "".join(stderr_chunks) if (
+                "stdout_chunks" in locals() and "stderr_chunks" in locals()
+            ) else ""
             raise
         except Exception as e:
             return f"ERROR: {e}"

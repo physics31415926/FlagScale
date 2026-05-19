@@ -7,6 +7,7 @@ Layout:
 
 import json
 import os
+import tempfile
 import time
 
 from pathlib import Path
@@ -26,7 +27,10 @@ def get_session_dir(session_id: str) -> str:
 def save_conversation(session_dir: str, session_id: str, messages: List[Dict[str, Any]],
                       loaded_skills: List[str] = None, metadata: Dict = None,
                       completed: bool = False) -> str:
-    """Save conversation to session_dir/conversation.json. Overwrites on each call."""
+    """Save conversation to session_dir/conversation.json. Overwrites on each call.
+
+    Uses atomic write (tmp file + rename) to prevent corruption on crash.
+    """
     os.makedirs(session_dir, exist_ok=True)
     path = os.path.join(session_dir, "conversation.json")
     data = {
@@ -37,8 +41,18 @@ def save_conversation(session_dir: str, session_id: str, messages: List[Dict[str
         "loaded_skills": loaded_skills or [],
         "metadata": metadata or {},
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # Atomic write: write to tmp then rename
+    fd, tmp = tempfile.mkstemp(dir=session_dir, prefix=".tmp_conversation_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -52,7 +66,7 @@ def load_conversation(session_dir: str) -> Optional[Dict[str, Any]]:
 
 
 def mark_completed(session_dir: str):
-    """Mark a session as completed (normal exit)."""
+    """Mark a session as completed (normal exit). Uses atomic write."""
     path = os.path.join(session_dir, "conversation.json")
     if not os.path.isfile(path):
         return
@@ -60,8 +74,17 @@ def mark_completed(session_dir: str):
         data = json.load(f)
     data["completed"] = True
     data["timestamp"] = time.time()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=session_dir, prefix=".tmp_conversation_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def find_resumable_sessions(sessions_root: str = None) -> List[Dict[str, Any]]:

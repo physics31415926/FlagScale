@@ -16,7 +16,7 @@ class OpenAIProvider(LLMProvider):
     def __init__(self, model: str, api_key: str, base_url: str = None, max_tokens: int = 8192):
         self._model = model
         self._max_tokens = max_tokens
-        kwargs = {"api_key": api_key}
+        kwargs = {"api_key": api_key, "timeout": 120.0}
         if base_url:
             kwargs["base_url"] = base_url
         self._client = OpenAI(**kwargs)
@@ -26,7 +26,12 @@ class OpenAIProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
 
-        response = self._client.chat.completions.create(**kwargs)
+        try:
+            response = self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            logger.error("OpenAI chat() failed: %s", e)
+            return {"content": f"[PROVIDER_ERROR] {type(e).__name__}: {e}", "tool_calls": None}
+
         choice = response.choices[0]
         message = choice.message
 
@@ -54,6 +59,7 @@ class OpenAIProvider(LLMProvider):
             kwargs["tools"] = tools
 
         stream = self._client.chat.completions.create(**kwargs)
+        seen_tool_ids = set()  # Track tool_start already fired to avoid duplicates
         for chunk in stream:
             if chunk.usage:
                 yield {
@@ -69,7 +75,10 @@ class OpenAIProvider(LLMProvider):
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     if tc.function and tc.function.name:
-                        yield {"type": "tool_start", "id": tc.id, "name": tc.function.name}
+                        tc_id = tc.id or ""
+                        if tc_id and tc_id not in seen_tool_ids:
+                            seen_tool_ids.add(tc_id)
+                            yield {"type": "tool_start", "id": tc.id, "name": tc.function.name}
                     if tc.function and tc.function.arguments:
                         yield {"type": "tool_delta", "id": tc.id or "", "arguments_delta": tc.function.arguments}
         yield {"type": "done"}

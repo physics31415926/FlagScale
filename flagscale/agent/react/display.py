@@ -724,10 +724,6 @@ def session_list(sessions):
 
 # ── Skill / plan ────────────────────────────────────────────────────────
 
-def skill_auto_loaded(name):
-    _print(magenta(f"  🔧 Auto-loaded skill: {name}"))
-
-
 def plan_created(title, step_count):
     _print(green(f"  📋 Plan created: {title} ({step_count} steps)"))
 
@@ -786,6 +782,15 @@ def autosave_resumed(turn_count):
 def interrupted():
     _stop_all_spinners()
     _print(yellow("\n  ⚠  Interrupted. Back to prompt."))
+
+
+def goodbye():
+    _stop_all_spinners()
+    _print(green("\n  Goodbye."))
+
+
+def skill_auto_loaded(name):
+    _print(magenta(f"  🔧 Auto-loaded skill: {name}"))
 
 
 # ── Markdown rendering ──────────────────────────────────────────────────

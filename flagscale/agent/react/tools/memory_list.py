@@ -1,10 +1,11 @@
 """Memory list tool — browse and search memory entries."""
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_READ_MEMORY
 
 
 class MemoryListTool(Tool):
     name = "memory_list"
+    effects = EFFECT_READ_MEMORY
     description = (
         "List and search memory entries. Use to browse what you've memorized, "
         "find entries by type or keyword, or check what's stored for a specific task. "

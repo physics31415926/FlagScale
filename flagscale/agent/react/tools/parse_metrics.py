@@ -5,12 +5,13 @@ import os
 import re
 import subprocess
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_READ_FS
 from flagscale.agent.react.tools.find_log import _parse_megatron_metrics, _health_check
 
 
 class ParseTrainingMetricsTool(Tool):
     name = "parse_training_metrics"
+    effects = EFFECT_READ_FS
     description = (
         "Parse training metrics from a Megatron log file or experiment directory. "
         "Returns structured metrics: iterations, losses, grad norms, throughput, anomalies. "

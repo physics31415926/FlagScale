@@ -1,10 +1,13 @@
 """Plan update tool — modify task plan steps and status."""
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, ToolEffect
+
+_EFFECT_PLAN_WRITE = ToolEffect(reads=frozenset({"plan"}), writes=frozenset({"plan"}))
 
 
 class PlanUpdateTool(Tool):
     name = "plan_update"
+    effects = _EFFECT_PLAN_WRITE
     description = (
         "Update the active task plan: mark steps done/skipped, add new steps, "
         "replan, or complete/abandon the plan. Use to track progress as you work."

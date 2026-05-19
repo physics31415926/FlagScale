@@ -28,6 +28,44 @@ parameters:
     default: "8"
 requires: [train-run]
 suggests: []
+
+constraints:
+  - id: use_monitor_tool_not_find
+    description: "Always use monitor(output_dir=...) instead of raw find commands to locate logs"
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [find, locate, stdout.log, stderr.log]
+    prompt: "Check if the agent is using raw find/locate commands to find training logs instead of the monitor tool"
+    correction: "Use monitor(output_dir=<exp_dir>) which auto-discovers latest logs and scans stderr."
+    max_violations: 2
+  - id: check_stderr_first
+    description: "Always check stderr before stdout — crashes are in stderr"
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [stdout.log, stdout_worker, .output]
+    prompt: "Check if the agent is reading stdout.log without first checking stderr.log for errors"
+    correction: "Check stderr.log FIRST. A process may look running in stdout while already crashed."
+    max_violations: 1
+
+warnings:
+  - id: old_log_trap
+    description: "Warn about finding old logs from previous runs"
+    severity: warning
+    trigger:
+      keywords: [find -name, stdout.log, stderr.log, logs/details]
+    prompt: "Check if log file discovery might return old logs from previous runs"
+    reminder: "Old log trap: find without timestamp filtering returns ALL previous runs. Use monitor tool or filter by latest timestamp dir."
+    max_reminders: 2
+
+context_injection:
+  always: ["Critical Rules", "Log Directory Structure"]
+  by_tool:
+    shell: ["Locate Latest Logs", "Multi-Node: Finding the Loss Log"]
+    monitor: ["Critical Rules"]
 ---
 
 # FlagScale Training Monitor
@@ -314,5 +352,5 @@ These provide richer visualization but require a browser. For CLI-based monitori
 
 - `train-run` — launch, stop, and manage training jobs
 - `train-config` — generate and validate training configuration
-- `precision-alignment` — verify numerical alignment between implementations
+- `train-precision-alignment` — verify numerical alignment between implementations
 - `topo-detect` — detect hardware topology for diagnosing performance issues

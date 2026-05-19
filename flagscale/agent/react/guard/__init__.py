@@ -1,0 +1,178 @@
+"""Guard system — behavioral constraints with lifecycle hooks.
+
+Guards fire at three points:
+- pre: Before tool execution (can block)
+- post: After tool execution (can inject messages)
+- strategic: At review points (can redirect plan)
+"""
+
+from __future__ import annotations
+
+import abc
+from dataclasses import dataclass, field
+from typing import Literal, Any
+
+from flagscale.agent.react.state_machine import AgentState
+from flagscale.agent.react.tools.base import ToolEffect
+
+
+@dataclass
+class GuardContext:
+    """Read-only snapshot passed to guards.
+
+    Contains tool context, state machine info, and LLM classify function.
+    """
+
+    # Tool context
+    tool_name: str = ""
+    tool_args: dict = field(default_factory=dict)
+    tool_result: str | None = None
+    tool_effects: ToolEffect = field(default_factory=ToolEffect)
+    turn_count: int = 0
+    recent_tool_names: list[str] = field(default_factory=list)
+    context_pressure: float = 0.0
+
+    # State machine context
+    current_state: AgentState = AgentState.IDLE
+    transitions_count: int = 0
+
+    # LLM classify function
+    classify_fn: Any = None  # (category: str, context: dict) -> Any
+
+    # Experiment context
+    experiment_compare_fn: Any = None
+    experiment_diff_fn: Any = None
+    current_experiment_name: str = ""
+
+    @property
+    def phase_name(self) -> str:
+        """Derive phase name from current state for backward compatibility."""
+        return self.current_state.name.lower()
+
+
+@dataclass
+class GuardVerdict:
+    """What the guard wants the agent to do."""
+
+    action: Literal["allow", "block", "inject_msg", "force_compact", "escalate", "redirect"]
+    message: str = ""
+    reason: str = ""
+    metadata: dict = field(default_factory=dict)
+
+    @classmethod
+    def allow(cls) -> GuardVerdict:
+        return cls(action="allow")
+
+    @classmethod
+    def block(cls, message: str, reason: str = "") -> GuardVerdict:
+        return cls(action="block", message=message, reason=reason)
+
+    @classmethod
+    def inject(cls, message: str, reason: str = "") -> GuardVerdict:
+        return cls(action="inject_msg", message=message, reason=reason)
+
+    @classmethod
+    def compact(cls, reason: str = "") -> GuardVerdict:
+        return cls(action="force_compact", reason=reason)
+
+    @classmethod
+    def escalate(cls, message: str, reason: str = "") -> GuardVerdict:
+        return cls(action="escalate", message=message, reason=reason)
+
+    @classmethod
+    def redirect(cls, message: str, reason: str = "", metadata: dict | None = None) -> GuardVerdict:
+        return cls(action="redirect", message=message, reason=reason, metadata=metadata or {})
+
+
+class Guard(abc.ABC):
+    """A behavioral constraint with lifecycle hooks.
+
+    Each Guard OWNS its state — no agent._xxx scatter.
+    """
+
+    # Subclass must override
+    name: str = "base"
+    priority: int = 50  # Lower = earlier in check order
+
+    # Activation conditions
+    activate_on_states: set[AgentState] = {AgentState.EXECUTING}
+    activate_on_tools: set[str] | None = None  # None = all tools
+
+    def should_activate(self, ctx: GuardContext) -> bool:
+        """Check if this guard should fire for the given context."""
+        if ctx.current_state not in self.activate_on_states:
+            return False
+        if self.activate_on_tools is not None and ctx.tool_name not in self.activate_on_tools:
+            return False
+        return True
+
+    def check_pre(self, ctx: GuardContext) -> GuardVerdict | None:
+        """Called BEFORE tool execution. Return verdict to act."""
+        return None
+
+    def check_post(self, ctx: GuardContext) -> GuardVerdict | None:
+        """Called AFTER tool execution. Return verdict to act."""
+        return None
+
+    def check_strategic(self, ctx: GuardContext) -> GuardVerdict | None:
+        """Called at strategic review points (every N turns). Return verdict to redirect."""
+        return None
+
+    def reset_turn(self):
+        """Called at the start of each turn. Override to reset per-turn state."""
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(name={self.name!r}, priority={self.priority})"
+
+
+class GuardRegistry:
+    """Manages guard instances, sorted by priority."""
+
+    def __init__(self):
+        self._guards: list[Guard] = []
+
+    def register(self, guard: Guard):
+        """Register a guard and maintain priority order."""
+        self._guards.append(guard)
+        self._guards.sort(key=lambda g: g.priority)
+
+    def check_pre(self, ctx: GuardContext) -> GuardVerdict | None:
+        """Run all guards' pre-checks. First non-None verdict wins."""
+        for guard in self._guards:
+            if guard.should_activate(ctx):
+                verdict = guard.check_pre(ctx)
+                if verdict is not None:
+                    return verdict
+        return None
+
+    def check_post(self, ctx: GuardContext) -> GuardVerdict | None:
+        """Run all guards' post-checks.
+
+        Unlike check_pre, ALL guards run (to update internal state).
+        Returns the highest-priority (first) non-None verdict.
+        """
+        first_verdict: GuardVerdict | None = None
+        for guard in self._guards:
+            if guard.should_activate(ctx):
+                verdict = guard.check_post(ctx)
+                if verdict is not None and first_verdict is None:
+                    first_verdict = verdict
+        return first_verdict
+
+    def check_strategic(self, ctx: GuardContext) -> GuardVerdict | None:
+        """Run all guards' strategic checks."""
+        for guard in self._guards:
+            if guard.should_activate(ctx):
+                verdict = guard.check_strategic(ctx)
+                if verdict is not None:
+                    return verdict
+        return None
+
+    def reset_turn(self):
+        """Reset all guards for a new turn."""
+        for guard in self._guards:
+            guard.reset_turn()
+
+    @property
+    def guards(self) -> list[Guard]:
+        return list(self._guards)

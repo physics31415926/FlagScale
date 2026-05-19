@@ -1,11 +1,21 @@
-"""Skill manager — load and parse SKILL.md files."""
+"""Skill manager — load and parse SKILL.md files.
+
+Enhanced for Phase 5.2 Skill-centric architecture:
+- get_workflow(): extract workflow stages from frontmatter
+- get_constraints(): extract hard constraints for ConstraintGuard
+- get_warnings(): extract soft warnings for WarningGuard
+- get_focused_context(): return only relevant sections by stage/tool
+"""
 
 import logging
 import os
+import re
 
 from typing import Dict, List, Optional, Tuple
 
 import yaml
+
+from flagscale.agent.react.constraint import Constraint, ConstraintTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +25,20 @@ class SkillManager:
 
     def __init__(self, dirs: List[str]):
         self._dirs = dirs
+        self._scan_cache: Optional[Dict[str, str]] = None
+        self._list_cache: Optional[List[Dict[str, str]]] = None
+        self._meta_cache: Dict[str, Dict] = {}
+
+    def invalidate_cache(self):
+        """Invalidate cached scan/list results. Call after skill dirs change."""
+        self._scan_cache = None
+        self._list_cache = None
+        self._meta_cache = {}
 
     def _scan(self) -> Dict[str, str]:
-        """Build mapping: skill_name -> skill_file_path (later dirs override)."""
+        """Build mapping: skill_name -> skill_file_path (later dirs override). Cached."""
+        if self._scan_cache is not None:
+            return self._scan_cache
         mapping = {}
         for d in self._dirs:
             if not os.path.isdir(d):
@@ -32,10 +53,13 @@ class SkillManager:
                         name = entry
                     mapping[name] = skill_file
                     mapping[entry] = skill_file
+        self._scan_cache = mapping
         return mapping
 
     def list_skills(self) -> List[Dict[str, str]]:
-        """Scan all directories and return available skills (deduplicated)."""
+        """Scan all directories and return available skills (deduplicated). Cached."""
+        if self._list_cache is not None:
+            return self._list_cache
         seen_paths = {}
         for d in self._dirs:
             if not os.path.isdir(d):
@@ -55,7 +79,8 @@ class SkillManager:
                         }
                     except Exception:
                         seen_paths[skill_file] = {"name": entry, "description": "", "keywords": [], "parameters": []}
-        return list(seen_paths.values())
+        self._list_cache = list(seen_paths.values())
+        return self._list_cache
 
     def load(self, name: str, _loading_stack: set | None = None, **params) -> str:
         """Load a skill by frontmatter name or directory name. Later directories take priority.
@@ -123,14 +148,28 @@ class SkillManager:
 
         return f"<skill name=\"{skill_name}\">\n{body}\n</skill>"
 
+    def get_effects(self, name: str) -> Dict:
+        """Get the 'effects' declaration from skill frontmatter.
+
+        Returns a dict that may contain:
+          - mode: str — mode flag to set on the agent (e.g. "porting")
+          - companion_skills: list[str] — skills to auto-load alongside
+        Returns empty dict if no effects declared.
+        """
+        meta = self.get_meta(name)
+        return meta.get("effects", {}) or {}
+
     def get_meta(self, name: str) -> Dict:
-        """Get skill frontmatter metadata without loading full content."""
+        """Get skill frontmatter metadata without loading full content. Cached."""
+        if name in self._meta_cache:
+            return self._meta_cache[name]
         mapping = self._scan()
         skill_file = mapping.get(name)
         if skill_file is None:
             return {}
         try:
             meta, _ = self._parse_file(skill_file)
+            self._meta_cache[name] = meta
             return meta
         except Exception:
             return {}
@@ -203,3 +242,199 @@ class SkillManager:
             meta = {}
         body = parts[2].strip()
         return meta, body
+
+    # ── Phase 5.2: Skill-centric enhancements ─────────────────────────────
+
+    def get_workflow(self, name: str) -> Optional[Dict]:
+        """Get workflow definition from skill frontmatter.
+
+        Returns the workflow dict (with 'trigger' and 'stages' keys) or None.
+        """
+        meta = self.get_meta(name)
+        workflow = meta.get("workflow")
+        if not workflow or not isinstance(workflow, dict):
+            return None
+        if "stages" not in workflow or not workflow["stages"]:
+            return None
+        return workflow
+
+    def get_constraints(self, name: str) -> List[Constraint]:
+        """Extract hard constraints from skill frontmatter.
+
+        Returns compiled Constraint objects ready for ConstraintGuard.
+        """
+        meta = self.get_meta(name)
+        raw_constraints = meta.get("constraints")
+        if not raw_constraints or not isinstance(raw_constraints, list):
+            return []
+
+        result = []
+        for item in raw_constraints:
+            if not isinstance(item, dict):
+                continue
+            try:
+                constraint = self._compile_constraint(item)
+                result.append(constraint)
+            except Exception as e:
+                logger.warning("Failed to compile constraint '%s': %s",
+                               item.get("id", "unknown"), e)
+        return result
+
+    def get_warnings(self, name: str) -> List[Dict]:
+        """Extract warning definitions from skill frontmatter.
+
+        Returns list of warning dicts for WarningGuard.
+        Each dict has: id, description, severity, trigger, prompt, reminder, max_reminders.
+        """
+        meta = self.get_meta(name)
+        raw_warnings = meta.get("warnings")
+        if not raw_warnings or not isinstance(raw_warnings, list):
+            return []
+
+        result = []
+        for item in raw_warnings:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            # Normalize trigger format
+            trigger = item.get("trigger", {})
+            if not isinstance(trigger, dict):
+                trigger = {}
+            warning = {
+                "id": item["id"],
+                "description": item.get("description", ""),
+                "severity": item.get("severity", "warning"),
+                "trigger": {
+                    "tools": trigger.get("tools", []),
+                    "keywords": trigger.get("keywords", []),
+                },
+                "prompt": item.get("prompt", ""),
+                "reminder": item.get("reminder", item.get("description", "")),
+                "max_reminders": item.get("max_reminders", 2),
+            }
+            result.append(warning)
+        return result
+
+    def get_focused_context(
+        self,
+        name: str,
+        stage_id: Optional[str] = None,
+        tool_name: Optional[str] = None,
+    ) -> str:
+        """Return focused context — only relevant sections of the skill body.
+
+        Uses context_injection rules from frontmatter to determine which
+        markdown sections to include. Falls back to full body when no rules defined.
+        """
+        mapping = self._scan()
+        skill_file = mapping.get(name)
+        if skill_file is None:
+            return ""
+        meta, body = self._parse_file(skill_file)
+
+        injection_rules = meta.get("context_injection")
+        if not injection_rules or not isinstance(injection_rules, dict):
+            return body  # No rules → full body
+
+        # Collect section titles to inject
+        sections_to_inject: set = set()
+
+        # Always-inject sections
+        always = injection_rules.get("always", [])
+        if isinstance(always, list):
+            sections_to_inject.update(always)
+
+        # By-stage sections
+        if stage_id:
+            by_stage = injection_rules.get("by_stage", {})
+            if isinstance(by_stage, dict):
+                stage_sections = by_stage.get(stage_id, [])
+                if isinstance(stage_sections, list):
+                    sections_to_inject.update(stage_sections)
+
+        # By-tool sections
+        if tool_name:
+            by_tool = injection_rules.get("by_tool", {})
+            if isinstance(by_tool, dict):
+                tool_sections = by_tool.get(tool_name, [])
+                if isinstance(tool_sections, list):
+                    sections_to_inject.update(tool_sections)
+
+        if not sections_to_inject:
+            return body  # No sections specified → full body
+
+        return self._extract_sections(body, sections_to_inject)
+
+    @staticmethod
+    def _extract_sections(body: str, section_titles: set) -> str:
+        """Extract markdown sections by heading title.
+
+        Matches ## or ### headings. Extracts content until the next heading
+        of equal or higher level.
+        """
+        if not section_titles:
+            return body
+
+        # Normalize titles for case-insensitive matching
+        normalized_titles = {t.lower().strip() for t in section_titles}
+
+        # Split body into sections by headings
+        # Pattern matches ## or ### headings
+        heading_pattern = re.compile(r'^(#{1,4})\s+(.+)$', re.MULTILINE)
+
+        sections = []
+        matches = list(heading_pattern.finditer(body))
+
+        for i, match in enumerate(matches):
+            level = len(match.group(1))
+            title = match.group(2).strip()
+
+            if title.lower() not in normalized_titles:
+                continue
+
+            # Find the end of this section (next heading of same or higher level)
+            start = match.start()
+            end = len(body)
+            for j in range(i + 1, len(matches)):
+                next_level = len(matches[j].group(1))
+                if next_level <= level:
+                    end = matches[j].start()
+                    break
+
+            sections.append(body[start:end].strip())
+
+        if not sections:
+            # No matching sections found — return full body as fallback
+            return body
+
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _compile_constraint(item: dict) -> Constraint:
+        """Compile a constraint dict from frontmatter into a Constraint object."""
+        trigger_raw = item.get("trigger", item.get("trigger_on", {}))
+        if not isinstance(trigger_raw, dict):
+            trigger_raw = {}
+
+        # Support both 'tools' and 'tool' keys
+        tool_names_raw = trigger_raw.get("tools", [])
+        if not tool_names_raw:
+            tool_val = trigger_raw.get("tool", "")
+            if tool_val:
+                tool_names_raw = [tool_val]
+
+        trigger = ConstraintTrigger(
+            tool_names=set(tool_names_raw) if tool_names_raw else set(),
+            keywords=trigger_raw.get("keywords", []),
+        )
+
+        return Constraint(
+            id=item["id"],
+            description=item.get("description", ""),
+            trigger=trigger,
+            severity=item.get("severity", "error"),
+            prompt=item.get("prompt", ""),
+            correction=item.get("correction", item.get("reminder", "")),
+            check_phase=item.get("check_phase", item.get("phases", ["pre"])[0] if isinstance(item.get("phases"), list) else "pre"),
+            max_violations=item.get("max_violations", 3),
+        )
+

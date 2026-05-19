@@ -6,48 +6,30 @@ returning to the LLM only when a meaningful change is detected or timeout.
 """
 
 import glob
+import logging
 import os
 import re
 import subprocess
 import time
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_READ_FS
 from flagscale.agent.react.tools.find_log import _last_sorted_subdir, _numeric_key
 
+logger = logging.getLogger(__name__)
 
-_INTERESTING_RE = re.compile(
-    r'ERROR|FATAL|Traceback|NCCL|OOM|OutOfMemory|RuntimeError|'
-    r'TERMINATED|STALLED|KeyError|ModuleNotFoundError|ImportError|'
-    r'AttributeError|TypeError|NameError|NotImplementedError|'
-    r'torch\.cuda\.OutOfMemoryError|CUDA error|'
-    r'saved\s+checkpoint|training\s+complete|finished|'
-    r'gradient_accumulation_fusion|No such file.*TransformerEngine|'
-    r'CUDA extension not found|flash_attn.*not.*installed|'
-    r'AssertionError|ValueError.*config|FileNotFoundError',
-    re.IGNORECASE,
-)
 
-# Lines matching _INTERESTING_RE but also matching this are NOT real errors
-_STDERR_IGNORE_RE = re.compile(
-    r'wandb[:\s]|W\s+wandb|UserWarning|FutureWarning|DeprecationWarning|'
-    r'warnings\.warn|torch\.utils\._pytree|pkg_resources|'
-    r'Setting ds_accelerator|TensorFloat-32',
-    re.IGNORECASE,
-)
-
+# Display-only heuristic: detects training metric patterns in log output.
+# Not safety-critical — used for log discovery and display summaries where
+# classify_fn is not available (polling loops, _discover_logs, _format_result).
 _METRIC_RE = re.compile(
     r'step[=:\s]|iteration[=:\s]|loss[=:\s]|grad.norm|throughput|MFU',
-    re.IGNORECASE,
-)
-
-_TRAIN_PROCESS_RE = re.compile(
-    r'torchrun|python.*train|flagscale|megatron|deepspeed',
     re.IGNORECASE,
 )
 
 
 class MonitorTool(Tool):
     name = "monitor"
+    effects = EFFECT_READ_FS
     description = (
         "Watch a file or command output locally WITHOUT calling the LLM. "
         "Use this when you need to wait for training progress, model loading, "
@@ -115,23 +97,24 @@ class MonitorTool(Tool):
         "required": [],
     }
 
-    def __init__(self, display_fn=None, regex_judge_fn=None):
+    def __init__(self, display_fn=None, classify_fn=None):
         self._display_fn = display_fn
-        self._regex_judge_fn = regex_judge_fn
+        self._classify_fn = classify_fn
 
     def _is_real_error(self, lines: list, context: str = "") -> list:
-        """Filter error lines through regex + LLM judge. Returns confirmed error lines."""
-        # First pass: regex + ignore list
-        candidates = [l for l in lines
-                      if _INTERESTING_RE.search(l) and not _STDERR_IGNORE_RE.search(l)]
-        if not candidates:
+        """Filter error lines through LLM classify. Returns confirmed error lines."""
+        if not lines:
             return []
-        # Second pass: LLM judge (if available)
-        if self._regex_judge_fn:
-            matched_text = "\n".join(candidates[:10])
-            if not self._regex_judge_fn("is_error", matched_text, context):
-                return []
-        return candidates
+        if not self._classify_fn:
+            logger.warning("MonitorTool._is_real_error: classify_fn is None, "
+                           "skipping error classification — potential errors may be missed")
+            return []
+        # Send all lines (up to 10) to classify("is_error") in one call
+        matched_text = "\n".join(lines[:10])
+        context_text = context or matched_text[:500]
+        if self._classify_fn("is_error", matched_text, context_text):
+            return lines[:10]
+        return []
 
     def execute(self, **kwargs) -> str:
         file_path = kwargs.get("file", "")

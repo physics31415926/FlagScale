@@ -13,6 +13,11 @@ from flagscale.agent.react.tools.monitor import MonitorTool
 _LIVE_PATTERN = "pytest"  # always matches the test runner process
 
 
+def _always_true_classify(category, text, context="", **kwargs):
+    """Mock classify that always returns True (error detected)."""
+    return True
+
+
 class TestMonitorTool:
 
     def test_basic_file_watch_timeout(self, tmp_path):
@@ -109,7 +114,7 @@ class TestMonitorTool:
         t = threading.Thread(target=write_error, daemon=True)
         t.start()
 
-        tool = MonitorTool()
+        tool = MonitorTool(classify_fn=_always_true_classify)
         result = tool.execute(file=str(log_file), duration=10, interval=1,
                               process_pattern=_LIVE_PATTERN)
 

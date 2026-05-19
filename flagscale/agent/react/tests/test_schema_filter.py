@@ -70,9 +70,8 @@ class TestPhaseDetection:
 
     def _make_agent_stub(self):
         """Create a minimal object with the filtered schemas method."""
-        from flagscale.agent.react.agent import (
-            WorkerAgent, _PHASE_TOOL_SETS, _CORE_TOOLS,
-        )
+        from flagscale.agent.react.agent import WorkerAgent
+        from flagscale.agent.react.constants import PHASE_TOOL_SETS, CORE_TOOLS
 
         agent = MagicMock()
         agent._extra_tools_next_iter = set()
@@ -91,12 +90,14 @@ class TestPhaseDetection:
 
         schemas = agent._get_filtered_schemas("monitoring")
         names = {s["function"]["name"] for s in schemas}
-        # monitoring set: monitor, shell, read_file, parse_training_metrics
+        # "monitoring" is not a defined phase, so only _CORE_TOOLS are available
         assert "monitor" in names
         assert "shell" in names
         assert "read_file" in names
-        assert "write_file" not in names
-        assert "plan_create" not in names
+        assert "write_file" in names  # write_file is a core tool
+        assert "plan_create" in names  # plan_create is a core tool
+        # parse_training_metrics is NOT a core tool, so it's excluded
+        assert "parse_training_metrics" not in names
 
     def test_filtered_schemas_default_returns_all(self):
         agent = self._make_agent_stub()

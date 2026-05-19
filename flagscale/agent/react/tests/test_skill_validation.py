@@ -14,16 +14,16 @@ SKILLS_DIR = os.path.normpath(SKILLS_DIR)
 EXPECTED_SKILLS = {
     "env-setup",
     "topo-detect",
-    "model-porter",
-    "data-prep",
+    "train-model-porter",
+    "train-data-prep",
     "train-config",
     "train-run",
     "train-monitor",
-    "reproduce",
-    "precision-alignment",
+    "train-reproduce",
+    "train-precision-alignment",
     "ops-discipline",
     "workspace-layout",
-    "parallel-strategy",
+    "train-parallel-strategy",
     "debug-strategy",
 }
 

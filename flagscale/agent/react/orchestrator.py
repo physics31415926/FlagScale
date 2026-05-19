@@ -1,20 +1,53 @@
-"""Orchestrator — incremental routing with three execution modes.
+"""Orchestrator — LLM-driven routing with declarative template config.
 
 1. Single Worker: simple task → one WorkerAgent
 2. SubtaskRunner: complex multi-stage task → serial pipeline with DAG
 3. BatchRunner: independent experiments → parallel workers
+
+Routing is LLM-first via Judge.route(). When Judge is unavailable,
+uses keyword matching against the declarative config as a fallback.
+
+Templates are loaded from:
+1. Skill SKILL.md workflow definitions (primary, Phase 5.2)
+2. subtask_config.yaml (fallback, legacy)
+Skill workflows take priority over YAML templates with the same name.
 """
 
 from __future__ import annotations
 
-import re
+import json
+import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+
+import yaml
 
 from .config import AgentConfig
 from .profile import PROFILES, WorkerProfile
 from .scene import PRESETS, ScenePreset
 from .agent import WorkerAgent, WorkerResult
+from .judge import Judge
+
+logger = logging.getLogger(__name__)
+
+# Path to subtask config, relative to this file
+_SUBTASK_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "subtask_config.yaml")
+
+
+# ── Subtask config loading ─────────────────────────────────────────────────
+
+def _load_subtask_config() -> dict:
+    """Load subtask configuration from YAML. Returns empty dict on failure."""
+    try:
+        if not os.path.isfile(_SUBTASK_CONFIG_PATH):
+            logger.warning("Subtask config not found at %s", _SUBTASK_CONFIG_PATH)
+            return {}
+        with open(_SUBTASK_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning("Failed to load subtask config: %s", e)
+        return {}
 
 
 # ── SubtaskDefinition ─────────────────────────────────────────────────────
@@ -32,6 +65,29 @@ class SubtaskDefinition:
     upstream_keys: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "SubtaskDefinition":
+        return cls(
+            id=d["id"],
+            description=d.get("description", d["id"]),
+            profile_name=d["profile"],
+            upstream_keys=d.get("upstream_keys", []),
+            depends_on=d.get("depends_on", []),
+        )
+
+
+# ── SubtaskTemplate ───────────────────────────────────────────────────────
+
+@dataclass
+class SubtaskTemplate:
+    """A complete subtask pipeline definition."""
+    name: str
+    description: str
+    subtasks: list[SubtaskDefinition]
+
+    def to_routing_desc(self) -> str:
+        return f"{self.name}: {self.description}"
+
 
 # ── SubtaskRunner ─────────────────────────────────────────────────────────
 
@@ -39,7 +95,183 @@ class SubtaskRunner:
     """Executes a subtask DAG with isolated histories.
 
     NOT a Multi-Agent framework. Each Worker has independent HistoryManager.
+
+    Templates are loaded from:
+    1. Skill SKILL.md workflow definitions (primary)
+    2. subtask_config.yaml (fallback)
+    Skill workflows override YAML templates with the same trigger keywords.
     """
+
+    def __init__(self, config: dict | None = None, skill_manager=None):
+        """Initialize with optional config dict and skill_manager.
+
+        If config is None, loads from YAML.
+        If skill_manager is provided, also loads workflow templates from Skills.
+        """
+        cfg = config if config is not None else _load_subtask_config()
+        self._cfg = cfg  # cache for use by _pick_template_keyword
+
+        self._templates: dict[str, SubtaskTemplate] = {}
+        self._build_templates(cfg)
+
+        # Phase 5.2: Load workflow templates from Skills (override YAML)
+        self._skill_manager = skill_manager
+        if skill_manager is not None:
+            self._build_templates_from_skills(skill_manager)
+
+        self._profile_rules: list[dict] = cfg.get("profile_select", [])
+        self._batch_keywords: list[str] = cfg.get("batch_keywords", [])
+
+    def _build_templates(self, cfg: dict):
+        """Parse template definitions from config."""
+        raw_templates = cfg.get("templates", {})
+        for name, tpl_data in raw_templates.items():
+            subtasks = [SubtaskDefinition.from_dict(s) for s in tpl_data.get("subtasks", [])]
+            self._templates[name] = SubtaskTemplate(
+                name=name,
+                description=tpl_data.get("description", name),
+                subtasks=subtasks,
+            )
+
+    def _build_templates_from_skills(self, skill_manager):
+        """Build SubtaskTemplates from Skill workflow definitions.
+
+        Skill workflows override YAML templates. Each Skill with a workflow
+        field generates a template named after the skill.
+        """
+        try:
+            skills = skill_manager.list_skills()
+        except Exception as e:
+            logger.warning("Failed to list skills for workflow loading: %s", e)
+            return
+
+        for skill_info in skills:
+            skill_name = skill_info.get("name", "")
+            if not skill_name:
+                continue
+
+            workflow = skill_manager.get_workflow(skill_name)
+            if not workflow:
+                continue
+
+            stages = workflow.get("stages", [])
+            if not stages:
+                continue
+
+            # Convert workflow stages to SubtaskDefinitions
+            subtasks = []
+            for stage in stages:
+                if not isinstance(stage, dict):
+                    continue
+                subtask = SubtaskDefinition(
+                    id=stage.get("id", ""),
+                    description=stage.get("description", stage.get("name", "")),
+                    profile_name=stage.get("profile", "training-reproduce"),
+                    depends_on=stage.get("depends_on", []),
+                    upstream_keys=stage.get("upstream_keys", stage.get("depends_on", [])),
+                )
+                subtasks.append(subtask)
+
+            if not subtasks:
+                continue
+
+            # Build trigger config for keyword matching
+            trigger = workflow.get("trigger", {})
+            description = f"Skill workflow: {skill_name}"
+
+            template = SubtaskTemplate(
+                name=skill_name,
+                description=description,
+                subtasks=subtasks,
+            )
+
+            # Store template — overrides YAML if same name
+            self._templates[skill_name] = template
+
+            # Also store trigger info in _cfg for keyword matching
+            if trigger and isinstance(trigger, dict):
+                if "templates" not in self._cfg:
+                    self._cfg["templates"] = {}
+                self._cfg["templates"][skill_name] = {
+                    "description": description,
+                    "trigger_on": trigger,
+                    "subtasks": stages,
+                }
+
+            logger.debug("Loaded workflow template from skill: %s (%d stages)",
+                         skill_name, len(subtasks))
+
+    # ── Template access ────────────────────────────────────────────────────
+
+    def template_names(self) -> list[str]:
+        return list(self._templates.keys())
+
+    def template_descriptions(self) -> str:
+        """Human-readable list of templates for Judge routing prompt."""
+        lines = []
+        for name, tpl in self._templates.items():
+            lines.append(f"  {name}: {tpl.description}")
+        return "\n".join(lines)
+
+    def get_template(self, name: str) -> SubtaskTemplate | None:
+        return self._templates.get(name)
+
+    # ── Keyword-based fallback routing ─────────────────────────────────────
+
+    def _pick_template_keyword(self, user_input: str) -> str | None:
+        """Pick template by matching trigger_on keywords from config."""
+        # Use cached config from it time, not disk reload
+        raw_templates = self._cfg.get("templates", {}) if hasattr(self, "_cfg") else {}
+        text_lower = user_input.lower()
+
+        for name, tpl_data in raw_templates.items():
+            trigger = tpl_data.get("trigger_on", {})
+
+            # Check keyword pairs (both must be present in the same input)
+            pairs = trigger.get("keywords_in_same_input", [])
+            for pair in pairs:
+                if not isinstance(pair, list) or len(pair) < 2:
+                    continue
+                if pair[0].lower() in text_lower and pair[1].lower() in text_lower:
+                    logger.info("Keyword pair match: %s/%s → template '%s'", pair[0], pair[1], name)
+                    return name
+
+            # Check standalone keywords
+            keywords = trigger.get("keywords", [])
+            if keywords and any(k.lower() in text_lower for k in keywords):
+                logger.info("Keyword match: %s → template '%s'", keywords, name)
+                return name
+
+        # No keywords matched — return None (caller should not assume a template)
+        return None
+
+    def _pick_profile_keyword(self, user_input: str) -> str:
+        """Pick profile by matching ordered rules from config."""
+        text_lower = user_input.lower()
+
+        for rule in self._profile_rules:
+            keywords = rule.get("keywords", [])
+
+            # Check additional keywords (all must match to select this profile)
+            extra = rule.get("additional_keywords", [])
+            if extra and not any(k.lower() in text_lower for k in extra):
+                continue
+
+            # Check primary keywords
+            if not keywords:
+                # No keywords = default catch-all
+                return rule.get("profile", "general")
+
+            if any(k.lower() in text_lower for k in keywords):
+                return rule.get("profile", "general")
+
+        return "general"
+
+    def _is_batch_keyword(self, user_input: str) -> bool:
+        """Check if user input suggests batch comparison (keyword fallback)."""
+        return any(k in user_input for k in self._batch_keywords)
+
+    # ── DAG execution ──────────────────────────────────────────────────────
 
     @staticmethod
     def _topological_batches(
@@ -69,106 +301,6 @@ class SubtaskRunner:
 
         return batches
 
-    # ── Regex patterns for task splitting ────────────────────────────────
-
-    _SUBTASK_PATTERNS: list[tuple[str, str]] = [
-        ("env|环境|conda|pip|setup|搭建|install|部署|deploy|cluster|集群",
-         "train|训练|run|启动|launch|复现|reproduce|verify|验证"),
-        ("migrate|迁移|port|porting",
-         "train|训练|run|启动|verify|验证"),
-        ("源码|source|clone|git|download|下载",
-         "train|训练|config|配置|launch|启动"),
-        ("复现|reproduce",
-         "源码|source|config|配置|环境|env|搭建|setup"),
-    ]
-
-    _BATCH_PATTERNS: list[str] = [
-        r"对比|compare|分别|分别跑|同时跑|都试试|试一下.*和|试一下.*跟",
-        r"跑.*个.*(?:配置|参数|实验|组)",
-        r"(?:哪个|哪种).*(?:更好|更快|更优|更稳定)",
-    ]
-
-    # ── Subtask templates ─────────────────────────────────────────────────
-
-    _TEMPLATES: dict[str, list[SubtaskDefinition]] = {
-        "env_and_reproduce": [
-            SubtaskDefinition(
-                id="env_setup",
-                description="Detect hardware, create environment, install dependencies",
-                profile_name="env-setup",
-                depends_on=[],
-            ),
-            SubtaskDefinition(
-                id="data_prep",
-                description="Download and preprocess training data",
-                profile_name="training-reproduce",
-                depends_on=[],
-            ),
-            SubtaskDefinition(
-                id="reproduce",
-                description="Clone reference implementation, understand code and model architecture",
-                profile_name="training-reproduce",
-                upstream_keys=[
-                    "env_path", "cuda_version", "gpu_count", "gpu_type",
-                    "data_path", "tokenizer_path",
-                ],
-                depends_on=["env_setup", "data_prep"],
-            ),
-            SubtaskDefinition(
-                id="train",
-                description="Generate FlagScale config and launch training",
-                profile_name="training-reproduce",
-                upstream_keys=["source_repo", "model_arch", "config_params"],
-                depends_on=["reproduce"],
-            ),
-            SubtaskDefinition(
-                id="verify",
-                description="Monitor training and verify reproduction success",
-                profile_name="training-reproduce",
-                upstream_keys=["output_dir", "experiment_name"],
-                depends_on=["train"],
-            ),
-        ],
-        "model_migration": [
-            SubtaskDefinition(
-                id="analyze",
-                description="Analyze source model structure, framework, and checkpoint format",
-                profile_name="model-migration",
-                depends_on=[],
-            ),
-            SubtaskDefinition(
-                id="implement",
-                description="Implement Megatron-native model and checkpoint converter",
-                profile_name="model-migration",
-                upstream_keys=["source_model_arch", "checkpoint_layout"],
-                depends_on=["analyze"],
-            ),
-            SubtaskDefinition(
-                id="verify",
-                description="Verify forward/backward/distributed correctness",
-                profile_name="model-migration",
-                upstream_keys=["model_path", "converter_path"],
-                depends_on=["implement"],
-            ),
-        ],
-    }
-
-    @classmethod
-    def should_split_to_subtasks(cls, user_input: str) -> bool:
-        """Check if task spans multiple skill domains → needs context isolation."""
-        for stage1_kw, stage2_kw in cls._SUBTASK_PATTERNS:
-            if re.search(stage1_kw, user_input, re.I) and re.search(stage2_kw, user_input, re.I):
-                return True
-        return False
-
-    @classmethod
-    def should_batch(cls, user_input: str) -> bool:
-        """Check if task wants to compare multiple variants."""
-        for pat in cls._BATCH_PATTERNS:
-            if re.search(pat, user_input, re.I):
-                return True
-        return False
-
     def run(
         self,
         template_name: str,
@@ -176,7 +308,12 @@ class SubtaskRunner:
         orchestrator: "Orchestrator",
     ) -> WorkerResult:
         """Execute subtask DAG with topological batching."""
-        subtasks = self._TEMPLATES[template_name]
+        template = self._templates.get(template_name)
+        if template is None:
+            return WorkerResult(status="failed",
+                summary=f"Unknown template: {template_name}")
+
+        subtasks = template.subtasks
         batches = self._topological_batches(subtasks)
         upstream: dict[str, str] = {}
 
@@ -190,6 +327,7 @@ class SubtaskRunner:
                 if result.status == "failed":
                     return result
                 upstream.update(result.artifacts)
+                upstream[sub.id] = result.summary
             else:
                 def _run_subtask(sub):
                     context = self._build_upstream_summary(sub.upstream_keys, upstream)
@@ -212,6 +350,7 @@ class SubtaskRunner:
                     if result.status == "failed":
                         return result
                     upstream.update(result.artifacts)
+                    upstream[sub.id] = result.summary
 
         return WorkerResult(
             status="success",
@@ -221,12 +360,19 @@ class SubtaskRunner:
 
     @staticmethod
     def _build_upstream_summary(keys: list[str], upstream: dict) -> str:
-        """Build concise summary from upstream results. NOT full history."""
+        """Build concise summary from upstream results. NOT full history.
+
+        keys can be stage IDs (e.g. "env_setup"), which map to stored summaries,
+        or semantic artifact keys (e.g. "env_path") which map to WorkerResult.artifacts.
+        """
         lines = ["Previous stage results:"]
+        found_any = False
         for k in keys:
             if k in upstream:
-                lines.append(f"  {k}: {upstream[k]}")
-        return "\n".join(lines) if len(lines) > 1 else ""
+                val = upstream[k]
+                lines.append(f"  {k}: {str(val)[:300]}")
+                found_any = True
+        return "\n".join(lines) if found_any else ""
 
     @staticmethod
     def _build_task(description: str, user_input: str, context: str) -> str:
@@ -277,10 +423,13 @@ class BatchRunner:
 class Orchestrator:
     """Entry point: routes user requests to the right execution mode.
 
-    Infrastructure components (provider, tool_registry, skill_manager,
-    session_memory, task_plan) are injected at construction time and
-    shared across all workers. Each worker gets its own HistoryManager
-    for context isolation.
+    LLM-first routing via Judge.route(), falling back to keyword-based
+    routing from subtask_config.yaml when Judge is unavailable.
+
+    All regex-based routing has been removed.
+
+    Infrastructure components are injected at construction time and
+    shared across all workers.
     """
 
     def __init__(
@@ -291,10 +440,12 @@ class Orchestrator:
         session_memory=None,
         task_plan=None,
         experiment_manager=None,
+        judge=None,
+        config: AgentConfig | None = None,
     ):
         self.profiles: dict[str, WorkerProfile] = PROFILES
         self.presets: dict[str, ScenePreset] = PRESETS
-        self.subtask_runner = SubtaskRunner()
+        self.subtask_runner = SubtaskRunner(skill_manager=skill_manager)
         self.batch_runner = BatchRunner()
         self.scene: ScenePreset | None = None
 
@@ -305,65 +456,358 @@ class Orchestrator:
         self.session_memory = session_memory
         self.task_plan = task_plan
         self.experiment_manager = experiment_manager
+        self.judge = judge
+        self.config = config or AgentConfig.auto_load()
 
     def handle(self, user_input: str) -> str:
-        """Handle a user request. Route to single Worker / SubtaskRunner / BatchRunner."""
-        # 1. Detect scene
+        """Handle a user request. Route via LLM (primary) or keywords (fallback)."""
+        # 1. Detect scene (env-based, no LLM needed)
         self.scene = self._refine_scene(user_input)
 
-        # 2. Check for batch (parallel experiments)
-        if self.subtask_runner.should_batch(user_input):
-            tasks = self._extract_batch_tasks(user_input)
-            if len(tasks) >= 2:
-                profile = self._pick_profile(user_input)
-                results = self.batch_runner.run(profile, tasks, self)
-                return self._format_batch_response(results)
+        # 2. Try LLM-based routing first
+        route = self._route_via_llm(user_input)
+        if route is not None:
+            return self._dispatch_route(route, user_input)
 
-        # 3. Check for multi-subtask (complex pipeline)
-        if self.subtask_runner.should_split_to_subtasks(user_input):
-            template = self._pick_template(user_input)
+        # 3. Fallback: keyword-based routing from config
+        logger.info("Judge unavailable for routing — falling back to keyword config")
+        return self._route_via_keyword(user_input)
+
+    # ── Public routing API for WorkerAgent interactive loop ─────────────────
+
+    def route(self, user_input: str) -> dict:
+        """Public routing method — returns route dict for external dispatch.
+
+        Combines LLM-based routing (primary) and keyword-based fallback.
+        Returns a dict with keys: mode, profile, template, batch_tasks.
+
+        Used by WorkerAgent.run() to decide execution path in interactive mode.
+        """
+        # 1. Detect scene (env-based, no LLM needed)
+        self.scene = self._refine_scene(user_input)
+
+        # 2. Try LLM-based routing first
+        route = self._route_via_llm(user_input)
+        if route is not None:
+            return route
+
+        # 3. Fallback: keyword-based routing from config
+        logger.info("Judge unavailable for routing — falling back to keyword config")
+        sr = self.subtask_runner
+
+        # Check for batch
+        if sr._is_batch_keyword(user_input):
+            tasks = self._extract_batch_tasks_by_separator(user_input)
+            if len(tasks) >= 2:
+                return {
+                    "mode": "batch",
+                    "profile": sr._pick_profile_keyword(user_input),
+                    "template": "",
+                    "batch_tasks": tasks,
+                }
+
+        # Check for multi-subtask
+        template = sr._pick_template_keyword(user_input)
+        if template is not None and template in self.subtask_runner._templates:
+            has_pair_match = self._has_template_keyword_pair(user_input, template)
+            if has_pair_match:
+                return {
+                    "mode": "subtask",
+                    "profile": "",
+                    "template": template,
+                    "batch_tasks": [],
+                }
+
+        # Single worker
+        return {
+            "mode": "single",
+            "profile": sr._pick_profile_keyword(user_input),
+            "template": "",
+            "batch_tasks": [],
+        }
+
+    def run_single_worker(self, route: dict, user_input: str) -> WorkerResult:
+        """Run a single WorkerAgent with the given route and return result.
+
+        Creates a fresh worker for this specific task.
+        Does NOT modify any shared state — caller owns the history.
+        """
+        profile = route["profile"] or self.subtask_runner._pick_profile_keyword(user_input)
+        worker = self._create_worker(profile)
+        return worker.execute(user_input)
+
+    def run_subtask_interactive(
+        self,
+        route: dict,
+        user_input: str,
+    ) -> tuple[str, list[WorkerResult]]:
+        """Execute subtask DAG in serial, interactive mode.
+
+        Each stage runs one at a time with progress display.
+        Returns (final_summary, list_of_per_stage_results).
+
+        Supports both YAML templates (route["template"]) and LLM-generated
+        dynamic stages (route["dynamic_stages"]).
+        """
+        subtasks = self._build_subtask_definitions(route, user_input)
+        if not subtasks:
+            return (f"No stages to execute for: {user_input}", [])
+
+        batches = self.subtask_runner._topological_batches(subtasks)
+        upstream: dict[str, str] = {}
+        stage_results: list[WorkerResult] = []
+
+        stage_idx = 0
+        total_stages = len(subtasks)
+
+        for batch in batches:
+            for sub in batch:
+                stage_idx += 1
+                context = self.subtask_runner._build_upstream_summary(
+                    sub.upstream_keys, upstream
+                )
+                worker = self._create_worker(sub.profile_name)
+                task = self.subtask_runner._build_task(
+                    sub.description, user_input, context
+                )
+
+                result = worker.execute(task)
+                stage_results.append(result)
+                if result.status == "failed":
+                    upstream.update(result.artifacts)
+                    upstream[sub.id] = result.summary
+                    return (
+                        f"Stage {stage_idx}/{total_stages} ({sub.id}) failed: {result.summary[:200]}",
+                        stage_results,
+                    )
+                upstream.update(result.artifacts)
+                upstream[sub.id] = result.summary
+
+        return ("All subtasks completed", stage_results)
+
+    def _build_subtask_definitions(
+        self, route: dict, user_input: str
+    ) -> list["SubtaskDefinition"]:
+        """Build SubtaskDefinitions from YAML template or LLM dynamic stages."""
+        template_name = route.get("template", "")
+        dynamic_stages = route.get("dynamic_stages", [])
+
+        # Prefer explicit template
+        if template_name:
+            template = self.subtask_runner._templates.get(template_name)
+            if template:
+                return template.subtasks
+
+        # Fallback: keyword template matching
+        kw_template = self.subtask_runner._pick_template_keyword(user_input)
+        if kw_template and kw_template in self.subtask_runner._templates:
+            return self.subtask_runner._templates[kw_template].subtasks
+
+        # LLM-generated dynamic stages
+        if dynamic_stages:
+            return [
+                SubtaskDefinition(
+                    id=s["id"],
+                    description=s.get("description", s["id"]),
+                    profile_name=s.get("profile", "training-reproduce"),
+                    depends_on=s.get("depends_on", []),
+                    upstream_keys=s.get("upstream_keys", []),
+                )
+                for s in dynamic_stages
+            ]
+
+        return []
+
+    def run_batch_interactive(
+        self,
+        route: dict,
+        user_input: str,
+    ) -> list[WorkerResult]:
+        """Execute batch comparison in parallel, returning per-task results.
+
+        Caller controls display and interactivity.
+        """
+        profile = route["profile"] or self.subtask_runner._pick_profile_keyword(user_input)
+        return self.batch_runner.run(profile, route["batch_tasks"], self)
+
+    # ── LLM-based routing (primary) ───────────────────────────────────────
+
+    def _route_via_llm(self, user_input: str) -> dict | None:
+        """Route via Judge. Returns route dict or None if Judge unavailable."""
+        judge = self.judge
+        if judge is None:
+            if self.provider is None:
+                return None
+            judge = Judge(self.provider)
+
+        profiles_str = json.dumps(list(self.profiles.keys()), ensure_ascii=False)
+        templates_str = self.subtask_runner.template_descriptions()
+
+        try:
+            result, source = judge.route(user_input, profiles_str, templates_str)
+        except Exception as e:
+            logger.warning("Judge.route() raised exception: %s", e)
+            return None
+
+        if source in ("unavailable", "default"):
+            return None
+
+        mode = result.get("mode", "single")
+        if mode not in ("single", "subtask", "batch"):
+            logger.warning("Unknown routing mode '%s' from Judge", mode)
+            return None
+
+        # Validate profile name
+        profile = result.get("profile", "")
+        if profile and profile not in self.profiles:
+            logger.warning("Unknown profile '%s' from Judge", profile)
+            profile = ""
+
+        # Validate template name or dynamic_stages for subtask mode
+        template = result.get("template", "")
+        dynamic_stages = result.get("dynamic_stages", [])
+
+        if mode == "subtask":
+            if template and template in self.subtask_runner._templates:
+                # Reusing an existing YAML template
+                pass
+            elif isinstance(dynamic_stages, list) and len(dynamic_stages) >= 2:
+                # LLM generated custom stages — validate each
+                for s in dynamic_stages:
+                    if not isinstance(s, dict):
+                        logger.warning("Invalid dynamic stage: %s", s)
+                        return None
+                    if not s.get("id") or not s.get("description"):
+                        logger.warning("Dynamic stage missing id/description: %s", s)
+                        return None
+                    stage_profile = s.get("profile", "")
+                    if stage_profile and stage_profile not in self.profiles:
+                        logger.warning("Unknown profile in dynamic stage: %s", stage_profile)
+                        return None
+                template = ""  # explicitly empty = dynamic
+            else:
+                logger.warning("Subtask mode requires template or dynamic_stages (>=2)")
+                return None
+
+        # Validate batch tasks
+        batch_tasks = result.get("batch_tasks", [])
+        if mode == "batch" and not (isinstance(batch_tasks, list) and len(batch_tasks) >= 2):
+            logger.warning("Insufficient batch tasks from Judge")
+            return None
+
+        return {
+            "mode": mode,
+            "profile": profile,
+            "template": template,
+            "batch_tasks": batch_tasks,
+            "dynamic_stages": dynamic_stages,
+        }
+
+    def _dispatch_route(self, route: dict, user_input: str) -> str:
+        """Execute the route decision."""
+        mode = route["mode"]
+
+        if mode == "batch":
+            profile = route["profile"] or self.subtask_runner._pick_profile_keyword(user_input)
+            results = self.batch_runner.run(profile, route["batch_tasks"], self)
+            return self._format_batch_response(results)
+
+        if mode == "subtask":
+            template = route["template"] or self.subtask_runner._pick_template_keyword(user_input)
+            if template is None:
+                return f"\u2717 [failed] No subtask template matched"
             result = self.subtask_runner.run(template, user_input, self)
             return self._format_response(result)
 
-        # 4. Single worker
-        profile_name = self._pick_profile(user_input)
-        worker = self._create_worker(profile_name)
+        # mode == "single"
+        profile = route["profile"] or self.subtask_runner._pick_profile_keyword(user_input)
+        worker = self._create_worker(profile)
         result = worker.execute(user_input)
         return self._format_response(result)
 
+    # ── Keyword-based routing (fallback when Judge unavailable) ────────────
+
+    def _route_via_keyword(self, user_input: str) -> str:
+        """Fallback routing using keyword config from subtask_config.yaml.
+
+        No regex — pure substring matching against declarative keyword lists.
+        """
+        sr = self.subtask_runner
+
+        # Check for batch
+        if sr._is_batch_keyword(user_input):
+            tasks = self._extract_batch_tasks_by_separator(user_input)
+            if len(tasks) >= 2:
+                profile = sr._pick_profile_keyword(user_input)
+                results = self.batch_runner.run(profile, tasks, self)
+                return self._format_batch_response(results)
+
+        # Check for multi-subtask
+        template = sr._pick_template_keyword(user_input)
+        if template is not None and template in self.subtask_runner._templates:
+            has_pair_match = self._has_template_keyword_pair(user_input, template)
+            if has_pair_match:
+                result = self.subtask_runner.run(template, user_input, self)
+                return self._format_response(result)
+
+        # Single worker
+        profile = sr._pick_profile_keyword(user_input)
+        worker = self._create_worker(profile)
+        result = worker.execute(user_input)
+        return self._format_response(result)
+
+    def _has_template_keyword_pair(self, user_input: str, template_name: str) -> bool:
+        """Check if user_input matches a keyword_pair for the given template."""
+        raw = self._cfg.get("templates", {}).get(template_name, {})
+        trigger = raw.get("trigger_on", {})
+        pairs = trigger.get("keywords_in_same_input", [])
+        text_lower = user_input.lower()
+        for pair in pairs:
+            if isinstance(pair, list) and len(pair) >= 2:
+                if pair[0].lower() in text_lower and pair[1].lower() in text_lower:
+                    return True
+        return False
+
+    @staticmethod
+    def _extract_batch_tasks_by_separator(user_input: str) -> list[str]:
+        """Extract individual task descriptions by splitting on separators."""
+        # Split on common separators (these separators are language-specific
+        # and would ideally come from config too)
+        parts = []
+        current = []
+        for ch in user_input:
+            if ch in ";；":
+                if current:
+                    parts.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            parts.append("".join(current).strip())
+
+        if len(parts) < 2:
+            # Try splitting on conjunction words
+            for sep in ["和", "跟", "对比", "分别"]:
+                if sep in user_input:
+                    parts = [p.strip() for p in user_input.split(sep) if p.strip()]
+                    if len(parts) >= 2:
+                        break
+
+        return [p for p in parts if p]
+
+    # ── Scene detection ───────────────────────────────────────────────────
+
     def _refine_scene(self, user_input: str) -> ScenePreset:
-        """Auto-detect scene, optionally confirm with user."""
-        return ScenePreset.auto_detect(user_input=user_input)
-
-    def _pick_template(self, user_input: str) -> str:
-        """Pick the right subtask template based on user intent."""
-        if re.search(r"环境|env|搭建|setup|deploy", user_input, re.I):
-            return "env_and_reproduce"
-        if re.search(r"迁移|migrate|port", user_input, re.I):
-            return "model_migration"
-        return "env_and_reproduce"
-
-    def _pick_profile(self, user_input: str) -> str:
-        """Pick WorkerProfile based on user intent."""
-        if re.search(r"迁移|migrate|port", user_input, re.I):
-            if re.search(r"chip|ascend|昇腾|kunlun|dcu", user_input, re.I):
-                return "chip-migration"
-            return "model-migration"
-        if re.search(r"推理|inference|deploy|部署|serving|vllm|sglang", user_input, re.I):
-            return "inference-deploy"
-        if re.search(r"环境|env|setup|install|conda|pip", user_input, re.I):
-            return "env-setup"
-        return "training-reproduce"
+        """Auto-detect scene from environment (no regex)."""
+        return ScenePreset.from_env_and_input(user_input=user_input)
 
     def _create_worker(self, profile_name: str) -> WorkerAgent:
         """Create a fresh WorkerAgent with shared infrastructure.
 
         Context isolation: each worker gets its OWN HistoryManager.
-        All other infrastructure is shared (injected at Orchestrator init).
         """
         profile = self.profiles[profile_name]
 
-        # Build constraints from profile's scene_constraints
         constraints = set(profile.scene_constraints)
         if self.scene:
             constraints |= self.scene.constraints
@@ -381,7 +825,7 @@ class Orchestrator:
         )
 
         return WorkerAgent(
-            config=AgentConfig(),
+            config=self.config,
             scene=worker_scene,
             _provider=self.provider,
             _tool_registry=self.tool_registry,
@@ -391,20 +835,12 @@ class Orchestrator:
             _experiment_manager=self.experiment_manager,
         )
 
-    def _extract_batch_tasks(self, user_input: str) -> list[str]:
-        """Extract individual task descriptions for batch execution."""
-        # Simple heuristic: split on common separators
-        tasks = re.split(r"[;；]", user_input)
-        if len(tasks) < 2:
-            tasks = re.split(r"和|跟|对比|分别", user_input)
-        return [t.strip() for t in tasks if t.strip()]
-
     @staticmethod
     def _format_response(result: WorkerResult) -> str:
         """Format WorkerResult for user display."""
         if result.status == "success":
-            return f"✓ {result.summary}"
-        return f"✗ [{result.status}] {result.summary}"
+            return f"\u2713 {result.summary}"
+        return f"\u2717 [{result.status}] {result.summary}"
 
     @staticmethod
     def _format_batch_response(results: list[WorkerResult]) -> str:

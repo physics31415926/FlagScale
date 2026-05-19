@@ -22,11 +22,12 @@ class AnthropicProvider(LLMProvider):
         self._base_url = base_url
         self._is_third_party = base_url and "anthropic.com" not in base_url
         self._auth_mode = None  # Will be auto-detected on first call
+        self._timeout = 120.0  # 2-minute timeout for API calls + summarizer
         self._client = self._build_client()
 
     def _build_client(self):
         """Build Anthropic client with current auth mode."""
-        kwargs = {"api_key": self._api_key}
+        kwargs = {"api_key": self._api_key, "timeout": self._timeout}
         if self._base_url:
             kwargs["base_url"] = self._base_url
             if self._is_third_party and self._auth_mode == "bearer":
@@ -87,17 +88,25 @@ class AnthropicProvider(LLMProvider):
 
     def chat_stream(self, messages: List[Dict[str, Any]], tools: List[dict]) -> Iterator[Dict[str, Any]]:
         kwargs = self._build_kwargs(messages, tools)
+        stream_ctx = None
 
         try:
             stream_ctx = self._client.messages.stream(**kwargs)
             stream = stream_ctx.__enter__()
         except anthropic.AuthenticationError:
             if self._is_third_party and self._switch_auth_and_retry():
+                # Close old context before creating new one
+                if stream_ctx is not None:
+                    try:
+                        stream_ctx.__exit__(None, None, None)
+                    except Exception:
+                        pass
                 stream_ctx = self._client.messages.stream(**kwargs)
                 stream = stream_ctx.__enter__()
             else:
                 raise
 
+        stream_error = None
         try:
             for event in stream:
                 if event.type == "content_block_start":
@@ -110,6 +119,20 @@ class AnthropicProvider(LLMProvider):
                         yield {"type": "text", "content": delta.text}
                     elif delta.type == "input_json_delta":
                         yield {"type": "tool_delta", "id": "", "arguments_delta": delta.partial_json}
+        except Exception as e:
+            stream_error = e
+        finally:
+            if stream_ctx is not None:
+                try:
+                    stream_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+        if stream_error:
+            raise stream_error
+
+        # Only try to get usage if stream completed normally
+        if stream_ctx is not None:
             try:
                 final = stream.get_final_message()
                 if final and final.usage:
@@ -119,9 +142,8 @@ class AnthropicProvider(LLMProvider):
                         "output_tokens": final.usage.output_tokens,
                     }
             except Exception:
-                pass
-        finally:
-            stream_ctx.__exit__(None, None, None)
+                logger.debug("Failed to get final message usage from stream", exc_info=True)
+
         yield {"type": "done"}
 
     def format_assistant_message(self, response: Dict[str, Any]) -> Dict[str, Any]:

@@ -23,7 +23,7 @@ class AgentConfig:
     base_url: Optional[str] = None
     max_iterations: int = 200
     max_context_tokens: int = 200000
-    shell_remind_interval: int = 120
+    shell_remind_interval: int = 60
     dangerous_commands_check: bool = True
     confirm_commands: bool = True
     mode: str = "confirm"  # "confirm" or "auto"
@@ -39,6 +39,10 @@ class AgentConfig:
     poll_interval: int = 15
     poll_max_duration: int = 300
     max_auto_turns: int = 20
+    budget_max_tokens: int = 2_000_000
+    budget_max_tool_calls: int = 500
+    circuit_breaker_threshold: int = 4
+    circuit_breaker_cooldown: int = 3
     _config_path: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self):

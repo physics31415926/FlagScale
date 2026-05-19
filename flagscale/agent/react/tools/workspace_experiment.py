@@ -1,10 +1,11 @@
 """Workspace experiment tool — manage per-experiment YAML files."""
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_WRITE_FS
 
 
 class WorkspaceExperimentTool(Tool):
     name = "workspace_experiment"
+    effects = EFFECT_WRITE_FS
     description = (
         "Manage experiment records. Each experiment has its own YAML file.\n"
         "Experiment level: name, purpose, hypothesis, status, root_cause, learnings.\n"

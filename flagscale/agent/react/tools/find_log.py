@@ -6,7 +6,7 @@ import re
 import subprocess
 import time
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_READ_FS
 
 
 def _last_sorted_subdir(parent: str, key=None):
@@ -105,6 +105,7 @@ def _health_check(metrics: dict, vocab_size: int = 0) -> list:
 
 class FindLatestLogTool(Tool):
     name = "find_latest_log"
+    effects = EFFECT_READ_FS
     description = (
         "Find and display the latest FlagScale training log. "
         "Scans ALL ranks to find the one with training metrics (loss/iteration). "

@@ -14,7 +14,6 @@ from flagscale.agent.react.tools.shell import (
 )
 from flagscale.agent.react.tools.write_file import WriteFileTool
 from flagscale.agent.react.tools import ToolRegistry
-from flagscale.agent.react.agent import _PluginShellTool
 
 
 class TestReadFileTool:
@@ -429,65 +428,6 @@ class TestEditFileReplaceAll:
         assert f.read_text().count("b") == 1
 
 
-class TestPluginShellTool:
-    def test_basic_execution(self):
-        spec = {
-            "name": "test_tool",
-            "command": "echo {msg}",
-            "parameters": {"type": "object", "properties": {"msg": {"type": "string"}}},
-        }
-        tool = _PluginShellTool(spec)
-        result = tool.execute(msg="hello")
-        assert "hello" in result
-
-    def test_injection_escaped(self):
-        spec = {
-            "name": "test_tool",
-            "command": "echo {msg}",
-            "parameters": {"type": "object", "properties": {"msg": {"type": "string"}}},
-        }
-        tool = _PluginShellTool(spec)
-        result = tool.execute(msg="; rm -rf /")
-        assert "rm -rf" not in result or "rm" in result
-        assert "; rm -rf /" in result
-
-    def test_injection_does_not_execute(self, tmp_path):
-        marker = tmp_path / "pwned.txt"
-        spec = {
-            "name": "test_tool",
-            "command": "echo {msg}",
-            "parameters": {"type": "object", "properties": {"msg": {"type": "string"}}},
-        }
-        tool = _PluginShellTool(spec)
-        tool.execute(msg=f"; touch {marker}")
-        assert not marker.exists()
-
-    def test_timeout(self):
-        spec = {
-            "name": "slow_tool",
-            "command": "sleep {secs}",
-            "timeout": 1,
-            "parameters": {"type": "object", "properties": {"secs": {"type": "string"}}},
-        }
-        tool = _PluginShellTool(spec)
-        result = tool.execute(secs="10")
-        assert "timed out" in result
-
-    def test_schemas(self):
-        spec = {
-            "name": "my_tool",
-            "description": "A tool",
-            "command": "echo {x}",
-            "parameters": {"type": "object", "properties": {"x": {"type": "string"}}},
-        }
-        tool = _PluginShellTool(spec)
-        openai = tool.to_openai_schema()
-        assert openai["type"] == "function"
-        assert openai["function"]["name"] == "my_tool"
-        anthropic = tool.to_anthropic_schema()
-        assert anthropic["name"] == "my_tool"
-
-
 class TestFindLatestLogTool:
     def test_missing_experiment(self, tmp_path):
         from flagscale.agent.react.tools.find_log import FindLatestLogTool
@@ -591,20 +531,20 @@ class TestFindLatestLogTool:
 class TestInjectProxyExports:
     def test_non_network_cmd_still_gets_proxy(self):
         result = _inject_proxy_exports("echo hello", {"HTTP_PROXY": "http://p:8080"})
-        assert 'export HTTP_PROXY="http://p:8080"' in result
+        assert 'export HTTP_PROXY=http://p:8080' in result
         assert result.endswith("&& echo hello")
 
     def test_wget_with_proxy(self):
         env = {"HTTP_PROXY": "http://p:8080", "HTTPS_PROXY": "http://p:8080"}
         result = _inject_proxy_exports("wget http://example.com/file.tar", env)
-        assert 'export HTTP_PROXY="http://p:8080"' in result
-        assert 'export HTTPS_PROXY="http://p:8080"' in result
+        assert 'export HTTP_PROXY=http://p:8080' in result
+        assert 'export HTTPS_PROXY=http://p:8080' in result
         assert result.endswith("&& wget http://example.com/file.tar")
 
     def test_pip_install_with_proxy(self):
         env = {"http_proxy": "http://p:8080"}
         result = _inject_proxy_exports("pip install numpy", env)
-        assert 'export http_proxy="http://p:8080"' in result
+        assert 'export http_proxy=http://p:8080' in result
 
     def test_no_proxy_vars_set(self):
         result = _inject_proxy_exports("wget http://example.com", {})
@@ -637,6 +577,71 @@ class TestEnsureWgetContinue:
         result = _ensure_wget_continue(cmd)
         assert result.count("wget -c") == 2
 
+
+
+class TestToolEffect:
+    """Tests for ToolEffect declarations on all tools."""
+
+    def test_effect_dataclass_frozen(self):
+        from flagscale.agent.react.tools.base import ToolEffect
+        e = ToolEffect(reads=frozenset({"filesystem"}))
+        with pytest.raises(Exception):
+            e.reads = frozenset()
+
+    def test_read_only_property(self):
+        from flagscale.agent.react.tools.base import ToolEffect, EFFECT_READ_FS, EFFECT_WRITE_FS
+        assert EFFECT_READ_FS.is_read_only
+        assert not EFFECT_WRITE_FS.is_read_only
+
+    def test_touches_filesystem(self):
+        from flagscale.agent.react.tools.base import EFFECT_READ_FS, EFFECT_WRITE_FS, EFFECT_NETWORK
+        assert EFFECT_READ_FS.touches_filesystem
+        assert EFFECT_WRITE_FS.touches_filesystem
+        assert not EFFECT_NETWORK.touches_filesystem
+
+    def test_touches_network(self):
+        from flagscale.agent.react.tools.base import EFFECT_NETWORK, EFFECT_READ_FS
+        assert EFFECT_NETWORK.touches_network
+        assert not EFFECT_READ_FS.touches_network
+
+    def test_shell_effects(self):
+        from flagscale.agent.react.tools.base import EFFECT_SHELL
+        assert EFFECT_SHELL.touches_filesystem
+        assert EFFECT_SHELL.touches_network
+        assert EFFECT_SHELL.touches_process
+        assert not EFFECT_SHELL.is_read_only
+
+    def test_read_file_tool_has_effects(self):
+        tool = ReadFileTool()
+        assert tool.effects.is_read_only
+        assert tool.effects.touches_filesystem
+
+    def test_write_file_tool_has_effects(self):
+        tool = WriteFileTool()
+        assert tool.effects.is_write
+        assert tool.effects.touches_filesystem
+
+    def test_edit_file_tool_has_effects(self):
+        tool = EditFileTool()
+        assert tool.effects.is_write
+        assert tool.effects.touches_filesystem
+
+    def test_shell_tool_has_effects(self):
+        tool = ShellTool()
+        assert tool.effects.touches_process
+        assert "training_launch" in tool.effects.side_effects
+
+    def test_all_registered_tools_have_effects(self):
+        """Every tool in the registry should have a non-default effects declaration."""
+        from flagscale.agent.react.tools.base import ToolEffect
+        reg = ToolRegistry()
+        reg.register(ReadFileTool())
+        reg.register(WriteFileTool())
+        reg.register(EditFileTool())
+        reg.register(ShellTool())
+        for tool in reg.all_tools():
+            assert tool.effects != ToolEffect() or tool.name == "base", \
+                f"Tool {tool.name} has no effects declared"
 
 
 class TestDownloadExitCodeAnnotation:

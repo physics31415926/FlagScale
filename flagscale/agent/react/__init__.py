@@ -6,12 +6,31 @@ Entry points:
 
 from flagscale.agent.react.agent import WorkerAgent
 from flagscale.agent.react.config import AgentConfig
+from flagscale.agent.react.orchestrator import Orchestrator
 from flagscale.agent.react.scene import ScenePreset, PRESETS
 from flagscale.agent.react.profile import WorkerProfile, PROFILES
 
 
 def run_agent(provider: str = "anthropic", model: str = None, mode: str = None):
-    """Entry point: create and run the agent."""
+    """Entry point: create agent and orchestrator, then run the agent.
+
+    The Orchestrator owns routing decisions (single/subtask/batch).
+    WorkerAgent.run() calls Orchestrator.route() on each user input
+    to dispatch to the right execution mode.
+    """
     config = AgentConfig.auto_load(provider=provider, model=model, mode=mode)
     agent = WorkerAgent(config)
+
+    # ── Wire Orchestrator with shared infrastructure ──
+    orchestrator = Orchestrator(
+        provider=agent.provider,
+        tool_registry=agent.tool_registry,
+        skill_manager=agent.skill_manager,
+        session_memory=agent.session_memory,
+        task_plan=agent.task_plan,
+        experiment_manager=agent._experiment_manager,
+        config=config,
+    )
+    agent._orchestrator = orchestrator
+
     agent.run()

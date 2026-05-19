@@ -3,7 +3,20 @@
 import os
 import re
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_READ_FS
+
+
+def _safe_torch_load(path: str):
+    """Load a PyTorch checkpoint safely — try weights_only first, fall back."""
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    import torch
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        _log.warning("weights_only=True failed for %s, falling back to weights_only=False. "
+                     "This is needed for checkpoints with custom objects.", path)
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def _load_state_dict(path: str):
@@ -16,7 +29,7 @@ def _load_state_dict(path: str):
             for key in f.keys():
                 sd[key] = f.get_tensor(key)
         return sd
-    data = torch.load(path, map_location="cpu", weights_only=False)
+    data = _safe_torch_load(path)
     if isinstance(data, dict):
         for k in ("model", "state_dict", "module"):
             if k in data:
@@ -40,8 +53,7 @@ def inspect_checkpoint(path, reference_path="", expected_keys="", sample_count=2
         return f"ERROR: Failed to load checkpoint: {type(e).__name__}: {e}"
 
     if state_dict is None:
-        import torch as _t
-        data = _t.load(path, map_location="cpu", weights_only=False)
+        data = _safe_torch_load(path)
         keys = list(data.keys())[:20] if isinstance(data, dict) else type(data).__name__
         return f"ERROR: Cannot find state_dict. Top-level keys: {keys}"
 
@@ -147,6 +159,7 @@ def inspect_checkpoint(path, reference_path="", expected_keys="", sample_count=2
 
 class InspectCheckpointTool(Tool):
     name = "inspect_checkpoint"
+    effects = EFFECT_READ_FS
     description = (
         "Deep inspection of a PyTorch checkpoint (.pt/.bin/.safetensors). "
         "Reports key count, shape/dtype summary, detects anomalies (all-zero, NaN/Inf), "

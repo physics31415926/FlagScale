@@ -24,8 +24,36 @@ parameters:
     description: Model name (e.g., qwen3, llama3)
   - name: exp_dir
     description: Experiment output directory
-requires: [workspace-layout]
-suggests: [env-setup, data-prep]
+requires: [workspace-layout, train-config]
+suggests: [env-setup, train-data-prep]
+
+constraints:
+  - id: no_kill_without_check
+    description: "Never kill training processes without checking logs first"
+    severity: error
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [pkill, killall, kill -9]
+    prompt: "Check if the agent is about to kill a training process without first reading logs to understand why"
+    correction: "Read training logs first to diagnose the issue before killing the process."
+    max_violations: 1
+
+warnings:
+  - id: monitor_reminder
+    description: "Remind to monitor training after launch"
+    severity: warning
+    trigger:
+      tools: [shell]
+      keywords: [flagscale.train, torchrun, python -m]
+    prompt: "Check if this is a training launch command (not dryrun)"
+    reminder: "After launching training, immediately call monitor() to observe the process."
+    max_reminders: 1
+
+context_injection:
+  always: ["Critical Rules", "Post-Launch Protocol"]
+  by_tool:
+    shell: ["Step 3: Preflight Check", "Step 4: Start / Stop Training", "Error Handling"]
 ---
 
 # FlagScale Training Launch
@@ -165,7 +193,7 @@ ls -lh ${DATA_PATH}.bin ${DATA_PATH}.idx
 
 **General rule**: any config file, JSON, or Python dict that maps dataset names to file paths is a potential source of path mismatch. After modifying data paths, always verify the FULL chain: config → dataset registry → metadata files → actual files on disk.
 
-If files are missing or paths don't match, stop and tell the user. Suggest running `/skill data-prep`.
+If files are missing or paths don't match, stop and tell the user. Suggest running `/skill train-data-prep`.
 
 ### 3d. Topology Freshness (Optional)
 
@@ -572,4 +600,4 @@ Only relaunch the full training when the fix is in a component that can't be tes
 - `train-monitor` — monitor running training jobs, check health, detect anomalies
 - `env-setup` — install FlagScale and all dependencies
 - `topo-detect` — detect hardware topology for parallelism planning
-- `data-prep` — prepare training data in Megatron binary format
+- `train-data-prep` — prepare training data in Megatron binary format

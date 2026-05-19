@@ -1,10 +1,11 @@
 """Load skill tool."""
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, ToolEffect
 
 
 class LoadSkillTool(Tool):
     name = "load_skill"
+    effects = ToolEffect(reads=frozenset({"filesystem"}), side_effects=frozenset({"skill_load"}))
     description = "Load a skill by name. Returns the skill content that provides specialized instructions. Extra arguments are passed as parameters to fill placeholders in the skill body."
     parameters = {
         "type": "object",

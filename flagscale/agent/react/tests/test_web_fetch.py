@@ -54,7 +54,8 @@ class TestWebFetchTool:
 
         with patch("flagscale.agent.react.tools.web_fetch.requests.get", return_value=mock_resp):
             result = tool.execute(url="https://example.com/file.pdf")
-        assert "Unsupported content type" in result
+        assert "WEB_FETCH_UNSUPPORTED" in result
+        assert "application/pdf" in result
 
     def test_network_error_with_proxy_hint(self):
         import requests
@@ -62,7 +63,7 @@ class TestWebFetchTool:
         with patch("flagscale.agent.react.tools.web_fetch.requests.get",
                     side_effect=requests.ConnectionError("ConnectionError: Name or service not known")):
             result = tool.execute(url="https://example.com")
-        assert "ERROR" in result
+        assert "WEB_FETCH_NETWORK_ERROR" in result
         assert "proxy" in result.lower()
 
     def test_network_error_no_hint_with_proxy(self):
@@ -71,8 +72,28 @@ class TestWebFetchTool:
         with patch("flagscale.agent.react.tools.web_fetch.requests.get",
                     side_effect=requests.ConnectionError("ConnectionError")):
             result = tool.execute(url="https://example.com")
-        assert "ERROR" in result
+        assert "WEB_FETCH_NETWORK_ERROR" in result
         assert "proxy" not in result.lower() or "configured" not in result.lower()
+
+    def test_error_message_does_not_start_with_error(self):
+        """web_fetch errors should use [WEB_FETCH_*] tags, not raw ERROR: prefix."""
+        import requests
+        tool = WebFetchTool()
+        with patch("flagscale.agent.react.tools.web_fetch.requests.get",
+                    side_effect=requests.ConnectionError("fail")):
+            result = tool.execute(url="https://example.com")
+        assert not result.startswith("ERROR:")
+        assert result.startswith("[WEB_FETCH_NETWORK_ERROR]")
+
+    def test_error_message_explains_not_a_tool_bug(self):
+        """web_fetch errors should tell LLM not to interpret as tool error."""
+        import requests
+        tool = WebFetchTool()
+        with patch("flagscale.agent.react.tools.web_fetch.requests.get",
+                    side_effect=requests.ConnectionError("fail")):
+            result = tool.execute(url="https://example.com")
+        assert "tool execution error" in result.lower()
+        assert "tool worked correctly" in result.lower()
 
 
 class TestExtractText:
@@ -102,7 +123,8 @@ class TestExtractText:
     def test_short_content_warning(self):
         html = "<html><body><p>Hi</p></body></html>"
         result = _extract_text(html, "https://example.com")
-        assert "very little content" in result
+        assert "WEB_FETCH_LOW_CONTENT" in result
+        assert "chars" in result
 
 
 class TestIsNetworkError:

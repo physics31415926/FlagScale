@@ -12,6 +12,53 @@ keywords:
   - safety
 requires: []
 suggests: [debug-strategy]
+
+constraints:
+  - id: no_modify_third_party
+    description: "Never modify third-party or framework source code to work around build errors"
+    severity: error
+    check_phase: pre
+    trigger:
+      tools: [edit_file, write_file]
+      keywords: [site-packages, megatron-lm, transformer-engine, apex, flash-attn]
+    prompt: "Check if the agent is modifying third-party framework source code instead of fixing the integration"
+    correction: "Fix your own code or configuration. If the framework has a bug, report it."
+    max_violations: 0
+  - id: no_repeat_command
+    description: "Never run the same shell command twice in a row expecting different results"
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [python, pip, conda, wget, curl, make, cmake, torchrun, flagscale]
+    prompt: "Check if this shell command is identical to the immediately preceding shell command"
+    correction: "Try a different diagnostic command or change the approach."
+    max_violations: 1
+
+warnings:
+  - id: read_before_write
+    description: "Read docs/code before implementing"
+    severity: warning
+    trigger:
+      keywords: [implement, write, create, build]
+    prompt: "Check if the agent is writing code without having read relevant documentation or source first"
+    reminder: "Reading strategy: understand before implementing. Read docs, example configs, and source code BEFORE writing."
+    max_reminders: 2
+  - id: disk_space_check
+    description: "Check disk space before large operations"
+    severity: warning
+    trigger:
+      keywords: [download, wget, curl, clone, pip install, conda install]
+    prompt: "Check if a large download/install is about to happen without prior disk space check"
+    reminder: "Check disk space with `df -h` before large downloads or builds."
+    max_reminders: 1
+
+context_injection:
+  always: ["Reading strategy — depth over speed"]
+  by_tool:
+    shell: ["Shell command rules", "Environment awareness", "Fail-fast preflight"]
+    edit_file: ["Root cause diagnosis"]
+    write_file: ["Root cause diagnosis"]
 ---
 
 # Operational Discipline

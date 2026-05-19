@@ -30,10 +30,72 @@ parameters:
     description: Python version
     default: "3.12"
   - name: deps_dir
-    description: Directory to clone source dependencies
-    default: /opt/flagscale/deps
-requires: []
-suggests: [workspace-layout]
+    description: Directory to clone source dependencies. If shared storage is detected, use <workspace_root>/code/deps/ so all nodes can access the same builds. Only fall back to a local path if no shared storage exists.
+    default: <workspace_root>/code/deps/
+requires: [workspace-layout]
+suggests: []
+constraints:
+  - id: env_setup_conda_prefix_not_shared_storage
+    description: Conda environment must be created with --prefix on shared storage (not local /tmp). Local paths prevent multi-node access.
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [conda create, conda env create]
+    prompt: "Check if conda env is being created on shared storage (--prefix) rather than local path"
+    correction: "Use --prefix on shared storage for multi-node access."
+  - id: env_setup_pip_install_not_verify_import
+    description: After every pip install, immediately verify with "python -c 'import <package>'" to catch corrupt installs or import hangs.
+    severity: warning
+    check_phase: post
+    trigger:
+      tools: [shell]
+      keywords: [pip install]
+    prompt: "Check if pip install was followed by import verification"
+    correction: "Verify with: python -c 'import <package>'"
+  - id: env_setup_pip_install_flagscale_without_no_deps
+    description: pip install flagscale must use --no-deps to prevent PyTorch silent upgrade.
+    severity: error
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [pip install, flagscale]
+    prompt: "Check if pip install flagscale uses --no-deps flag"
+    correction: "Use: pip install --no-deps -e . (or pip install --no-deps flagscale)"
+    max_violations: 0
+  - id: env_setup_pip_install_flash_attn_missing_no_deps
+    description: pip install flash-attn must use --no-deps to prevent PyTorch from being overridden.
+    severity: error
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [pip install, flash-attn, flash_attn]
+    prompt: "Check if pip install flash-attn uses --no-deps flag"
+    correction: "Use: pip install --no-deps flash-attn"
+    max_violations: 0
+
+warnings:
+  - id: cuda_version_check
+    description: "Check CUDA/driver version before installing GPU packages"
+    severity: warning
+    trigger:
+      keywords: [install, build, compile, pip install, conda install]
+    prompt: "Check if CUDA/driver version was verified before installing GPU-dependent packages"
+    reminder: "Run nvidia-smi and check CUDA version before installing torch/TE/apex/flash-attn."
+    max_reminders: 1
+  - id: verify_import_after_install
+    description: "Verify import after pip install to catch corrupt installs"
+    severity: warning
+    trigger:
+      keywords: [pip install]
+    prompt: "Check if pip install was followed by import verification"
+    reminder: "After pip install, verify with: python -c 'import <package>; print(<package>.__version__)'"
+    max_reminders: 3
+
+context_injection:
+  always: ["Strategy", "CRITICAL: Source-of-truth principle"]
+  by_tool:
+    shell: ["General rules", "Step 1", "Step 2", "Step 3"]
 ---
 
 # FlagScale Training Environment Setup
@@ -61,11 +123,25 @@ The ONLY valid sources of truth for dependency versions are:
 2. Try pip install with pinned versions (fast, from FlagScale PyPI)
 3. If pip fails, fall back to source clone + build
 4. Never modify dependency source code to work around errors — report to user
-5. After any large `pip install`, verify critical packages were not unexpectedly upgraded: `python -c "import torch; print(torch.__version__, torch.version.cuda)"`
+5. **After EVERY pip install, VERIFY the import works.** DO NOT assume a successful pip exit code means the package is usable. Immediately test: `python -c "import <package>; print(<package>.__version__)"`. For large packages (torch, flash-attn, apex), if `import` hangs >10s, the install is corrupt and must be redone. On NFS/shared storage, use `timeout 15 python -c "import <package>"` to catch hangs quickly without blocking the session.
 6. **Auto-fetch FL dependencies**: When Megatron-LM-FL or TransformerEngine-FL source code is needed (for analysis, compilation, or debugging) and is not available locally, pull the latest automatically — don't ask the user. Repos: `https://github.com/flagos-ai/Megatron-LM-FL.git`, `https://github.com/flagos-ai/TransformerEngine-FL.git` (use `--recursive` for TE-FL)
 7. **ALL FL-customized dependencies are MANDATORY.** Do NOT skip Megatron-LM-FL, TransformerEngine-FL, Apex, or Flash-Attention. These are not optional — FlagScale training will fail or produce incorrect results without them. If one is difficult to install, try the source build fallback. Only skip a dependency if the user explicitly requests it after being warned of the consequences.
 8. **If the user asks to create a new environment, create a new environment.** Do not reuse an existing one, even if it appears to have the right packages. Existing environments may have editable installs pointing to other workspaces, patched packages, or stale versions. A fresh environment is the only way to guarantee a clean, reproducible baseline. If you believe reusing is genuinely better, explain why and ask — but do not silently substitute.
 9. **NEVER copy packages between environments using `cp -r` from site-packages.** This bypasses pip's metadata tracking — pip won't know the package exists, so dependency resolution, upgrades, and uninstalls all break silently. Always install via `pip install` (from wheel, PyPI, or source build). If a prebuilt wheel isn't available, build from source — it takes longer but produces a properly registered package.
+10. **Prefer shared storage for conda environments.** If the working directory is under a shared filesystem (e.g., `/share/`, `/mnt/share/`, `/mnt/cfs/`), create the conda environment with `--prefix <shared_path>/envs/<name>` instead of `-n <name>`. This ensures all nodes can access the same environment in multi-node training without duplication. Use `--prefix` for ALL subsequent `conda run` commands targeting this environment. Only use `-n` if no shared storage is available.
+11. **Conda envs and pip packages MUST go on shared storage, not local paths.** Even if `/tmp` or local disk has more space or is faster, the conda environment prefix and pip install target MUST be on shared storage (e.g., `/share/.../envs/<name>`). The only exception is `TMPDIR` for pip's temporary build cache — that can point to local storage to speed up compilation, but the final installed packages must land in the shared prefix.
+
+## Step 0: Determine Dependency Source Directory
+
+**Before anything else, determine `deps_dir` — the directory for cloning and building source dependencies.**
+
+1. If workspace-layout skill has been loaded and `workspace_root` is known (from memory or detection), set `deps_dir = <workspace_root>/code/deps/`. This ensures all nodes in multi-node training can access the same builds.
+2. If shared storage is available but workspace_root is not yet set, detect it now (see workspace-layout Step 1) and use it.
+3. Only if NO shared storage is available, fall back to a local path.
+
+**Summary**: `deps_dir` is always on shared storage when available. Never hardcode `/opt/flagscale/deps` — this path is local to one node and invisible to others.
+
+Record `deps_dir` in memory after determining it.
 
 ## Step 1: Constraint Collection (NO installs in this step)
 
@@ -139,7 +215,7 @@ FlagScale requirements:
 
 | # | Component | Required Version | Install Method | Notes |
 |---|-----------|-----------------|---------------|-------|
-| 1 | Conda env | python=py_ver | conda create | name: env_name |
+| 1 | Conda env | python=py_ver | conda create --prefix | path: <shared>/envs/env_name (or -n if no shared storage) |
 | 2 | PyTorch | torch_ver+cuXXX | pip | --extra-index-url https://download.pytorch.org/whl/cuXXX |
 | 3 | FlagScale | editable | pip -e ".[cuda-train]" | from project root |
 | 4 | Megatron-LM-FL | mlm_ver | pip/source | FlagScale PyPI / git clone + build |
@@ -150,6 +226,7 @@ FlagScale requirements:
 
 CRITICAL CHECKLIST before proceeding:
 - [ ] All versions in the table are derived from FlagScale source files (NOT existing envs)
+- [ ] Shared storage checked — conda env path uses --prefix on shared FS if available
 - [ ] CUDA toolkit version matches PyTorch's CUDA (not driver's)
 - [ ] GPU compute capability ≥ required by flash-attn
 - [ ] Megatron-LM-FL wheel exists on FlagScale PyPI at the needed version
@@ -162,18 +239,58 @@ After confirmation, annotate your response with [ENV_COMPAT_ANALYZED].
 
 ## Step 2: Conda Environment
 
+### 2a. Check shared storage FIRST
+
+**CRITICAL**: If the current working directory is under a shared filesystem (e.g., `/share/`, `/mnt/share/`, `/mnt/cfs/`), create the conda environment on the shared storage — NOT on the local node. This ensures all nodes in multi-node training can access the same environment without duplication.
+
+```bash
+# Check if we're on shared storage
+df -h . | grep -E '^[^/]' | head -5
+
+# Check available shared mount points
+ls -d /share /mnt/share /mnt/cfs /mnt/dfs 2>/dev/null
+```
+
+If shared storage is found (e.g., `/share/project/...`), use `--prefix` instead of `--name`:
+
+```bash
+# Create env in shared storage — use --prefix with full path
+conda create --prefix /share/project/<path>/envs/{env_name} python={python_version} -y
+
+# For all subsequent commands, use --prefix (not -n):
+conda run --prefix /share/project/<path>/envs/{env_name} <command>
+```
+
+If NO shared storage is found, fall back to `-n`:
+
 ```bash
 conda create -n {env_name} python={python_version} -y
 # In non-interactive shells (agent), use: conda run -n {env_name} <command>
 # In interactive shells (user), use: conda activate {env_name}
 ```
 
-Verify:
+### 2b. Verify
+
 ```bash
 python --version
 ```
 
 ## Step 3: Install FlagScale
+
+### 3a. Pin PyTorch FIRST (before installing FlagScale)
+
+**CRITICAL**: `pip install -e ".[cuda-train]"` will pull in ALL requirements, including PyTorch from the requirements files. If those requirements specify a different CUDA version than what your driver supports, pip will silently upgrade PyTorch and all CUDA libraries. This is the #1 cause of wasted time in environment setup.
+
+**Always pin PyTorch before FlagScale install:**
+
+```bash
+# Install exact PyTorch version from Step 1 compatibility analysis
+pip install torch=={torch_version}+{cu_tag} torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/{cu_tag}
+# Verify CUDA version is correct
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+### 3b. Install FlagScale editable
 
 From the FlagScale project root:
 
@@ -181,15 +298,24 @@ From the FlagScale project root:
 pip install -e ".[cuda-train]"
 ```
 
-This installs FlagScale itself plus base pip dependencies (PyTorch, sentencepiece, transformers, tiktoken, etc.).
+**If pip tries to upgrade PyTorch during this step**, abort and use the two-phase approach:
+```bash
+# Phase 1: install FlagScale without deps
+pip install --no-deps -e .
+# Phase 2: install remaining deps from requirements (PyTorch already pinned, won't change)
+pip install -r requirements/cuda/train.txt
+```
+
+This ensures PyTorch stays at the pinned version.
 
 Verify:
 ```bash
 flagscale --help
 python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')"
+# CRITICAL: confirm torch version did NOT change from what was installed in 3a
 ```
 
-**Important**: `requirements/cuda/train.txt` includes a megatron-core whl from the FlagScale PyPI. This is a base version — it may lack modules like `megatron.plugin.platform` that FlagScale's training code requires. If training fails with import errors from megatron, proceed to Step 3.
+**Important**: `requirements/cuda/train.txt` includes a megatron-core whl from the FlagScale PyPI. This is a base version — it may lack modules like `megatron.plugin.platform` that FlagScale's training code requires. If training fails with import errors from megatron, proceed to Step 4.
 
 ## Step 4: FL-Customized Dependencies
 

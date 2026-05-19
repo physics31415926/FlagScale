@@ -29,6 +29,52 @@ keywords:
   - snapshot_download
 requires: []
 suggests: []
+
+constraints:
+  - id: workspace_layout_install_to_local_not_shared
+    description: "Conda envs, pip packages, models, datasets, and experiments MUST be on shared storage, NOT local paths (/tmp, ~/)"
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [conda create, conda install, pip install, snapshot_download, wget, mkdir]
+    prompt: "Check if artifacts are being created on local storage instead of shared storage"
+    correction: "Use shared storage path for all persistent artifacts."
+    max_violations: 2
+  - id: no_experiment_overwrite
+    description: "Never overwrite or reuse a previous experiment directory"
+    severity: error
+    check_phase: pre
+    trigger:
+      tools: [shell, write_file]
+      keywords: [rm -rf, rmdir, exp_dir]
+    prompt: "Check if the agent is about to delete or overwrite an existing experiment directory"
+    correction: "Create a new experiment directory with a unique name. Never reuse or delete experiment dirs."
+    max_violations: 0
+
+warnings:
+  - id: disk_space_precheck
+    description: "Check disk space before large downloads or training launches"
+    severity: warning
+    trigger:
+      keywords: [download, snapshot_download, wget, training, launch]
+    prompt: "Check if a disk space check was done before this large operation"
+    reminder: "Run `df -h <target_dir>` before large downloads. Warn if free space < 1.5x estimated size."
+    max_reminders: 2
+  - id: artifact_dedup_check
+    description: "Check memory for existing artifacts before downloading"
+    severity: warning
+    trigger:
+      keywords: [download, snapshot_download, wget, clone]
+    prompt: "Check if memory was consulted for existing artifact paths before downloading"
+    reminder: "Check memory_read for existing paths before downloading. Avoid duplicate downloads."
+    max_reminders: 2
+
+context_injection:
+  always: ["Standard Directory Layout"]
+  by_tool:
+    shell: ["Detect Storage Root", "Disk Space Pre-check", "Artifact Discovery"]
+    write_file: ["Rules for Each Artifact Type"]
 ---
 
 # Workspace Layout & Storage Management

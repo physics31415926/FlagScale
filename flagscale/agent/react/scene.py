@@ -12,7 +12,6 @@ Key design: constraints set 是机器可消费的标记:
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass, field
 
 
@@ -41,13 +40,14 @@ class ScenePreset:
     constraints: set[str] = field(default_factory=set)
 
     @classmethod
-    def auto_detect(cls, cwd: str | None = None, user_input: str = "") -> "ScenePreset":
-        """Pure function: detect scene from environment. No LLM needed."""
-        cwd = cwd or os.getcwd()
+    def from_env_and_input(cls, user_input: str = "") -> "ScenePreset":
+        """Detect scene from environment only (no regex).
 
-        constraints: set[str] = set()
-
-        # Detect chip type from env
+        Uses keyword-based matching on user_input for mode/hints.
+        Full intent classification (migration vs training vs inference,
+        multi-node) should be done by Judge; this is a lightweight fallback.
+        """
+        # ── Chip type (env only) ──
         chip_type = "nvidia"
         chip_vendor_sdk = "cuda"
         if os.environ.get("ASCEND_HOME"):
@@ -57,49 +57,56 @@ class ScenePreset:
             chip_type = "dcu"
             chip_vendor_sdk = "rocm"
 
-        # Detect mode from user_input
+        # ── Mode hints (keyword, not regex) ──
+        constraints: set[str] = set()
         mode = "training"
-        if re.search(r"inference|serving|推理|部署|vllm|sglang", user_input, re.IGNORECASE):
+        text_lower = user_input.lower()
+
+        inference_keywords = ["inference", "serving", "vllm", "sglang", "推理", "部署"]
+        migration_keywords = ["migrate", "port", "porting", "from ", "迁移"]
+        multi_node_keywords = ["multi-node", "multi_node", "集群", "cluster", "slurm"]
+        rl_keywords = ["rl", "reinforcement", "ppo", "grpo", "reward", "强化学习"]
+
+        if any(k in text_lower for k in inference_keywords):
             mode = "inference_serving"
             constraints.add("is_inference")
         else:
             constraints.add("is_training")
 
-        # Detect migration intent
-        if re.search(r"迁移|migrate|port|porting|from.*megatron|from.*deepspeed", user_input, re.IGNORECASE):
+        if any(k in text_lower for k in migration_keywords):
             constraints.add("is_migration")
             if chip_type != "nvidia":
                 constraints.add("is_chip_migration")
 
-        # Detect multi-node
-        if re.search(r"多节点|multi.node|集群|cluster|slurm", user_input, re.IGNORECASE):
+        if any(k in text_lower for k in multi_node_keywords):
             constraints.add("requires_multi_node")
             network_topology = "multi_node_ib"
         else:
             network_topology = "single_node"
 
-        # Detect RL
-        if re.search(r"RL|reinforcement|强化学习|PPO|GRPO|reward", user_input, re.IGNORECASE):
+        if any(k in text_lower for k in rl_keywords):
             constraints.add("is_rl")
 
-        # Determine frameworks
+        # ── Source framework hints ──
         source = ""
-        if re.search(r"from\s+megatron|原来是?megatron|megatron.*迁移", user_input, re.IGNORECASE):
+        if "megatron" in text_lower and any(k in text_lower for k in ["from ", "迁移", "migrate", "原来是"]):
             source = "megatron"
-        elif re.search(r"deepspeed|from\s+DS|deepspeed.*迁移", user_input, re.IGNORECASE):
+        elif "deepspeed" in text_lower:
             source = "deepspeed"
-        elif re.search(r"fsdp|from\s+FSDP", user_input, re.IGNORECASE):
+        elif "fsdp" in text_lower:
             source = "fsdp"
-        elif re.search(r"vllm|vLLM", user_input, re.IGNORECASE):
+        elif any(k in text_lower for k in ["vllm", "vLLM"]):
             source = "vllm"
 
+        # ── Target ──
         target = "megatron-core"
         if mode == "inference_serving":
             target = "flagscale+vllm"
 
-        # Precision: favor bf16 on NVIDIA, fp16 on domestic chips
+        # ── Precision ──
         precision = "bf16" if chip_type == "nvidia" else "fp16"
 
+        # ── Name ──
         name = f"{target.split('+')[0]}-{mode}-{chip_type}"
         if source:
             name += f"-from-{source}"
@@ -115,6 +122,11 @@ class ScenePreset:
             network_topology=network_topology,
             constraints=constraints,
         )
+
+    @classmethod
+    def auto_detect(cls, cwd: str | None = None, user_input: str = "") -> "ScenePreset":
+        """Backward-compatible alias for from_env_and_input."""
+        return cls.from_env_and_input(user_input=user_input)
 
 
 # ── Preset library ────────────────────────────────────────────────────────
@@ -164,14 +176,4 @@ PRESETS: dict[str, ScenePreset] = {
         network_topology="single_node",
         constraints={"is_training", "is_migration"},
     ),
-    # Future RL extension — one line config
-    # "megatron-rl-nvidia": ScenePreset(
-    #     name="megatron-rl-nvidia",
-    #     mode="training",
-    #     chip_type="nvidia", chip_vendor_sdk="cuda",
-    #     target_framework="megatron-core", source_framework="",
-    #     default_precision="bf16",
-    #     network_topology="multi_node_ib",
-    #     constraints={"is_training", "is_rl", "requires_multi_node"},
-    # ),
 }

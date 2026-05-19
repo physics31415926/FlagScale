@@ -16,6 +16,45 @@ keywords:
   - 失败
 requires: []
 suggests: [ops-discipline, train-run]
+
+constraints:
+  - id: no_blind_retry
+    description: "Never retry a failed command a 3rd time without a fundamentally different approach"
+    severity: error
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [python, torchrun, flagscale, pytest, pip install]
+    prompt: "Check if the agent is retrying a command that failed twice with similar errors without changing approach"
+    correction: "Stop and perform root cause analysis. Fill the RCA template before trying again."
+    max_violations: 0
+  - id: no_symptom_fix
+    description: "Never fix at crash site (.to(dtype), .reshape) without tracing root cause"
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [write_file, edit_file]
+      keywords: [".to(", ".reshape(", ".view(", "strict=False"]
+    prompt: "Check if this edit patches a symptom rather than fixing root cause upstream"
+    correction: "Trace the data flow upstream to find where the wrong dtype/shape originates."
+    max_violations: 2
+
+warnings:
+  - id: two_strike_reminder
+    description: "Remind about 2-strike rule when same error category appears twice"
+    severity: warning
+    trigger:
+      keywords: [error, Error, ERROR, failed, FAILED, Traceback]
+    prompt: "Check if the same category of error has appeared twice consecutively"
+    reminder: "2-Strike Rule: Same error category hit twice. STOP fixing forward — root cause audit needed."
+    max_reminders: 3
+
+context_injection:
+  always: ["The 2-Strike Rule", "Root Cause Analysis Template"]
+  by_tool:
+    shell: ["Error → Action Mapping", "Diagnosis Methodology"]
+    edit_file: ["Anti-Patterns to Avoid"]
+    write_file: ["Anti-Patterns to Avoid"]
 ---
 
 # Debug Strategy

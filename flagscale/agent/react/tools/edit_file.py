@@ -1,11 +1,34 @@
 """Edit file tool — exact string replacement."""
 
-from flagscale.agent.react.tools.base import Tool
+import os
+
+from flagscale.agent.react.tools.base import Tool, EFFECT_WRITE_FS
 from flagscale.agent.react.tools.read_file import get_file_cache
+
+# -- Same protected paths as write_file.py --
+_PROTECTED_PATHS = frozenset({
+    os.path.expanduser("~/.bashrc"),
+    os.path.expanduser("~/.profile"),
+    os.path.expanduser("~/.bash_profile"),
+    os.path.expanduser("~/.zshrc"),
+    os.path.expanduser("~/.ssh/authorized_keys"),
+})
+
+
+def _is_protected_path(path: str) -> bool:
+    resolved = os.path.abspath(os.path.realpath(path))
+    if resolved in _PROTECTED_PATHS:
+        return True
+    if resolved.startswith("/etc/") and not resolved.startswith("/etc/apt/"):
+        return True
+    if resolved.startswith("/boot/"):
+        return True
+    return False
 
 
 class EditFileTool(Tool):
     name = "edit_file"
+    effects = EFFECT_WRITE_FS
     description = "Edit a file by replacing an exact string match. The old_string must match exactly (including whitespace)."
     parameters = {
         "type": "object",
@@ -31,6 +54,10 @@ class EditFileTool(Tool):
     }
 
     def execute(self, **kwargs) -> str:
+        path = kwargs["path"]
+
+        if _is_protected_path(path):
+            return f"ERROR: Cannot edit protected system path: {path}"
         path = kwargs["path"]
         old_string = kwargs["old_string"]
         new_string = kwargs["new_string"]

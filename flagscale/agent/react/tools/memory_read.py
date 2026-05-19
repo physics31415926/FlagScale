@@ -1,10 +1,11 @@
 """Memory read tool — retrieve a specific memory entry."""
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_READ_MEMORY
 
 
 class MemoryReadTool(Tool):
     name = "memory_read"
+    effects = EFFECT_READ_MEMORY
     description = (
         "Read a specific memory entry by key. "
         "Use when you know a memory exists and want to retrieve its details."

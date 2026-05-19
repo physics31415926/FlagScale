@@ -1,0 +1,189 @@
+"""Constraint extraction cache for FlagScale Agent.
+
+Manages disk-cached constraint extraction results so that LLM-based
+constraint extraction only runs once per skill content version.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from flagscale.agent.react import display
+
+logger = logging.getLogger(__name__)
+
+# Bump this when constraint extraction format changes
+_CACHE_VERSION = 2
+
+
+class ConstraintCache:
+    """Disk-backed cache for LLM-extracted skill constraints.
+
+    Thread-safe: uses a lock to serialize extraction calls.
+    """
+
+    def __init__(self, cache_dir: str):
+        """Initialize constraint cache.
+
+        Args:
+            cache_dir: Directory to store constraint_cache.json
+        """
+        self._cache_dir = cache_dir
+        self._lock = threading.Lock()
+        self._memory: dict[str, list[dict]] = {}
+
+    @property
+    def items(self) -> dict[str, list[dict]]:
+        """In-memory constraint items by skill name."""
+        return self._memory
+
+    def _cache_path(self) -> str:
+        return os.path.join(self._cache_dir, "constraint_cache.json")
+
+    def _load_disk_cache(self) -> dict:
+        path = self._cache_path()
+        try:
+            if os.path.exists(path):
+                with open(path) as f:
+                    data = json.load(f)
+                if data.get("_version") != _CACHE_VERSION:
+                    logger.info(
+                        "Constraint cache version mismatch (got %s, need %s) — invalidating",
+                        data.get("_version"), _CACHE_VERSION,
+                    )
+                    return {}
+                return data.get("entries", {})
+        except Exception:
+            pass
+        return {}
+
+    def _save_disk_cache(self, cache: dict):
+        path = self._cache_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump({
+                    "_version": _CACHE_VERSION,
+                    "entries": cache,
+                }, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def get_or_extract(self, skill_name: str, skill_content: str,
+                       extract_fn) -> list[dict]:
+        """Get constraints from cache or extract via LLM.
+
+        Args:
+            skill_name: Name of the skill
+            skill_content: Full skill content text
+            extract_fn: Callable that takes skill_content and returns list[dict]
+
+        Returns:
+            List of constraint dicts
+        """
+        if skill_name in self._memory:
+            return self._memory[skill_name]
+
+        # Check disk cache
+        disk_cache = self._load_disk_cache()
+        content_hash = hashlib.md5(skill_content.encode()).hexdigest()[:16]
+        if skill_name in disk_cache:
+            entry = disk_cache[skill_name]
+            if entry.get("content_hash") == content_hash and entry.get("items"):
+                self._memory[skill_name] = entry["items"]
+                print(display.dim(
+                    f"  📋 [{skill_name}] {len(entry['items'])} constraints (from cache)"
+                ))
+                logger.info(
+                    "Loaded %d cached constraints for skill '%s'",
+                    len(entry["items"]), skill_name,
+                )
+                return entry["items"]
+
+        # Extract with lock
+        with self._lock:
+            return self._extract_locked(
+                skill_name, skill_content, disk_cache, content_hash, extract_fn
+            )
+
+    def _extract_locked(self, skill_name: str, skill_content: str,
+                        disk_cache: dict, content_hash: str,
+                        extract_fn) -> list[dict]:
+        """Thread-safe extraction with double-check pattern."""
+        # Double-check in case another thread just finished
+        if skill_name in self._memory:
+            return self._memory[skill_name]
+
+        try:
+            print(display.dim(f"  📋 [{skill_name}] analyzing..."), end="\r")
+            raw = extract_fn(skill_content)
+            items = []
+            if isinstance(raw, list) and raw:
+                for c in raw:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get("id", "")
+                    if not cid or not c.get("prompt"):
+                        continue
+                    items.append(c)
+            if items:
+                self._memory[skill_name] = items
+                disk_cache[skill_name] = {"content_hash": content_hash, "items": items}
+                self._save_disk_cache(disk_cache)
+                constraint_list = ", ".join(c["id"] for c in items)
+                print(display.green(
+                    f"  📋 [{skill_name}] {len(items)} constraints: {constraint_list}"
+                ))
+                logger.info(
+                    "Extracted %d constraints from skill '%s': %s",
+                    len(items), skill_name, constraint_list,
+                )
+            else:
+                print(display.dim(
+                    f"  📋 [{skill_name}] 0 constraints extracted"
+                ))
+            return items
+        except Exception:
+            import traceback
+            print(display.dim(
+                f"  📋 [{skill_name}] constraint extraction skipped"
+            ))
+            logger.warning(
+                "Failed to extract constraints from skill '%s': %s\n%s",
+                skill_name, sys.exc_info()[1],
+                traceback.format_exc(),
+            )
+            return []
+
+    def batch_extract(self, skill_map: dict[str, str], extract_fn) -> None:
+        """Extract constraints from multiple skills concurrently.
+
+        Args:
+            skill_map: {skill_name: skill_content, ...}
+            extract_fn: Callable that takes skill_content and returns list[dict]
+        """
+        pending = {
+            name: content
+            for name, content in skill_map.items()
+            if name not in self._memory
+        }
+        if not pending:
+            return
+
+        print(display.dim(f"  📋 Extracting constraints from {len(pending)} skill(s)..."))
+        with ThreadPoolExecutor(max_workers=len(pending)) as pool:
+            futures = {
+                pool.submit(self.get_or_extract, name, content, extract_fn): name
+                for name, content in pending.items()
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    pass

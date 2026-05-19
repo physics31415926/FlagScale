@@ -453,6 +453,13 @@ class HistoryManager:
         self._messages.append(message)
         self._full_log.append(message)
 
+    def set_system_prompt(self, content: str):
+        """Replace or prepend the system message."""
+        if self._messages and self._messages[0].get("role") == "system":
+            self._messages[0]["content"] = content
+        else:
+            self._messages.insert(0, {"role": "system", "content": content})
+
     def compact_intra_turn(self, keep_last: int = 6):
         """Graduated in-place compression of older tool results.
 

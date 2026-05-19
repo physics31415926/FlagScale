@@ -1,10 +1,11 @@
 """Memory write tool — save key findings, decisions, and todos."""
 
-from flagscale.agent.react.tools.base import Tool
+from flagscale.agent.react.tools.base import Tool, EFFECT_WRITE_MEMORY
 
 
 class MemoryWriteTool(Tool):
     name = "memory_write"
+    effects = EFFECT_WRITE_MEMORY
     description = (
         "Save a key finding, decision, or todo for future sessions. "
         "Use to record important discoveries, choices made, or pending work "

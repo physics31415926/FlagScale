@@ -23,6 +23,43 @@ parameters:
     default: ./topo_report.yaml
 requires: []
 suggests: []
+
+constraints:
+  - id: no_install_packages
+    description: "Do NOT install any packages during topology detection — only use tools already present"
+    severity: error
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [pip install, conda install, apt install, yum install]
+    prompt: "Check if the agent is trying to install packages during topology detection"
+    correction: "Only use tools already present on the system. If a tool is unavailable, note it and move on."
+    max_violations: 0
+  - id: io_benchmark_confirm
+    description: "IO benchmark writes temporary files — must confirm with user before running"
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [shell]
+      keywords: [dd if=, fio, iozone, bonnie]
+    prompt: "Check if an IO benchmark is about to run without user confirmation"
+    correction: "Ask user for confirmation before running IO benchmarks that write temporary files."
+    max_violations: 1
+
+warnings:
+  - id: cleanup_temp_files
+    description: "Clean up temporary benchmark files after IO tests"
+    severity: warning
+    trigger:
+      keywords: [dd, fio, testfile, benchmark]
+    prompt: "Check if temporary benchmark files were created and need cleanup"
+    reminder: "Clean up any temporary files created during IO benchmarks."
+    max_reminders: 1
+
+context_injection:
+  always: ["Execution Rules", "Output"]
+  by_tool:
+    shell: ["Compute Detection", "Communication Detection", "Storage Detection"]
 ---
 
 # Hardware Topology Detection (Single Node)

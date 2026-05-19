@@ -27,22 +27,28 @@ class WorkerProfile:
 # ── Registered profiles ────────────────────────────────────────────────────
 
 PROFILES: dict[str, WorkerProfile] = {
+    "general": WorkerProfile(
+        name="general",
+        description="General-purpose tasks: shell operations, file inspection, simple Q&A, cleanup",
+        skills=[],
+        scene_constraints=[],
+    ),
     "model-migration": WorkerProfile(
         name="model-migration",
         description="Migrate models from source frameworks to FlagScale/Megatron-Core",
-        skills=["model-porter", "train-config", "data-prep"],
+        skills=["train-model-porter", "train-config", "train-data-prep"],
         scene_constraints=["is_migration"],
     ),
     "chip-migration": WorkerProfile(
         name="chip-migration",
         description="Migrate from FlagScale+Nvidia to FlagScale+domestic chip",
-        skills=["model-porter", "precision-alignment", "train-config", "data-prep"],
+        skills=["train-model-porter", "train-precision-alignment", "train-config", "train-data-prep"],
         scene_constraints=["is_migration", "is_chip_migration"],
     ),
     "training-reproduce": WorkerProfile(
         name="training-reproduce",
         description="Reproduce training results from papers/reference implementations",
-        skills=["reproduce", "train-config", "train-run"],
+        skills=["train-reproduce", "train-config", "train-run"],
         scene_constraints=["is_training"],
     ),
     "env-setup": WorkerProfile(

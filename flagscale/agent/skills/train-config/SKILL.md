@@ -29,6 +29,45 @@ parameters:
     description: Model size variant (e.g., 0_6b, 7b, 70b)
 requires: [workspace-layout]
 suggests: [topo-detect]
+constraints:
+  - id: train_config_gbs_too_large_for_smoke_test
+    description: "Global batch size must be minimal for smoke tests (1-20 iters). GBS > DP*mbs*8 is wasteful."
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [edit_file, write_file]
+      keywords: [global_batch_size, train_iters]
+    prompt: "For smoke test / environment validation / reproduce configs with train_iters <= 50, global_batch_size should equal DP * micro_batch_size (or at most 8x that). Check if GBS is far larger than DP*mbs."
+    correction: "GBS too large for smoke test — reduce to DP × micro_batch_size (e.g., GBS=4 for DP=4 mbs=1)"
+    max_violations: 2
+  - id: train_config_exp_dir_not_shared_storage
+    description: "exp_dir must use shared storage path (not ./outputs/) when shared storage is available"
+    severity: warning
+    check_phase: pre
+    trigger:
+      tools: [edit_file, write_file]
+      keywords: [exp_dir, output_dir, ./outputs]
+    prompt: "If shared_storage is available and exp_dir starts with './outputs/' or './' (local path), flag it. exp_dir should use the workspace_root from workspace-layout."
+    correction: "exp_dir should use shared storage path, not ./outputs/"
+    max_violations: 2
+
+warnings:
+  - id: smoke_test_reminder
+    description: "Remind to run a smoke test before full training"
+    severity: warning
+    trigger:
+      tools: [write_file, edit_file]
+      keywords: [train_iters, global_batch_size, num_layers]
+    prompt: "Check if this is a new config that hasn't been smoke-tested yet"
+    reminder: "Run a smoke test (train_iters=20) before launching full training."
+    max_reminders: 1
+
+context_injection:
+  always: ["Common Configuration Pitfalls", "Config Validation Before Launch"]
+  by_tool:
+    write_file: ["Two-Level YAML Structure", "Config Generation Template"]
+    edit_file: ["Config Verification Checklist", "Parallelism Strategy"]
+    shell: ["Quick Test vs Real Training"]
 ---
 
 # FlagScale Training Configuration
@@ -53,7 +92,7 @@ experiment:
   seed: 42
   save_steps: 999999
   load: null              # checkpoint path to resume from
-  exp_dir: ./outputs/qwen3_0_6b_train
+  exp_dir: <workspace_root>/experiments/qwen3_0_6b_train
   ckpt_format: torch      # torch or dist (distributed checkpoint)
   task:
     type: train
@@ -65,7 +104,7 @@ experiment:
     rdzv_backend: static
     hostfile: null         # null for single-node, path for multi-node
   cmds:
-    before_start: ulimit -n 1048576 && source /root/miniconda3/bin/activate <env_name>
+    before_start: ulimit -n 1048576
   envs:
     LOGLEVEL: "INFO"
     CUDA_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
@@ -337,14 +376,21 @@ For multi-node training, verify before launching:
 
 Before configuring, determine the user's intent:
 
-**Quick test / environment validation** — goal is to run 1 step as fast as possible:
-- `model.train_iters`: 3-5
+**Quick test / environment validation** — goal is to run 1-20 steps as fast as possible. **CRITICAL: always minimize global_batch_size for smoke tests.** A GBS of 2048 for a 0.6B model on 8 GPUs is severely wasteful — with TP=2 DP=4, set GBS = DP × micro_batch_size = 4 (mbs=1). The GBS = 2048 rule from getting-started.md is for real pretraining, not for environment validation.
+
+**LR MUST be scaled with GBS.** The linear scaling rule: `lr = base_lr × (your_gbs / reference_gbs)`. For smoke tests with minimal GBS:
+- `model.train_iters`: 1-20
 - `model.micro_batch_size`: 1
-- `model.global_batch_size`: smallest valid value (= DP × micro_batch_size)
+- `model.global_batch_size`: smallest valid value (= DP × micro_batch_size), NOT 2048
+- `model.lr`: scale down proportionally: base_lr × (smoke_gbs / reference_gbs). E.g., if reference is lr=1.5e-4 at GBS=2048, and smoke GBS=4, then lr = 1.5e-4 × (4/2048) ≈ 3e-7
+- `model.min_lr`: proportional to lr (typically lr/10)
+- `model.lr_warmup_iters`: 0 (no warmup needed for a few steps)
 - `model.eval_iters`: 0
 - `model.eval_interval`: 999999
 - `system.save_interval`: 999999
 - `model.log_interval`: 1
+
+**Do NOT use the reference config's lr directly with a reduced GBS — this will cause loss spikes or NaN.** Always scale lr with GBS. If unsure, use an even smaller lr (1e-7 range) — it's better to lose slowly than to explode.
 
 **Real training** — use values from the model's reference config or paper:
 - `model.train_iters`: as specified
@@ -471,5 +517,5 @@ if pipeline_model_parallel_size > 1:
 
 - `train-run` — launch training with generated configuration
 - `topo-detect` — detect hardware topology for parallelism planning
-- `model-porter` — port model architecture before configuring training
-- `data-prep` — prepare training data referenced in configuration
+- `train-model-porter` — port model architecture before configuring training
+- `train-data-prep` — prepare training data referenced in configuration
