@@ -261,11 +261,11 @@ class TestTrainingRuntimeGuard:
         g = TrainingRuntimeGuard()
         g._consecutive_train_failures = 2
         g._training_started = True
-        # Fast path handles is_training_command(torchrun)=True
-        # is_kill_command(torchrun) → None (uncertain), goes to LLM
-        # Then is_training_failure and is_zombie_gpu go to LLM
+        # With cheap trigger: torchrun matches _LAUNCH_TRIGGER_RE, so
+        # is_training_command is called. Kill detection skipped (no kill keyword).
+        # Then is_training_failure and is_zombie_gpu are called.
         provider = MockProvider(responses=[
-            '{"real": false, "need_more": null}',  # is_kill_command (not fast-pathed for torchrun)
+            '{"real": true, "need_more": null}',   # is_training_command (torchrun matches trigger)
             '{"real": true, "need_more": null}',   # is_training_failure
             '{"real": false, "need_more": null}',  # is_zombie_gpu
         ])

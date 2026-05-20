@@ -90,8 +90,15 @@ class PromptBuilder:
                 )
                 if focused:
                     skill_bodies.append(focused)
-                else:
+                elif self._turn_count <= 5:
+                    # Full skill content only for first 5 turns
                     skill_bodies.append(content)
+                else:
+                    # After turn 5: compact summary only (critical rules already extracted separately)
+                    # Include just the first 3 lines as a reminder of what the skill is
+                    lines = content.strip().split("\n")
+                    header = "\n".join(lines[:3])
+                    skill_bodies.append(f"{header}\n[... full content omitted after turn 5 to save tokens ...]")
             skill_context = "\n\n".join(skill_bodies)
 
         critical_rules = self._build_critical_rules(active_skill_content)

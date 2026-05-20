@@ -51,10 +51,10 @@ PROFILES: dict[str, WorkerProfile] = {
         skills=["train-reproduce", "train-config", "train-run"],
         scene_constraints=["is_training"],
     ),
-    "env-setup": WorkerProfile(
-        name="env-setup",
+    "train-env-setup": WorkerProfile(
+        name="train-env-setup",
         description="Detect hardware, create environments, install dependencies",
-        skills=["env-setup", "workspace-layout"],
+        skills=["train-env-setup", "workspace-layout"],
         scene_constraints=[],
     ),
     "inference-deploy": WorkerProfile(

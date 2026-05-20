@@ -31,6 +31,7 @@ class PlanGuard(Guard):
         self._complex_task_no_plan: bool = False
         self._pre_plan_tool_calls: int = 0
         self._consecutive_reads: int = 0
+        self._block_count: int = 0  # track repeated blocks for escalation
 
     def mark_complex_task(self):
         """Called externally (by ComplexityJudge) when a task needs a plan."""
@@ -40,6 +41,7 @@ class PlanGuard(Guard):
         """Called externally when a plan is created."""
         self._complex_task_no_plan = False
         self._pre_plan_tool_calls = 0
+        self._block_count = 0
 
     def check_pre(self, ctx: GuardContext) -> GuardVerdict | None:
         if not ctx.tool_name:
@@ -60,6 +62,14 @@ class PlanGuard(Guard):
         # Mode 1: complexity judge fired → hard block at threshold
         if self._complex_task_no_plan:
             if self._pre_plan_tool_calls > self._PLAN_GATE_MAX_EXPLORATORY:
+                self._block_count += 1
+                if self._block_count >= 3:
+                    return GuardVerdict.escalate(
+                        f"[PLAN GATE] Complex task blocked {self._block_count} times "
+                        f"without plan creation. You MUST call plan_create NOW or "
+                        f"ask the user for guidance.",
+                        reason="complex task no plan persistent",
+                    )
                 return GuardVerdict.block(
                     f"[PLAN GATE — TOOL NOT EXECUTED] This task was flagged "
                     f"as complex. You've used {self._pre_plan_tool_calls} exploratory "
@@ -72,6 +82,13 @@ class PlanGuard(Guard):
 
         # Mode 2: independent — soft warn, then hard block
         if self._consecutive_reads >= self._PLAN_GATE_INDEPENDENT_BLOCK:
+            self._block_count += 1
+            if self._block_count >= 3:
+                return GuardVerdict.escalate(
+                    f"[PLAN GATE] Blocked {self._block_count} times without plan creation. "
+                    f"You MUST call plan_create NOW or ask the user for guidance.",
+                    reason="independent plan threshold persistent",
+                )
             return GuardVerdict.block(
                 f"[PLAN GATE — TOOL NOT EXECUTED] You've made "
                 f"{self._consecutive_reads} consecutive exploratory calls "
@@ -96,6 +113,7 @@ class PlanGuard(Guard):
         if ctx.tool_name in ("plan_create",):
             self._complex_task_no_plan = False
             self._pre_plan_tool_calls = 0
+            self._block_count = 0
         return None
 
     def check_plan_staleness(self, task_plan, turn_count: int) -> GuardVerdict | None:

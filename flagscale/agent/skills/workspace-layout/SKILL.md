@@ -1,82 +1,113 @@
 ---
 name: workspace-layout
-description: Standardized workspace directory layout and storage management for FlagScale projects. Covers shared storage detection, fixed paths for models/datasets/experiments/checkpoints/logs/conda envs, experiment isolation (never overwrite), disk space pre-checks, and artifact deduplication via memory.
+description: Standardized workspace directory layout and storage management for FlagScale projects. Covers shared storage
+  detection, fixed paths for models/datasets/experiments/checkpoints/logs/conda envs, experiment isolation (never overwrite),
+  disk space pre-checks, and artifact deduplication via memory.
 keywords:
-  - 下载
-  - 模型
-  - 权重
-  - download
-  - model
-  - weights
-  - checkpoint
-  - 存储
-  - storage
-  - 磁盘
-  - disk
-  - 路径
-  - path
-  - 目录
-  - directory
-  - workspace
-  - 实验
-  - experiment
-  - exp_dir
-  - 数据集
-  - dataset
-  - conda
-  - 环境
-  - huggingface
-  - snapshot_download
+- 下载
+- 模型
+- 权重
+- download
+- model
+- weights
+- checkpoint
+- 存储
+- storage
+- 磁盘
+- disk
+- 路径
+- path
+- 目录
+- directory
+- workspace
+- 实验
+- experiment
+- exp_dir
+- 数据集
+- dataset
+- conda
+- 环境
+- huggingface
+- snapshot_download
 requires: []
 suggests: []
-
 constraints:
-  - id: workspace_layout_install_to_local_not_shared
-    description: "Conda envs, pip packages, models, datasets, and experiments MUST be on shared storage, NOT local paths (/tmp, ~/)"
-    severity: warning
-    check_phase: pre
-    trigger:
-      tools: [shell]
-      keywords: [conda create, conda install, pip install, snapshot_download, wget, mkdir]
-    prompt: "Check if artifacts are being created on local storage instead of shared storage"
-    correction: "Use shared storage path for all persistent artifacts."
-    max_violations: 2
-  - id: no_experiment_overwrite
-    description: "Never overwrite or reuse a previous experiment directory"
-    severity: error
-    check_phase: pre
-    trigger:
-      tools: [shell, write_file]
-      keywords: [rm -rf, rmdir, exp_dir]
-    prompt: "Check if the agent is about to delete or overwrite an existing experiment directory"
-    correction: "Create a new experiment directory with a unique name. Never reuse or delete experiment dirs."
-    max_violations: 0
-
-warnings:
-  - id: disk_space_precheck
-    description: "Check disk space before large downloads or training launches"
-    severity: warning
-    trigger:
-      keywords: [download, snapshot_download, wget, training, launch]
-    prompt: "Check if a disk space check was done before this large operation"
-    reminder: "Run `df -h <target_dir>` before large downloads. Warn if free space < 1.5x estimated size."
-    max_reminders: 2
-  - id: artifact_dedup_check
-    description: "Check memory for existing artifacts before downloading"
-    severity: warning
-    trigger:
-      keywords: [download, snapshot_download, wget, clone]
-    prompt: "Check if memory was consulted for existing artifact paths before downloading"
-    reminder: "Check memory_read for existing paths before downloading. Avoid duplicate downloads."
-    max_reminders: 2
-
+- id: workspace_layout_install_to_local_not_shared
+  description: Conda envs, pip packages, models, datasets, and experiments MUST be on shared storage, NOT local paths (/tmp,
+    ~/)
+  trigger:
+    tools:
+    - shell
+    keywords:
+    - conda create
+    - conda install
+    - pip install
+    - snapshot_download
+    - wget http
+    - mkdir -p /tmp
+  prompt: Check if artifacts are being created on local storage instead of shared storage
+  correction: Use shared storage path for all persistent artifacts.
+- id: no_experiment_overwrite
+  description: Never overwrite or reuse a previous experiment directory
+  trigger:
+    tools:
+    - shell
+    - write_file
+    keywords:
+    - rm -rf
+    - rmdir
+    - exp_dir
+  prompt: Check if the agent is about to delete or overwrite an existing experiment directory
+  correction: Create a new experiment directory with a unique name. Never reuse or delete experiment dirs.
+- id: disk_space_precheck
+  description: Check disk space before large downloads or training launches
+  trigger:
+    keywords:
+    - snapshot_download
+    - wget http
+    - curl http
+    - huggingface download
+    - launch training
+  prompt: Check if a disk space check was done before this large operation
+  correction: Run `df -h <target_dir>` before large downloads. Warn if free space < 1.5x estimated size.
+- id: artifact_dedup_check
+  description: Check memory for existing artifacts before downloading
+  trigger:
+    keywords:
+    - snapshot_download
+    - wget http
+    - curl http
+    - git clone http
+    - huggingface download
+  prompt: Check if memory was consulted for existing artifact paths before downloading
+  correction: Check memory_read for existing paths before downloading. Avoid duplicate downloads.
+- id: workspace_layout_experiment_must_be_training
+  description: workspace_experiment create should only be used for actual training/inference experiments, not for environment setup,
+    data download, or other infrastructure tasks. If created, the experiment MUST be updated (workspace_experiment update) before
+    the task ends.
+  trigger:
+    tools:
+    - workspace_experiment
+    keywords:
+    - create
+  prompt: "SCOPE: workspace_experiment create. CHECK: Is this experiment being created for a non-training purpose (environment setup,
+    conda install, data download, dependency build)? Experiments should only track training/inference runs that produce metrics,
+    not infrastructure preparation. Also: if an experiment was already created earlier in this session, was it properly updated
+    with results before creating a new one?"
+  correction: "Do NOT create workspace_experiment entries for infrastructure tasks (env setup, data prep, dependency install).
+    Only create experiments for actual training/inference runs. If you already created one, you MUST call
+    workspace_experiment update with results before the task ends."
 context_injection:
-  always: ["Standard Directory Layout"]
+  always:
+  - Standard Directory Layout
   by_tool:
-    shell: ["Detect Storage Root", "Disk Space Pre-check", "Artifact Discovery"]
-    write_file: ["Rules for Each Artifact Type"]
+    shell:
+    - Detect Storage Root
+    - Disk Space Pre-check
+    - Artifact Discovery
+    write_file:
+    - Rules for Each Artifact Type
 ---
-
 # Workspace Layout & Storage Management
 
 This skill defines the standard directory layout and storage management rules for all FlagScale projects. Follow these rules whenever creating, downloading, or referencing artifacts (models, datasets, checkpoints, logs, conda envs).

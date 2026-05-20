@@ -56,6 +56,7 @@ class KernelResult:
     iterations: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    elapsed: float = 0.0
     interrupted: bool = False
     final_state: AgentState = AgentState.COMPLETED
     stop_reason: str = ""
@@ -81,8 +82,10 @@ class AgentKernel:
         result = KernelResult()
         d = self.deps
         max_iter = d.config.max_iterations
+        turn_start = time.time()
 
         self._interrupted = False
+        self._plan_auto_continue_count = 0  # Reset per turn to avoid poisoning
         self.fsm.transition(AgentState.EXECUTING, reason="new turn")
         d.judge.reset_turn()
 
@@ -112,11 +115,15 @@ class AgentKernel:
                 ctx = self._build_ctx(tool_name="", tool_args={}, tool_result=None)
                 verdict = d.guard_registry.check_pre(ctx)
                 if verdict is not None:
-                    self._apply_verdict(verdict, pre=True)
+                    blocked = self._apply_verdict(verdict, pre=True)
+                    if blocked:
+                        result.stop_reason = f"blocked_by_guard: {verdict.reason}"
+                        break
 
                 # ── LLM call ──
                 d.display.thinking()
                 messages = d.history.get_messages()
+                self._t0 = time.time()
 
                 try:
                     _call = d.call_llm_fn or (lambda m, s: d.provider.chat_stream(m, s))
@@ -157,6 +164,7 @@ class AgentKernel:
 
                 # ── No tool calls → done ──
                 if not response.get("tool_calls"):
+                    result.iterations = iteration + 1
                     if not self._should_auto_continue_plan():
                         result.stop_reason = "no_tool_calls"
                         break
@@ -179,8 +187,14 @@ class AgentKernel:
                     d.display.interrupted()
                     self._interrupted = True
                     break
+                except Exception as e:
+                    logger.exception("Tool execution failed: %s", e)
+                    # Create error results for all tool calls so the LLM can see what happened
+                    tool_calls = response["tool_calls"]
+                    results = [f"Error executing tool: {e}"] * len(tool_calls)
 
                 # ── Post-guard checks (per tool) ──
+                post_verdicts = []
                 for tc, tool_result in zip(tool_calls, results):
                     ctx = self._build_ctx(
                         tool_name=tc["name"],
@@ -189,13 +203,18 @@ class AgentKernel:
                     )
                     verdict = d.guard_registry.check_post(ctx)
                     if verdict is not None:
-                        self._apply_verdict(verdict, pre=False)
+                        post_verdicts.append(verdict)
 
                 tool_results = [
                     d.format_tool_result_fn(tc["id"], r)
                     for tc, r in zip(tool_calls, results)
                 ]
                 d.append_tool_results_fn(tool_results)
+
+                # Apply post-guard verdicts AFTER tool results are appended,
+                # so inject messages don't break tool_call → tool_result pairing
+                for verdict in post_verdicts:
+                    self._apply_verdict(verdict, pre=False)
 
                 if d.on_tool_results_fn:
                     d.on_tool_results_fn(tool_calls, results)
@@ -207,6 +226,7 @@ class AgentKernel:
 
         result.interrupted = self._interrupted
         result.final_state = self.fsm.current_state
+        result.elapsed = time.time() - turn_start
         if self._interrupted:
             self.fsm.force_transition(AgentState.INTERRUPTED, reason="user interrupt")
         else:
@@ -238,11 +258,13 @@ class AgentKernel:
             classify_fn=d.judge.classify,
         )
 
-    def _apply_verdict(self, verdict: GuardVerdict, pre: bool):
+    def _apply_verdict(self, verdict: GuardVerdict, pre: bool) -> bool:
+        """Apply a guard verdict. Returns True if the verdict is a 'block' action."""
         d = self.deps
         if verdict.action == "block":
             d.inject_message_fn(verdict.message)
             logger.info("Guard %s: %s", verdict.action, verdict.reason)
+            return True
         elif verdict.action == "inject_msg":
             d.inject_message_fn(verdict.message)
         elif verdict.action == "force_compact":
@@ -250,10 +272,15 @@ class AgentKernel:
         elif verdict.action == "escalate":
             d.inject_message_fn(verdict.message)
             self.fsm.transition(AgentState.REVIEWING, reason=verdict.reason)
+        return False
 
     def _recover_context_overflow(self, exc, schemas):
         """Try progressively aggressive compaction on context overflow."""
         d = self.deps
+
+        # Save recovery state to plan before compaction
+        self._save_recovery_state()
+
         d.display.thinking_clear()
         logger.warning("Context overflow, compacting: %s", exc)
         _call = d.call_llm_fn or (lambda m, s: d.provider.chat_stream(m, s))
@@ -270,6 +297,49 @@ class AgentKernel:
                     logger.error("LLM error after compact: %s", e2)
                     return None, {}
         return None, {}
+
+    def _save_recovery_state(self):
+        """Save current progress to plan notes before compaction.
+
+        This ensures the agent can recover its working state after context
+        is compacted, preventing the post-compaction death loop.
+        """
+        d = self.deps
+        task_plan = getattr(d, "task_plan", None)
+        if not task_plan:
+            return
+
+        active = task_plan.get_active()
+        if not active:
+            return
+
+        # Find current "doing" step
+        steps = active.get("steps", [])
+        doing_steps = [s for s in steps if s.get("status") == "doing"]
+        if not doing_steps:
+            return
+
+        step = doing_steps[0]
+        step_id = step.get("id")
+
+        # Build recovery context from recent history
+        recent_msgs = d.history.get_messages()[-6:]  # Last 3 exchanges
+        recovery_lines = []
+        for msg in recent_msgs:
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    for line in content.split("\n"):
+                        if line.strip() and not line.startswith("["):
+                            recovery_lines.append(line.strip()[:200])
+                            break
+
+        if recovery_lines:
+            recovery_note = "RECOVERY: " + " | ".join(recovery_lines[-3:])
+            try:
+                task_plan.update_step(step_id, "doing", recovery_note)
+            except Exception:
+                pass
 
     def _should_auto_continue_plan(self) -> bool:
         """Check if there's an active plan with pending steps."""

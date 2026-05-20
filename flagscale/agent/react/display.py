@@ -215,10 +215,46 @@ def _stop_all_spinners():
         _poll_anim = None
 
 
+# ── Paste display ──────────────────────────────────────────────────────
+
+def pasted_input(text: str):
+    """Display a multi-line pasted input in collapsed form (like Claude Code).
+
+    Shows first line, a "... (N lines)" indicator, and last line.
+    """
+    lines = text.splitlines()
+    if len(lines) <= 3:
+        return  # Short enough, prompt_toolkit already echoed it
+    # Clear the raw echoed lines and re-display collapsed
+    # Move cursor up to overwrite the echoed paste
+    for _ in range(len(lines) - 1):
+        sys.stdout.write("\033[A\033[2K")
+    sys.stdout.flush()
+    first = lines[0][:80]
+    last = lines[-1][:80]
+    _print(f"  {first}")
+    _print(dim(f"  ... ({len(lines)} lines)"))
+    _print(f"  {last}")
+
+
 # ── Banner ──────────────────────────────────────────────────────────────
 
 def banner(provider, model, mode=None, extra_lines=None):
     from flagscale.agent import __version__
+
+    # ASCII logo
+    logo = [
+        "  _____ _             ____            _      ",
+        " |  ___| | __ _  __ _/ ___|  ___ __ _| | ___ ",
+        " | |_  | |/ _` |/ _` \\___ \\ / __/ _` | |/ _ \\",
+        " |  _| | | (_| | (_| |___) | (_| (_| | |  __/",
+        " |_|   |_|\\__,_|\\__, |____/ \\___\\__,_|_|\\___|",
+        "                |___/                         ",
+    ]
+    for line in logo:
+        _print(cyan(line))
+    _print()
+
     title = f"FlagScale Agent v{__version__}"
     mode_str = f" | Mode: {mode}" if mode else ""
     info = f"Provider: {provider} | Model: {model}{mode_str}"

@@ -23,9 +23,11 @@ class ProgressGuard(Guard):
     _STALE_THRESHOLD_NORMAL = 25
     _STALE_THRESHOLD_PORTING = 40
     _STALE_THRESHOLD_DEBUG = 30
+    _STALE_THRESHOLD_WORKER = 8  # Fix 5: Lower threshold for worker mode
     _STALE_EXTRA_FOR_BLOCK = 8
     _READS_HARD_CAP_NORMAL = 60
     _READS_HARD_CAP_PORTING = 80
+    _READS_HARD_CAP_WORKER = 20  # Fix 5: Lower hard cap for worker mode
 
     def __init__(self):
         self._consecutive_reads: int = 0
@@ -33,20 +35,28 @@ class ProgressGuard(Guard):
         self._rereads_without_save: int = 0
         self._read_files: set[str] = set()
         self._progress_triggers: int = 0
+        self._progress_block_count: int = 0  # track repeated blocks for escalation
         # Mode flags (set externally)
         self.is_porting_mode: bool = False
+        self.is_worker_mode: bool = False  # Fix 5: Worker mode flag
         self.consecutive_train_failures: int = 0
 
     def check_post(self, ctx: GuardContext) -> GuardVerdict | None:
         # Reset on productive action (tool that writes)
-        if ctx.tool_effects.is_write or ctx.tool_name in (
-            "shell", "write_file", "edit_file", "memory_write",
+        is_productive = ctx.tool_effects.is_write or ctx.tool_name in (
+            "write_file", "edit_file", "memory_write",
             "plan_create", "plan_update", "workspace_experiment",
-        ):
+        )
+        # Shell: only productive if not read-only
+        if ctx.tool_name == "shell" and not ctx.tool_effects.is_read_only:
+            is_productive = True
+
+        if is_productive:
             self._consecutive_reads = 0
             self._reads_since_last_new_file = 0
             self._rereads_without_save = 0
             self._progress_triggers = 0
+            self._progress_block_count = 0
             return None
 
         # Track read-only calls
@@ -64,7 +74,9 @@ class ProgressGuard(Guard):
 
         # Determine adaptive threshold
         stale_threshold = self._STALE_THRESHOLD_NORMAL
-        if self.is_porting_mode:
+        if self.is_worker_mode:
+            stale_threshold = self._STALE_THRESHOLD_WORKER
+        elif self.is_porting_mode:
             stale_threshold = self._STALE_THRESHOLD_PORTING
         elif self.consecutive_train_failures >= 2:
             stale_threshold = self._STALE_THRESHOLD_DEBUG
@@ -73,6 +85,15 @@ class ProgressGuard(Guard):
         if self._reads_since_last_new_file >= stale_threshold:
             self._progress_triggers += 1
             if self._reads_since_last_new_file >= stale_threshold + self._STALE_EXTRA_FOR_BLOCK:
+                self._progress_block_count += 1
+                if self._progress_block_count >= 3:
+                    return GuardVerdict.escalate(
+                        f"[PROGRESS] Blocked {self._progress_block_count} times — "
+                        f"you've made {self._reads_since_last_new_file} calls without "
+                        f"discovering new files or producing output. "
+                        "STOP and ask the user for guidance.",
+                        reason=f"progress_stall_persistent: {self._reads_since_last_new_file} reads",
+                    )
                 return GuardVerdict.block(
                     f"[PROGRESS BLOCK] You've made {self._reads_since_last_new_file} "
                     f"calls without discovering any new files or producing output. "
@@ -91,7 +112,12 @@ class ProgressGuard(Guard):
                 )
 
         # Pattern 2: Long exploration without checkpoint
-        reads_hard_cap = self._READS_HARD_CAP_PORTING if self.is_porting_mode else self._READS_HARD_CAP_NORMAL
+        if self.is_worker_mode:
+            reads_hard_cap = self._READS_HARD_CAP_WORKER
+        elif self.is_porting_mode:
+            reads_hard_cap = self._READS_HARD_CAP_PORTING
+        else:
+            reads_hard_cap = self._READS_HARD_CAP_NORMAL
         if self._consecutive_reads >= reads_hard_cap and self._progress_triggers <= 1:
             self._progress_triggers += 1
             return GuardVerdict.inject(

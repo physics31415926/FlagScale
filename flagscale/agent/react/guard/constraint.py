@@ -1,6 +1,6 @@
-"""ConstraintGuard — enforces compiled Constraints via Guard lifecycle.
+"""ConstraintGuard — enforces compiled Constraints via pre-exec blocking.
 
-Design (REFACTOR_TRACKER D3):
+Design:
 1. Deterministic trigger: tool_name + keyword match (cheap, no LLM)
 2. Precise judgment: only when triggered, call classify_fn (LLM)
 3. Block behavior: violated constraints return block + correction
@@ -9,9 +9,9 @@ Design (REFACTOR_TRACKER D3):
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from flagscale.agent.react.constraint import Constraint, ConstraintViolation
+from flagscale.agent.react import display
+from flagscale.agent.react.constraint import Constraint
 from flagscale.agent.react.guard import Guard, GuardContext, GuardVerdict
 from flagscale.agent.react.state_machine import AgentState
 
@@ -19,11 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class ConstraintGuard(Guard):
-    """Enforces a set of compiled Constraints.
-
-    Lifecycle:
-    - check_pre: enforces constraints with check_phase="pre"
-    - check_post: enforces constraints with check_phase="post"
+    """Enforces a set of compiled Constraints (pre-exec only).
 
     Trigger strategy:
     - First: deterministic trigger check (ConstraintTrigger.matches)
@@ -38,89 +34,102 @@ class ConstraintGuard(Guard):
     def __init__(self, constraints: list[Constraint] | None = None):
         self._constraints: list[Constraint] = constraints or []
         self._violations: dict[str, int] = {}  # constraint_id -> violation count
+        self._ESCALATE_THRESHOLD = 3  # escalate after 3 blocks on same constraint
 
     def add_constraints(self, constraints: list[Constraint]):
         """Add constraints (e.g., after skill load)."""
         self._constraints.extend(constraints)
 
     def check_pre(self, ctx: GuardContext) -> GuardVerdict | None:
-        """Check pre-phase constraints."""
-        return self._check(ctx, phase="pre")
-
-    def check_post(self, ctx: GuardContext) -> GuardVerdict | None:
-        """Check post-phase constraints."""
-        return self._check(ctx, phase="post")
-
-    def _check(self, ctx: GuardContext, phase: str) -> GuardVerdict | None:
-        """Core enforcement logic.
-
-        1. Filter constraints by check_phase
-        2. For each: deterministic trigger check
-        3. If triggered: LLM precise judgment
-        4. If violated: block (error) or inject (warning)
-        """
+        """Check constraints before tool execution."""
         for constraint in self._constraints:
-            if constraint.check_phase != phase:
-                continue
-
             # Step 1: Deterministic trigger (cheap)
             if not constraint.trigger.matches(ctx.tool_name, ctx.tool_args, ctx.tool_result):
                 continue
 
+            # Display: constraint triggered
+            print(display.dim(
+                f"  🔍 Constraint triggered: [{constraint.id}]"
+            ))
+
             # Step 2: Precise judgment via LLM
-            violated = self._judge_violation(ctx, constraint)
+            violated, reason = self._judge_violation(ctx, constraint)
+
+            # Display: LLM judgment result with reason (indented under trigger)
+            if violated:
+                print(display.yellow(
+                    f"     🚫 Constraint VIOLATED: [{constraint.id}] — {reason}"
+                ))
+            else:
+                print(display.dim(
+                    f"     ✓  Constraint passed: [{constraint.id}] — {reason}"
+                ))
+
             if not violated:
+                # LLM says not violated — reset violation count for this constraint
+                if constraint.id in self._violations:
+                    self._violations[constraint.id] = 0
                 continue
 
-            # Step 3: Record and act
+            # Step 3: Record and block (or escalate if persistent)
             count = self._violations.get(constraint.id, 0) + 1
             self._violations[constraint.id] = count
 
             logger.info(
-                "Constraint violated: %s (count=%d, severity=%s)",
-                constraint.id, count, constraint.severity,
+                "Constraint violated: %s (count=%d) reason=%s",
+                constraint.id, count, reason,
             )
 
-            if constraint.severity == "error":
-                return GuardVerdict.block(
-                    message=constraint.correction,
-                    reason=f"Constraint [{constraint.id}]: {constraint.description}",
+            if count >= self._ESCALATE_THRESHOLD:
+                return GuardVerdict.escalate(
+                    f"[Constraint] PERSISTENT VIOLATION of [{constraint.id}] "
+                    f"({count} times). {constraint.correction}\n"
+                    "You keep violating this constraint. STOP and ask the user for guidance.",
+                    reason=f"Constraint [{constraint.id}] persistent: {reason}",
                 )
-            else:
-                # Warning: inject correction but don't block
-                return GuardVerdict.inject(
-                    message=f"⚠️ {constraint.correction}",
-                    reason=f"Constraint [{constraint.id}]: {constraint.description}",
-                )
+
+            return GuardVerdict.block(
+                message=constraint.correction,
+                reason=f"Constraint [{constraint.id}]: {reason}",
+            )
 
         return None
 
-    def _judge_violation(self, ctx: GuardContext, constraint: Constraint) -> bool:
+    def _judge_violation(self, ctx: GuardContext, constraint: Constraint) -> tuple[bool, str]:
         """Use LLM to precisely judge if a constraint is violated.
 
-        Returns True if violated, False otherwise.
-        Falls back to True (block) if no classify_fn available.
+        Returns (violated: bool, reason: str).
+        Falls back to (True, "") if no classify_fn available.
         """
         if not ctx.classify_fn:
-            # No LLM available — conservative: assume violated
-            return True
+            return (True, "no judge available")
 
         judge_context = {
             "constraint": constraint.description,
             "prompt": constraint.prompt,
             "tool_name": ctx.tool_name,
             "tool_args": str(ctx.tool_args),
+            "tool_result": "(not yet executed — this is a pre-execution check)",
+            "recent_tool_history": "(none)",
         }
         if ctx.tool_result:
             judge_context["tool_result"] = ctx.tool_result[:2000]
+        if ctx.recent_tool_history:
+            history_lines = [
+                f"  {i+1}. [{e['tool']}] {e['args_summary']} → {e['result_summary'][:100]}"
+                for i, e in enumerate(ctx.recent_tool_history)
+            ]
+            judge_context["recent_tool_history"] = "\n".join(history_lines)
 
         try:
             result = ctx.classify_fn("is_constraint_violated", judge_context)
-            return bool(result)
+            if isinstance(result, dict):
+                return (bool(result.get("violated", True)), result.get("reason", ""))
+            # Fallback for legacy bool return
+            return (bool(result), "")
         except Exception as e:
             logger.warning("Constraint judge failed for %s: %s", constraint.id, e)
-            # Conservative: assume violated on error
-            return True
+            return (True, f"judge error: {e}")
 
     @property
     def violations(self) -> dict[str, int]:

@@ -10,30 +10,14 @@ counters on uncertain success checks.
 from __future__ import annotations
 
 from flagscale.agent.react.guard import Guard, GuardContext, GuardVerdict
+from flagscale.agent.react.guard.utils import (
+    get_judge_result as _get_judge_result,
+    SOURCE_LLM as _SOURCE_LLM,
+    SOURCE_CACHE as _SOURCE_CACHE,
+    SOURCE_DEFAULT as _SOURCE_DEFAULT,
+    SOURCE_UNAVAILABLE as _SOURCE_UNAVAILABLE,
+)
 from flagscale.agent.react.state_machine import AgentState
-
-# Source constants — must match judge.py
-_SOURCE_LLM = "llm"
-_SOURCE_CACHE = "cache"
-_SOURCE_DEFAULT = "default"
-_SOURCE_UNAVAILABLE = "unavailable"
-
-
-def _get_judge_result(classify_fn, category: str, context: dict, default=None):
-    """Call classify_fn and return (value, source) tuple."""
-    try:
-        judge = getattr(classify_fn, "__self__", None)
-        if judge and hasattr(judge, "classify_traced"):
-            return judge.classify_traced(category, context, default)
-
-        result = classify_fn(category, context, default=default)
-        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], str) and result[1] in (
-            _SOURCE_LLM, _SOURCE_CACHE, _SOURCE_DEFAULT, _SOURCE_UNAVAILABLE,
-        ):
-            return result
-        return (result, _SOURCE_LLM)
-    except Exception:
-        return (default, _SOURCE_UNAVAILABLE)
 
 
 class SafetyGuard(Guard):
@@ -110,11 +94,12 @@ class SafetyGuard(Guard):
 
         error_trustworthy = error_source in (_SOURCE_LLM, _SOURCE_CACHE)
 
+        # Track memory_write as root-cause documentation (regardless of error status)
+        if ctx.tool_name == "memory_write" and self._consecutive_errors > 0:
+            self._root_cause_recorded_since_error = True
+
         if is_error:
             self._consecutive_errors += 1
-
-            if ctx.tool_name == "memory_write":
-                self._root_cause_recorded_since_error = True
 
             if self._consecutive_errors >= self._ERROR_ESCALATE_HARD:
                 return GuardVerdict.escalate(

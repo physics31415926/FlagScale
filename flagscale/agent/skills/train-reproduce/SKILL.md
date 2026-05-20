@@ -1,64 +1,70 @@
 ---
 name: train-reproduce
-description: Reproduce training results from open-source implementations, papers, or reference codebases. Establishes a verified baseline before migrating to FlagScale. Covers the IMMUTABLE vs ADAPTABLE parameter framework, original artifact reuse, quick baseline validation, per-step logging, and experiment log isolation.
+description: Reproduce training results from open-source implementations, papers, or reference codebases. Establishes a verified
+  baseline before migrating to FlagScale. Covers the IMMUTABLE vs ADAPTABLE parameter framework, original artifact reuse,
+  quick baseline validation, per-step logging, and experiment log isolation.
 keywords:
-  - reproduce
-  - reproduction
-  - baseline
-  - reference
-  - original
-  - paper
-  - 复现
-  - 基线
-  - 原始实现
-  - 对齐基线
+- reproduce
+- reproduction
+- baseline
+- reference
+- original
+- paper
+- 复现
+- 基线
+- 原始实现
+- 对齐基线
 parameters:
-  - name: source_dir
-    description: Directory containing the original implementation source code
-  - name: output_dir
-    description: "Directory for reproduction experiment outputs. Use shared storage for multi-node scenarios."
-requires: [train-precision-alignment]
-suggests: [env-setup, train-data-prep]
-
+- name: source_dir
+  description: Directory containing the original implementation source code
+- name: output_dir
+  description: Directory for reproduction experiment outputs. Use shared storage for multi-node scenarios.
+requires:
+- train-precision-alignment
+suggests:
+- train-env-setup
+- train-data-prep
 constraints:
-  - id: no_modify_immutable_params
-    description: "Never change IMMUTABLE parameters (architecture, optimizer type, LR schedule, loss function) during reproduction"
-    severity: error
-    check_phase: pre
-    trigger:
-      tools: [edit_file, write_file]
-      keywords: [hidden_size, num_layers, num_heads, learning_rate, lr_schedule, loss, optimizer]
-    prompt: "Check if the agent is modifying an IMMUTABLE parameter that defines the experiment identity"
-    correction: "Only ADAPTABLE parameters (num_nodes, batch distribution, logging) may be changed. If an immutable param conflicts, STOP and ask."
-    max_violations: 0
-  - id: use_original_artifacts
-    description: "Always use original tokenizer/config/weights from the official release, never regenerate"
-    severity: warning
-    check_phase: pre
-    trigger:
-      tools: [shell, write_file]
-      keywords: [tokenizer, vocab, sentencepiece, train_tokenizer]
-    prompt: "Check if the agent is regenerating artifacts (tokenizer, vocab) instead of using the official release"
-    correction: "Download the exact tokenizer/config from the original model release. Never regenerate."
-    max_violations: 1
-
-warnings:
-  - id: baseline_before_migration
-    description: "Establish reproduction baseline before migrating to FlagScale"
-    severity: warning
-    trigger:
-      keywords: [migrate, port, flagscale, megatron]
-    prompt: "Check if migration work is starting without a verified reproduction baseline"
-    reminder: "Reproduction baseline must be verified (loss matches reference) before starting migration."
-    max_reminders: 1
-
+- id: no_modify_immutable_params
+  description: Never change IMMUTABLE parameters (architecture, optimizer type, LR schedule, loss function) during reproduction
+  trigger:
+    tools:
+    - edit_file
+    - write_file
+    keywords:
+    - hidden_size
+    - num_layers
+    - num_heads
+    - learning_rate
+    - lr_schedule
+    - loss_function
+    - optimizer_type
+  prompt: Check if the agent is modifying an IMMUTABLE parameter that defines the experiment identity
+  correction: Only ADAPTABLE parameters (num_nodes, batch distribution, logging) may be changed. If an immutable param conflicts,
+    STOP and ask.
+- id: use_original_artifacts
+  description: Always use original tokenizer/config/weights from the official release, never regenerate
+  trigger:
+    tools:
+    - shell
+    - write_file
+    keywords:
+    - train_tokenizer
+    - train tokenizer
+    - sentencepiece_trainer
+    - build vocab
+  prompt: Check if the agent is regenerating artifacts (tokenizer, vocab) instead of using the official release
+  correction: Download the exact tokenizer/config from the original model release. Never regenerate.
 context_injection:
-  always: ["Core Principle: IMMUTABLE vs ADAPTABLE", "Why Reproduction Matters"]
+  always:
+  - 'Core Principle: IMMUTABLE vs ADAPTABLE'
+  - Why Reproduction Matters
   by_tool:
-    shell: ["Quick Baseline Validation"]
-    edit_file: ["Original Artifact Reuse"]
+    shell:
+    - Quick Baseline Validation
+    edit_file:
+    - Original Artifact Reuse
 ---
-
 # Reproduce Training Results
 
 Reproduce training results from open-source implementations to establish a verified baseline. This baseline is the foundation for precision alignment when migrating to FlagScale.
@@ -358,5 +364,5 @@ After successful reproduction:
 
 - `train-model-porter` — port the model to FlagScale after establishing baseline
 - `train-precision-alignment` — align FlagScale implementation against reproduction baseline
-- `env-setup` — set up environment for running the original implementation
+- `train-env-setup` — set up environment for running the original implementation
 - `train-data-prep` — prepare data for reproduction experiments

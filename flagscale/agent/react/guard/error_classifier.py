@@ -1,15 +1,24 @@
-"""ErrorClassifierGuard — classifies tool errors and injects recovery suggestions."""
+"""ErrorClassifierGuard — classifies tool errors and injects recovery suggestions.
+
+Uses two-phase detection:
+1. Cheap trigger: error-like keywords in output
+2. Precise judgment: classify_fn("is_error") to confirm real errors
+"""
 
 from __future__ import annotations
 
+from flagscale.agent.react import display
 from flagscale.agent.react.guard import Guard, GuardContext, GuardVerdict
+from flagscale.agent.react.guard.utils import get_judge_result, is_trusted
 from flagscale.agent.react.state_machine import AgentState
 
 
 class ErrorClassifierGuard(Guard):
     """Classifies errors from tool results and suggests recovery actions.
 
-    Activates in EXECUTING state. Acts as a post-guard.
+    Two-phase detection:
+    1. Cheap trigger: _cheap_error_trigger() scans for error keywords
+    2. LLM confirm: classify_fn("is_error") eliminates false positives
     """
 
     name = "error_classifier"
@@ -88,11 +97,22 @@ class ErrorClassifierGuard(Guard):
         if not ctx.tool_result:
             return None
 
-        category = self._classify(ctx.tool_result)
+        # Only classify errors from shell commands — other tools (load_skill,
+        # read_file, memory_*) may contain "error" in their content without
+        # indicating an execution failure.
+        if ctx.tool_name != "shell":
+            return None
+
+        # Phase 1: Cheap trigger — has error-like keywords?
+        if not self._cheap_error_trigger(ctx.tool_result):
+            self._reset_on_success()
+            return None
+
+        # Phase 2: LLM precise classification
+        category = self._classify_error(ctx)
+
         if category is None:
-            # Successful result resets streak
-            self._error_history.clear()
-            self._last_category = None
+            self._reset_on_success()
             return None
 
         self._error_history.append(category)
@@ -129,18 +149,46 @@ class ErrorClassifierGuard(Guard):
         # Keep error history across turns (session-level tracking)
         pass
 
-    def _classify(self, result: str) -> str | None:
-        """Classify a tool result into an error category, or None if no error."""
-        return self._classify_static(result)
+    def _reset_on_success(self):
+        """Reset error streak on successful result."""
+        self._error_history.clear()
+        self._last_category = None
+
+    def _classify_error(self, ctx: GuardContext) -> str | None:
+        """Classify error using LLM when available, keyword fallback otherwise."""
+        print(display.dim(f"  🔍 [error_classifier] triggered: error keywords in output"))
+
+        if ctx.classify_fn:
+            is_error, source = get_judge_result(
+                ctx.classify_fn, "is_error",
+                {"tool_name": ctx.tool_name,
+                 "command": ctx.tool_args.get("command", ""),
+                 "result": ctx.tool_result[:2000] if ctx.tool_result else ""},
+                default=False
+            )
+            if is_trusted(source) and not is_error:
+                print(display.dim(f"     ✓  [error_classifier] override: not a real error"))
+                return None  # LLM says not an error
+            if is_trusted(source) and is_error:
+                print(display.yellow(f"     ⚠  [error_classifier] confirmed: real error"))
+
+        # Fallback to keyword classification for category
+        return self._classify_static(ctx.tool_result or "")
+
+    @staticmethod
+    def _cheap_error_trigger(result: str) -> bool:
+        """Phase 1: Quick check if result might contain an error."""
+        indicators = ("error", "Error", "ERROR", "failed", "Failed",
+                      "Traceback", "Exception", "denied", "refused")
+        return any(ind in result for ind in indicators)
 
     @staticmethod
     def _classify_static(result: str) -> str | None:
-        """Static classifier — shared with CircuitBreakerGuard."""
-        error_indicators = ["error", "Error", "ERROR", "failed", "Failed",
-                           "Traceback", "Exception", "denied", "refused"]
-        if not any(ind in result for ind in error_indicators):
-            return None
+        """Static keyword classifier — determines error category.
 
+        Used as fallback when LLM confirms error but we need category name.
+        Also used by CircuitBreakerGuard.
+        """
         for category, (patterns, _desc) in ErrorClassifierGuard.ERROR_CATEGORIES.items():
             for pattern in patterns:
                 if pattern in result:
@@ -161,4 +209,4 @@ class ErrorClassifierGuard(Guard):
     @property
     def last_category(self) -> str | None:
         """Last classified error category."""
-        return self._last_category._last_category
+        return self._last_category

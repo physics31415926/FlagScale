@@ -7,7 +7,7 @@ import os
 import time
 
 from flagscale.agent.react.session import (
-    find_resumable_sessions, load_conversation,
+    find_resumable_sessions, load_conversation, mark_completed,
 )
 from flagscale.agent.react.tools.shell import ShellTool
 
@@ -31,11 +31,17 @@ class CommandHandler:
         """Dispatch slash command to appropriate handler.
 
         Args:
-            user_input: Raw user input starting with /
+            user_input: Raw user input starting with / (or bare 'resume')
 
         Returns:
             True if command was handled, False otherwise
         """
+        # Allow bare "resume" or "resume <arg>" without / prefix
+        stripped = user_input.strip()
+        if stripped == "resume" or stripped.startswith("resume "):
+            self._handle_resume("/" + stripped)
+            return True
+
         cmd = user_input.split()[0] if user_input.startswith("/") else None
         if not cmd:
             return False
@@ -203,21 +209,48 @@ class CommandHandler:
         print(f"Unknown /plan subcommand: {' '.join(parts[1:])}")
 
     def _handle_resume(self, user_input: str):
-        """Handle /resume command - resume previous session."""
+        """Handle /resume command - resume previous session.
+
+        Supports:
+          /resume         — list resumable sessions
+          /resume 1       — resume by numeric index
+          /resume f73eb28f — resume by session ID (prefix match)
+        """
         sessions = find_resumable_sessions(self.agent._sessions_root)
         if not sessions:
             print("No resumable sessions found.")
             return
         parts = user_input.split()
-        if len(parts) >= 2 and parts[1].isdigit():
-            idx = int(parts[1]) - 1
-            if 0 <= idx < len(sessions):
-                s = sessions[idx]
-                data = load_conversation(s["session_dir"])
+        if len(parts) >= 2:
+            arg = parts[1]
+            target = None
+            if arg.isdigit():
+                # Match by numeric index
+                idx = int(arg) - 1
+                if 0 <= idx < len(sessions):
+                    target = sessions[idx]
+            else:
+                # Match by session ID prefix
+                for s in sessions:
+                    sid = s.get("session_id", "")
+                    if sid.startswith(arg) or sid[:12].startswith(arg):
+                        target = s
+                        break
+            if target:
+                data = load_conversation(target["session_dir"])
                 if data:
-                    self.agent._restore_session(data)
-                    print(f"Resumed session: {s.get('last_user_msg', '')[:60]}")
+                    self.agent._restore_session(data, target["session_dir"])
+                    sid = target.get("session_id", "?")[:12]
+                    print(f"Resumed session {sid} ({target.get('user_turns', 0)} turns)")
                     return
+                else:
+                    print(f"Failed to load conversation from {target['session_dir']}")
+                    return
+            print(f"No session matching '{arg}' found.")
         for i, s in enumerate(sessions[:10], 1):
-            print(f"  {i}. [{time.strftime('%m-%d %H:%M', time.localtime(s['timestamp']))}] {s.get('last_user_msg', '')[:60]}")
-        print("Usage: /resume <number>")
+            sid = s.get("session_id", "?")[:12]
+            ts = time.strftime("%m-%d %H:%M", time.localtime(s['timestamp']))
+            skills = s.get("loaded_skills", [])
+            skill_str = f" [{','.join(skills[:2])}]" if skills else ""
+            print(f"  {i}. {sid}  {ts}{skill_str}  ({s.get('user_turns', 0)} turns)")
+        print("Usage: /resume <number|session_id>")

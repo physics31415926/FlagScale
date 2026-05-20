@@ -12,35 +12,6 @@ from flagscale.agent.react.judge_fast import FastParser, FastClassifier
 
 
 class TestFastParser:
-    def test_gate_override_found(self):
-        text = "[GATE_OVERRIDE: attention_mapping] Reason: Using custom attention impl"
-        result = FastParser.parse_gate_override(text)
-        assert result == ("attention_mapping", "Using custom attention impl")
-
-    def test_gate_override_not_found(self):
-        text = "No override here, just normal text."
-        assert FastParser.parse_gate_override(text) is None
-
-    def test_gate_override_multiline_reason(self):
-        text = "[GATE_OVERRIDE: tp_split] Reason: The model uses GQA which requires special handling"
-        result = FastParser.parse_gate_override(text)
-        assert result[0] == "tp_split"
-        assert "GQA" in result[1]
-
-    def test_checklist_override_single(self):
-        text = "I'll skip this: [CHECKLIST_OVERRIDE: env_no_pip_system]"
-        result = FastParser.parse_checklist_override(text)
-        assert result == ["env_no_pip_system"]
-
-    def test_checklist_override_multiple(self):
-        text = "[CHECKLIST_OVERRIDE: rule_a] and [CHECKLIST_OVERRIDE: rule_b]"
-        result = FastParser.parse_checklist_override(text)
-        assert result == ["rule_a", "rule_b"]
-
-    def test_checklist_override_none(self):
-        text = "Normal response without overrides."
-        assert FastParser.parse_checklist_override(text) == []
-
     def test_knowledge_confirm_yes(self):
         text = "[PIPELINE_KNOWLEDGE_CONFIRMED: YES]"
         assert FastParser.parse_knowledge_confirm(text) is True

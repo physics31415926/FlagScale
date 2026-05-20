@@ -40,9 +40,22 @@ class TestConstraintTrigger:
         assert t.matches("write_file", {"path": "/tmp/x"}) is False
 
     def test_keyword_filter(self):
+        # OR logic: any one keyword match triggers
         t = ConstraintTrigger(keywords=["rm", "delete"])
-        assert t.matches("shell", {"command": "rm -rf /tmp"}) is True
-        assert t.matches("shell", {"command": "ls -la"}) is False
+        assert t.matches("shell", {"command": "rm -rf /tmp"}) is True   # matches "rm"
+        assert t.matches("shell", {"command": "delete /tmp"}) is True   # matches "delete"
+        assert t.matches("shell", {"command": "ls -la"}) is False       # no match
+
+    def test_keyword_normalization(self):
+        # pip ↔ pip3
+        t1 = ConstraintTrigger(keywords=["pip install"])
+        assert t1.matches("shell", {"command": "pip3 install torch"}) is True
+        # underscore ↔ hyphen
+        t2 = ConstraintTrigger(keywords=["transformer_engine"])
+        assert t2.matches("shell", {"command": "pip install transformer-engine"}) is True
+        # python ↔ python3
+        t3 = ConstraintTrigger(keywords=["python"])
+        assert t3.matches("shell", {"command": "python3 --version"}) is True
 
     def test_keyword_case_insensitive(self):
         t = ConstraintTrigger(keywords=["DELETE"])
@@ -80,22 +93,10 @@ class TestCompileOne:
         assert c.description == "Never delete output dirs"
         assert c.trigger.tool_names == {"shell"}
         assert c.trigger.keywords == ["rm", "rmdir"]
-        assert c.severity == "error"
-        assert c.check_phase == "pre"
 
     def test_missing_description_returns_none(self):
         item = {"tool_names": ["shell"], "keywords": ["rm"]}
         assert _compile_one(item, "test", 0) is None
-
-    def test_invalid_severity_defaults_to_error(self):
-        item = {"description": "test", "severity": "invalid"}
-        c = _compile_one(item, "test", 0)
-        assert c.severity == "error"
-
-    def test_invalid_check_phase_defaults_to_pre(self):
-        item = {"description": "test", "check_phase": "invalid"}
-        c = _compile_one(item, "test", 0)
-        assert c.check_phase == "pre"
 
     def test_empty_tool_names_and_keywords(self):
         item = {"description": "test constraint"}
@@ -117,7 +118,7 @@ class TestExtractConstraints:
             assert category == "extract_constraints"
             return [
                 {"description": "No rm -rf", "tool_names": ["shell"],
-                 "keywords": ["rm"], "severity": "error",
+                 "keywords": ["rm -rf"], "severity": "error",
                  "prompt": "Does this rm?", "correction": "Don't rm.",
                  "check_phase": "pre"},
             ]
@@ -144,7 +145,7 @@ class TestExtractConstraints:
                 {"description": "valid", "tool_names": ["shell"]},
                 "not a dict",
                 {"no_description": True},
-                {"description": "also valid"},
+                {"description": "also valid", "tool_names": ["shell"]},
             ]
 
         result = extract_constraints("content", mock_classify, "test")
@@ -156,7 +157,7 @@ class TestExtractConstraints:
 
 def _make_constraint(
     id="c1", description="test", tool_names=None, keywords=None,
-    severity="error", check_phase="pre", prompt="violated?", correction="fix it",
+    prompt="violated?", correction="fix it", **kwargs
 ):
     return Constraint(
         id=id,
@@ -165,10 +166,8 @@ def _make_constraint(
             tool_names=set(tool_names or []),
             keywords=keywords or [],
         ),
-        severity=severity,
         prompt=prompt,
         correction=correction,
-        check_phase=check_phase,
     )
 
 
@@ -227,31 +226,6 @@ class TestConstraintGuard:
         result = guard.check_pre(ctx)
         assert result is None
         assert len(provider.calls) == 0
-
-    def test_post_phase_constraint(self):
-        """Constraint with check_phase=post fires after tool execution."""
-        provider = MockProvider(responses=['{"real": true, "need_more": null}'])
-        judge = Judge(provider)
-        c = _make_constraint(check_phase="post", tool_names=["shell"],
-                             keywords=["torchrun"])
-        guard = ConstraintGuard(constraints=[c])
-        ctx = _ctx("shell", {"command": "torchrun train.py"},
-                   "Training started", classify_fn=judge.classify)
-        result = guard.check_post(ctx)
-        assert result is not None
-        assert result.action == "block"
-
-    def test_warning_severity_injects(self):
-        """Warning severity → inject_msg instead of block."""
-        provider = MockProvider(responses=['{"real": true, "need_more": null}'])
-        judge = Judge(provider)
-        c = _make_constraint(severity="warning", tool_names=["shell"],
-                             keywords=["pip"])
-        guard = ConstraintGuard(constraints=[c])
-        ctx = _ctx("shell", {"command": "pip install torch"}, classify_fn=judge.classify)
-        result = guard.check_pre(ctx)
-        assert result is not None
-        assert result.action == "inject_msg"
 
     def test_blocks_without_classify_fn(self):
         """No classify_fn → conservative block."""

@@ -1,15 +1,33 @@
 """TrainingRuntimeGuard — monitor enforcement, hang/kill-retry/zombie detection,
 auto-restart strategy, and multi-node health check reminders.
 
-Uses LLM classify() for all command/output analysis — no regex/keyword matching.
+Uses two-phase detection: cheap keyword trigger + LLM classify() for confirmation.
 """
 
 from __future__ import annotations
 
+import re
 import time
 
 from flagscale.agent.react.guard import Guard, GuardContext, GuardVerdict
 from flagscale.agent.react.state_machine import AgentState
+
+
+# Cheap trigger patterns for training launch detection.
+# Only commands matching these get sent to LLM for confirmation.
+# NOTE: serve/inference patterns are NOT here — this guard only manages
+# training lifecycle (monitor enforcement, failure tracking, restart strategy).
+_LAUNCH_TRIGGER_PATTERNS = (
+    r"\btorchrun\b",
+    r"\bpython\s+-m\s+torch\.distributed\b",
+    r"\bdeepspeed\b",
+    r"\bflagscale\s+train\b",
+    r"\bmegatron\b.*\btrain\b",
+    r"\btrain\.py\b",
+    r"\bpretrain\.py\b",
+    r"\bpretrain\s",
+)
+_LAUNCH_TRIGGER_RE = re.compile("|".join(_LAUNCH_TRIGGER_PATTERNS), re.IGNORECASE)
 
 
 # Auto-restart config templates
@@ -88,7 +106,10 @@ class TrainingRuntimeGuard(Guard):
 
             # Allow read-only diagnostic shell commands
             if ctx.tool_name == "shell":
-                cmd = ctx.tool_args.get("command", "")
+                cmd = ctx.tool_args.get("command", "").strip()
+                # Fast-path: common read-only prefixes don't need LLM
+                if self._is_read_only_shell_fast(cmd):
+                    return None
                 classify = ctx.classify_fn
                 if classify and classify("is_read_only_shell", {"command": cmd}, default=True):
                     return None
@@ -193,43 +214,46 @@ class TrainingRuntimeGuard(Guard):
             self._turns_since_last_monitor = 0
             self._turns_since_last_gpu_check = 0
 
-        # Detect training launch (LLM-based)
+        # Detect training launch (two-phase: cheap trigger + LLM confirm)
         if ctx.tool_name == "shell":
             cmd = ctx.tool_args.get("command", "")
-            if classify and classify("is_training_command", {"command": cmd}, default=False):
-                self._training_launch_timestamps.append(time.time())
-                self._awaiting_monitor = True
-                self._training_started = True
-                self._turns_since_last_monitor = 0
-                self._turns_since_last_gpu_check = 0
-                # Extract output_dir
-                output_dir = ctx.tool_args.get("output_dir", "")
-                if not output_dir:
-                    import re as _re
-                    m = _re.search(r'--output[_-]dir\s+(\S+)', cmd, _re.IGNORECASE)
-                    if m:
-                        output_dir = m.group(1).strip('\'"')
-                self._last_launch_output_dir = output_dir
+            # Phase 1: cheap regex trigger — skip LLM call for non-launch commands
+            if _LAUNCH_TRIGGER_RE.search(cmd):
+                # Phase 2: LLM confirmation
+                if classify and classify("is_training_command", {"command": cmd}, default=False):
+                    self._training_launch_timestamps.append(time.time())
+                    self._awaiting_monitor = True
+                    self._training_started = True
+                    self._turns_since_last_monitor = 0
+                    self._turns_since_last_gpu_check = 0
+                    # Extract output_dir
+                    output_dir = ctx.tool_args.get("output_dir", "")
+                    if not output_dir:
+                        m = re.search(r'--output[_-]dir\s+(\S+)', cmd, re.IGNORECASE)
+                        if m:
+                            output_dir = m.group(1).strip('\'"')
+                    self._last_launch_output_dir = output_dir
 
-                # Multi-node health check
-                multi_node_msg = self._check_multi_node_setup(ctx)
-                if multi_node_msg and not self._multi_node_warned:
-                    self._multi_node_warned = True
-                    return GuardVerdict.inject(multi_node_msg, reason="multi-node health check reminder")
+                    # Multi-node health check
+                    multi_node_msg = self._check_multi_node_setup(ctx)
+                    if multi_node_msg and not self._multi_node_warned:
+                        self._multi_node_warned = True
+                        return GuardVerdict.inject(multi_node_msg, reason="multi-node health check reminder")
 
-            # Detect kill commands
-            if classify and classify("is_kill_command", {"command": cmd}, default=False):
-                self._kill_retry_timestamps.append(time.time())
-                cutoff = time.time() - self._KILL_RETRY_WINDOW
-                self._kill_retry_timestamps = [t for t in self._kill_retry_timestamps if t > cutoff]
-                if len(self._kill_retry_timestamps) >= self._KILL_RETRY_MAX:
-                    return GuardVerdict.inject(
-                        "[TrainingRuntime] Kill-retry loop detected — "
-                        f"{len(self._kill_retry_timestamps)} kill commands in "
-                        f"{self._KILL_RETRY_WINDOW}s. "
-                        "Diagnose the root cause before restarting.",
-                        reason="kill-retry loop",
-                    )
+            # Detect kill commands (only if training is active)
+            if self._training_started and re.search(r'\b(kill|pkill|killall)\b', cmd):
+                if classify and classify("is_kill_command", {"command": cmd}, default=False):
+                    self._kill_retry_timestamps.append(time.time())
+                    cutoff = time.time() - self._KILL_RETRY_WINDOW
+                    self._kill_retry_timestamps = [t for t in self._kill_retry_timestamps if t > cutoff]
+                    if len(self._kill_retry_timestamps) >= self._KILL_RETRY_MAX:
+                        return GuardVerdict.inject(
+                            "[TrainingRuntime] Kill-retry loop detected — "
+                            f"{len(self._kill_retry_timestamps)} kill commands in "
+                            f"{self._KILL_RETRY_WINDOW}s. "
+                            "Diagnose the root cause before restarting.",
+                            reason="kill-retry loop",
+                        )
 
         # Track training failures
         if self._training_started and ctx.tool_result and ctx.tool_name == "shell":
@@ -314,6 +338,31 @@ class TrainingRuntimeGuard(Guard):
 
     def reset_turn(self):
         """Heartbeat and multi-node state persist across turns."""
+
+    @staticmethod
+    def _is_read_only_shell_fast(cmd: str) -> bool:
+        """Fast-path check for read-only shell commands (no LLM needed).
+
+        Covers common diagnostic commands that should never be blocked by monitor gate.
+        """
+        cmd_lower = cmd.lower().strip()
+        # Handle piped commands: check the first command in the pipe
+        first_cmd = cmd_lower.split("|")[0].strip()
+        # Handle command chains: check the first command
+        for sep in ("&&", ";"):
+            if sep in first_cmd:
+                first_cmd = first_cmd.split(sep)[0].strip()
+
+        _PREFIXES = (
+            "ls", "find ", "cat ", "head ", "tail ", "grep ", "wc ",
+            "which ", "echo ", "pwd", "env ", "printenv",
+            "nvidia-smi", "nvcc ", "ps ", "pgrep ", "top ",
+            "df ", "du ", "free ", "uname ", "whoami", "hostname", "date",
+            "python --version", "python -c \"import", "python -c 'import",
+            "python3 --version", "python3 -c \"import", "python3 -c 'import",
+            "timeout ", "conda info", "conda list", "pip list", "pip show",
+        )
+        return any(first_cmd.startswith(p) for p in _PREFIXES)
 
     @staticmethod
     def _check_multi_node_setup(ctx: GuardContext) -> str | None:

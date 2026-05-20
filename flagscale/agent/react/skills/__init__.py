@@ -3,7 +3,6 @@
 Enhanced for Phase 5.2 Skill-centric architecture:
 - get_workflow(): extract workflow stages from frontmatter
 - get_constraints(): extract hard constraints for ConstraintGuard
-- get_warnings(): extract soft warnings for WarningGuard
 - get_focused_context(): return only relevant sections by stage/tool
 """
 
@@ -280,40 +279,6 @@ class SkillManager:
                                item.get("id", "unknown"), e)
         return result
 
-    def get_warnings(self, name: str) -> List[Dict]:
-        """Extract warning definitions from skill frontmatter.
-
-        Returns list of warning dicts for WarningGuard.
-        Each dict has: id, description, severity, trigger, prompt, reminder, max_reminders.
-        """
-        meta = self.get_meta(name)
-        raw_warnings = meta.get("warnings")
-        if not raw_warnings or not isinstance(raw_warnings, list):
-            return []
-
-        result = []
-        for item in raw_warnings:
-            if not isinstance(item, dict) or "id" not in item:
-                continue
-            # Normalize trigger format
-            trigger = item.get("trigger", {})
-            if not isinstance(trigger, dict):
-                trigger = {}
-            warning = {
-                "id": item["id"],
-                "description": item.get("description", ""),
-                "severity": item.get("severity", "warning"),
-                "trigger": {
-                    "tools": trigger.get("tools", []),
-                    "keywords": trigger.get("keywords", []),
-                },
-                "prompt": item.get("prompt", ""),
-                "reminder": item.get("reminder", item.get("description", "")),
-                "max_reminders": item.get("max_reminders", 2),
-            }
-            result.append(warning)
-        return result
-
     def get_focused_context(
         self,
         name: str,
@@ -431,10 +396,7 @@ class SkillManager:
             id=item["id"],
             description=item.get("description", ""),
             trigger=trigger,
-            severity=item.get("severity", "error"),
             prompt=item.get("prompt", ""),
             correction=item.get("correction", item.get("reminder", "")),
-            check_phase=item.get("check_phase", item.get("phases", ["pre"])[0] if isinstance(item.get("phases"), list) else "pre"),
-            max_violations=item.get("max_violations", 3),
         )
 

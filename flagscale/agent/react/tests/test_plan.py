@@ -277,3 +277,87 @@ class TestRecordTurnActivity:
         tp.record_turn_activity(7)
         plan = tp.get_active()
         assert plan["steps"][0]["_last_activity_turn"] == 7
+
+
+class TestPlanCreateToolStringSteps:
+    """Regression: LLM sometimes returns steps as a JSON string instead of array."""
+
+    def test_steps_as_json_string(self, tp):
+        from flagscale.agent.react.tools.plan_create import PlanCreateTool
+        tool = PlanCreateTool(tp, session_id="test")
+        result = tool.execute(
+            title="Test plan",
+            steps='["Create conda env", "Install deps", "Run training"]',
+        )
+        assert "Plan created" in result
+        plan = tp.get_active()
+        assert len(plan["steps"]) == 3
+        assert plan["steps"][0]["title"] == "Create conda env"
+        assert plan["steps"][2]["title"] == "Run training"
+
+    def test_steps_as_plain_string(self, tp):
+        from flagscale.agent.react.tools.plan_create import PlanCreateTool
+        tool = PlanCreateTool(tp, session_id="test")
+        result = tool.execute(
+            title="Test plan",
+            steps="Create conda env\nInstall deps\nRun training",
+        )
+        assert "Plan created" in result
+        plan = tp.get_active()
+        assert len(plan["steps"]) == 3
+
+    def test_steps_as_normal_list(self, tp):
+        from flagscale.agent.react.tools.plan_create import PlanCreateTool
+        tool = PlanCreateTool(tp, session_id="test")
+        result = tool.execute(
+            title="Test plan",
+            steps=["Step A", "Step B"],
+        )
+        assert "Plan created" in result
+        plan = tp.get_active()
+        assert len(plan["steps"]) == 2
+        assert plan["steps"][0]["title"] == "Step A"
+
+
+class TestPlanUpdateToolStepIdParsing:
+    """Regression: LLM sometimes passes step_id as 'step_1' instead of 1."""
+
+    def test_integer_step_id(self, tp):
+        from flagscale.agent.react.tools.plan_update import PlanUpdateTool, _parse_step_id
+        tp.create("Test", ["A", "B", "C"])
+        tool = PlanUpdateTool(tp)
+        result = tool.execute(action="step_done", step_id=1)
+        assert "ERROR" not in result
+
+    def test_string_integer_step_id(self, tp):
+        from flagscale.agent.react.tools.plan_update import PlanUpdateTool
+        tp.create("Test", ["A", "B", "C"])
+        tool = PlanUpdateTool(tp)
+        result = tool.execute(action="step_done", step_id="1")
+        assert "ERROR" not in result
+
+    def test_step_underscore_format(self, tp):
+        from flagscale.agent.react.tools.plan_update import PlanUpdateTool
+        tp.create("Test", ["A", "B", "C"])
+        tool = PlanUpdateTool(tp)
+        result = tool.execute(action="step_done", step_id="step_1")
+        assert "ERROR" not in result
+
+    def test_step_space_format(self, tp):
+        from flagscale.agent.react.tools.plan_update import PlanUpdateTool
+        tp.create("Test", ["A", "B", "C"])
+        tool = PlanUpdateTool(tp)
+        result = tool.execute(action="step_doing", step_id="step 2")
+        assert "ERROR" not in result
+
+    def test_hash_format(self, tp):
+        from flagscale.agent.react.tools.plan_update import _parse_step_id
+        assert _parse_step_id("#3") == 3
+
+    def test_none_returns_none(self, tp):
+        from flagscale.agent.react.tools.plan_update import _parse_step_id
+        assert _parse_step_id(None) is None
+
+    def test_garbage_returns_none(self, tp):
+        from flagscale.agent.react.tools.plan_update import _parse_step_id
+        assert _parse_step_id("hello") is None
