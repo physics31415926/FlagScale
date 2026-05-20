@@ -1,114 +1,137 @@
 ---
 name: train-precision-alignment
-description: Systematically align training precision across three scenarios — model migration (native→FlagScale), internal iteration (self-regression), and hardware migration (NVIDIA→new hardware). Progressive 6-level elimination from structure to forward/backward.
+description: Systematically align training precision across three scenarios — model migration (native→FlagScale), internal
+  iteration (self-regression), and hardware migration (NVIDIA→new hardware). Progressive 6-level elimination from structure
+  to forward/backward.
 keywords:
-  - alignment
-  - precision
-  - accuracy
-  - loss
-  - divergence
-  - 精度对齐
-  - 对齐
-  - loss对比
-  - 前向对齐
-  - 反向对齐
-  - 复现
-  - reproduce
-  - cross-framework
-  - cross-hardware
-  - deterministic
-  - spike
-  - gradient
+- alignment
+- precision
+- accuracy
+- loss
+- divergence
+- 精度对齐
+- 对齐
+- loss对比
+- 前向对齐
+- 反向对齐
+- 复现
+- reproduce
+- cross-framework
+- cross-hardware
+- deterministic
+- spike
+- gradient
 parameters:
-  - name: source_framework
-    description: "The reference framework/hardware (ground truth side)"
-  - name: target_framework
-    description: "The framework/hardware being aligned"
-  - name: model_name
-    description: "Model name being aligned"
-  - name: work_dir
-    description: "Working directory for alignment artifacts"
+- name: source_framework
+  description: The reference framework/hardware (ground truth side)
+- name: target_framework
+  description: The framework/hardware being aligned
+- name: model_name
+  description: Model name being aligned
+- name: work_dir
+  description: Working directory for alignment artifacts
 requires: []
-suggests: [train-run, train-monitor]
-
+suggests:
+- train-run
+- train-monitor
 workflow:
   trigger:
-    keywords: [align, alignment, precision, 对齐, 精度]
+    keywords:
+    - align
+    - alignment
+    - precision
+    - 对齐
+    - 精度
     keywords_in_same_input:
-      - [align, loss]
-      - [precision, compare]
-      - [对齐, 精度]
+    - - align
+      - loss
+    - - precision
+      - compare
+    - - 对齐
+      - 精度
   stages:
-    - id: structure
-      name: "Level 1: Structure Check"
-      description: "Compare model structure — param names, shapes, layer count"
-      depends_on: []
-      context_focus: ["Level 1: Model Structure Alignment"]
-    - id: hyperparams
-      name: "Level 2: Hyperparameter Alignment"
-      description: "Verify all hyperparams match between reference and target"
-      depends_on: [structure]
-      context_focus: ["Level 2: Hyperparameter Alignment"]
-    - id: data
-      name: "Level 3: Data Pipeline"
-      description: "Verify identical data feeding — same tokens, same order"
-      depends_on: [hyperparams]
-      context_focus: ["Level 3: Data Pipeline Alignment"]
-    - id: init
-      name: "Level 4: Initialization"
-      description: "Load identical weights, verify tensor equality"
-      depends_on: [data]
-      context_focus: ["Level 4: Weight Initialization Alignment"]
-    - id: loss_curve
-      name: "Level 5: Loss Curve Comparison"
-      description: "Run both, compare loss curves step-by-step"
-      depends_on: [init]
-      context_focus: ["Level 5: Loss/Evaluation Alignment"]
-    - id: forward_backward
-      name: "Level 6: Forward/Backward Debugging"
-      description: "If loss diverges, instrument forward/backward to find divergence point"
-      depends_on: [loss_curve]
-      context_focus: ["Level 6: Forward/Backward Alignment"]
-
+  - id: structure
+    name: 'Level 1: Structure Check'
+    description: Compare model structure — param names, shapes, layer count
+    depends_on: []
+  - id: hyperparams
+    name: 'Level 2: Hyperparameter Alignment'
+    description: Verify all hyperparams match between reference and target
+    depends_on:
+    - structure
+  - id: data
+    name: 'Level 3: Data Pipeline'
+    description: Verify identical data feeding — same tokens, same order
+    depends_on:
+    - hyperparams
+  - id: init
+    name: 'Level 4: Initialization'
+    description: Load identical weights, verify tensor equality
+    depends_on:
+    - data
+  - id: loss_curve
+    name: 'Level 5: Loss Curve Comparison'
+    description: Run both, compare loss curves step-by-step
+    depends_on:
+    - init
+  - id: forward_backward
+    name: 'Level 6: Forward/Backward Debugging'
+    description: If loss diverges, instrument forward/backward to find divergence point
+    depends_on:
+    - loss_curve
 constraints:
-  - id: no_skip_levels
-    description: "Never skip alignment levels — each level eliminates one category of variables"
-    severity: error
-    check_phase: pre
-    trigger:
-      tools: [shell, write_file]
-      keywords: [loss_curve, loss comparison, forward_backward, Level 5, Level 6]
-    prompt: "Check if the agent is skipping alignment levels (e.g. jumping to loss comparison without verifying structure/hyperparams/data/init)"
-    correction: "Complete each level in order. Skipping levels means uncontrolled variables."
-    max_violations: 0
-  - id: one_variable_at_a_time
-    description: "Each alignment experiment changes exactly one thing"
-    severity: warning
-    check_phase: pre
-    trigger:
-      tools: [edit_file, write_file]
-      keywords: [experiment, config, align]
-    prompt: "Check if multiple variables are being changed simultaneously in an alignment experiment"
-    correction: "Change exactly one variable per experiment. Multiple changes make it impossible to identify the cause."
-    max_violations: 1
-
-warnings:
-  - id: align_against_reproduced
-    description: "Align against reproduced baseline, not paper values"
-    severity: warning
-    trigger:
-      keywords: [paper, expected, reported, claimed]
-    prompt: "Check if alignment is being done against paper-reported values instead of a reproduced baseline"
-    reminder: "Align against REPRODUCED baseline, never against 'expected' values from papers."
-    max_reminders: 1
-
+- id: no_skip_levels
+  description: Never skip alignment levels — each level eliminates one category of variables
+  trigger:
+    tools:
+    - shell
+    - write_file
+    keywords:
+    - loss_curve
+    - loss comparison
+    - forward_backward
+    - Level 5
+    - Level 6
+  prompt: Check if the agent is skipping alignment levels (e.g. jumping to loss comparison without verifying structure/hyperparams/data/init)
+  correction: Complete each level in order. Skipping levels means uncontrolled variables.
+- id: one_variable_at_a_time
+  description: Each alignment experiment changes exactly one thing
+  trigger:
+    tools:
+    - edit_file
+    - write_file
+    keywords:
+    - alignment experiment
+    - align config
+    - alignment config
+    - exp00
+  prompt: Check if multiple variables are being changed simultaneously in an alignment experiment
+  correction: Change exactly one variable per experiment. Multiple changes make it impossible to identify the cause.
+- id: align_against_reproduced
+  description: Align against reproduced baseline, not paper values
+  trigger:
+    tools:
+    - shell
+    - write_file
+    - edit_file
+    keywords:
+    - paper reported
+    - paper values
+    - expected loss
+    - reported accuracy
+    - claimed performance
+  prompt: Check if alignment is being done against paper-reported values instead of a reproduced baseline
+  correction: Align against REPRODUCED baseline, never against 'expected' values from papers.
 context_injection:
-  always: ["Three Alignment Scenarios", "Core Principles"]
+  always:
+  - Three Alignment Scenarios
+  - Core Principles
   by_tool:
-    shell: ["Experiment Structure"]
-    edit_file: ["Core Principles"]
+    shell:
+    - Experiment Structure
+    edit_file:
+    - Core Principles
 ---
-
 # Training Precision Alignment
 
 Systematically verify and align training precision. Progressive, level-by-level — each level eliminates one category of variables. Never skip levels.

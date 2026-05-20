@@ -193,6 +193,30 @@ class TestCircuitBreaker:
         assert result is not None
         assert result.action == "block"
 
+    def test_different_category_resets_count(self):
+        """Switching error categories should reset consecutive count for the new one."""
+        guard = CircuitBreakerGuard(trip_threshold=3, cooldown_iters=2)
+        perm_ctx = _make_ctx("Error: Permission denied")
+        net_ctx = _make_ctx("Error: Connection refused")
+
+        # 2 consecutive permission errors
+        guard.check_pre(_make_ctx())
+        guard.check_post(perm_ctx)
+        guard.check_pre(_make_ctx())
+        guard.check_post(perm_ctx)
+        assert guard._error_counts.get("permission") == 2
+
+        # Switch to network error — should reset network count to 1
+        guard.check_pre(_make_ctx())
+        guard.check_post(net_ctx)
+        assert guard._error_counts.get("network") == 1
+
+        # One more network error should be 2, not trip (threshold=3)
+        guard.check_pre(_make_ctx())
+        result = guard.check_post(net_ctx)
+        # Should not trip yet (only 2 consecutive)
+        assert result is None or "TRIPPED" not in (result.message if result else "")
+
 
 # ── BudgetGuard Tests ───────────────────────────────────────────────────────
 
@@ -245,6 +269,21 @@ class TestBudgetGuard:
         result = guard.check_pre(ctx)
         assert result is not None
         assert result.action == "block"
+
+    def test_tool_call_warning_independent_of_token_warning(self):
+        """Tool call warnings fire even if token budget is low (separate flags)."""
+        guard = BudgetGuard(max_tokens=10_000_000, max_tool_calls=10)
+        # Report low token usage — no token warning triggered
+        guard.report_tokens(100, 100)  # 0.002% tokens
+        # Add 8 tool calls to reach 80% tool calls
+        ctx = _make_ctx(tool_name="shell")
+        for _ in range(8):
+            guard.check_post(ctx)
+        # Should warn about tool calls at 80%
+        result = guard.check_pre(ctx)
+        assert result is not None
+        assert result.action == "inject_msg"
+        assert "tool" in result.message.lower() or "Tool" in result.message
 
     def test_usage_summary(self):
         guard = BudgetGuard(max_tokens=1000, max_tool_calls=10)

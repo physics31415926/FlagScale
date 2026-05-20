@@ -1,4 +1,4 @@
-"""FlagScale Agent. Single WorkerAgent with composable Interrupt + Checklist + Judge architecture.
+"""FlagScale Agent. Single WorkerAgent with composable Guard + Judge architecture.
 
 Entry points:
 - run_agent(provider, model, mode) — high-level CLI launcher

@@ -12,7 +12,7 @@ SKILLS_DIR = os.path.join(
 SKILLS_DIR = os.path.normpath(SKILLS_DIR)
 
 EXPECTED_SKILLS = {
-    "env-setup",
+    "train-env-setup",
     "topo-detect",
     "train-model-porter",
     "train-data-prep",

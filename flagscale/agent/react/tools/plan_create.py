@@ -1,5 +1,7 @@
 """Plan create tool — create a structured task plan."""
 
+import json
+
 from flagscale.agent.react.tools.base import Tool, ToolEffect
 
 _EFFECT_PLAN_WRITE = ToolEffect(reads=frozenset({"plan"}), writes=frozenset({"plan"}))
@@ -36,6 +38,23 @@ class PlanCreateTool(Tool):
     def execute(self, **kwargs) -> str:
         title = kwargs["title"]
         steps = kwargs["steps"]
+
+        # Normalize: LLM sometimes returns steps as a JSON-encoded string instead of array
+        if isinstance(steps, str):
+            steps = steps.strip()
+            if steps.startswith("["):
+                try:
+                    steps = json.loads(steps)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            # If still a string (single step or unparseable), wrap in list
+            if isinstance(steps, str):
+                steps = [s.strip() for s in steps.split("\n") if s.strip()]
+
+        if not steps or not isinstance(steps, list):
+            return "ERROR: At least one step is required."
+        # Ensure all items are strings (not nested structures)
+        steps = [str(s) for s in steps if s]
         if not steps:
             return "ERROR: At least one step is required."
         try:

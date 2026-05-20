@@ -1,4 +1,4 @@
-"""Tests for Phase 5.2 SkillManager enhancements and WarningGuard."""
+"""Tests for Phase 5.2 SkillManager enhancements."""
 
 import os
 import tempfile
@@ -6,8 +6,7 @@ import pytest
 
 from flagscale.agent.react.skills import SkillManager
 from flagscale.agent.react.constraint import Constraint, ConstraintTrigger
-from flagscale.agent.react.guard import GuardContext, GuardVerdict
-from flagscale.agent.react.guard.warning import WarningGuard
+from flagscale.agent.react.guard import GuardContext
 from flagscale.agent.react.state_machine import AgentState
 
 
@@ -47,42 +46,31 @@ workflow:
 constraints:
   - id: no_dummy_data
     description: "Never use dummy data"
-    severity: error
-    check_phase: pre
     trigger:
       tools: [write_file, edit_file]
       keywords: [torch.rand, torch.zeros]
     prompt: "Check if code uses dummy data"
     correction: "Use real data from get_batch."
-    max_violations: 0
   - id: read_before_write
     description: "Must read source before writing"
-    severity: warning
-    check_phase: pre
     trigger:
       tools: [write_file]
       keywords: [class, def]
     prompt: "Check if source was read"
     correction: "Read source code first."
-
-warnings:
   - id: frozen_native
     description: "Frozen components need native impl"
-    severity: warning
     trigger:
       keywords: [frozen, freeze, requires_grad=False]
     prompt: "Check if skipping native impl for frozen"
-    reminder: "Frozen != skip native. Use Megatron primitives."
-    max_reminders: 2
+    correction: "Frozen != skip native. Use Megatron primitives."
   - id: parallelism_check
     description: "Check parallelism feasibility"
-    severity: warning
     trigger:
       tools: [write_file, edit_file]
       keywords: [tensor_model_parallel_size, pipeline_model_parallel_size]
     prompt: "Check if parallelism assessment done"
-    reminder: "Complete parallelism feasibility assessment first."
-    max_reminders: 1
+    correction: "Complete parallelism feasibility assessment first."
 
 context_injection:
   always: ["Core Principles"]
@@ -230,15 +218,13 @@ class TestGetWorkflow:
 class TestGetConstraints:
     def test_returns_constraint_objects(self, manager):
         constraints = manager.get_constraints("test-skill")
-        assert len(constraints) == 2
+        assert len(constraints) == 4
         assert all(isinstance(c, Constraint) for c in constraints)
 
     def test_constraint_fields_correct(self, manager):
         constraints = manager.get_constraints("test-skill")
         c = constraints[0]
         assert c.id == "no_dummy_data"
-        assert c.severity == "error"
-        assert c.check_phase == "pre"
         assert c.correction == "Use real data from get_batch."
         assert "torch.rand" in c.trigger.keywords
 
@@ -257,33 +243,6 @@ class TestGetConstraints:
         assert len(constraints) == 1
         assert constraints[0].id == "no_system_python"
         assert "shell" in constraints[0].trigger.tool_names
-
-
-# ── SkillManager.get_warnings ─────────────────────────────────────────────
-
-
-class TestGetWarnings:
-    def test_returns_warning_dicts(self, manager):
-        warnings = manager.get_warnings("test-skill")
-        assert len(warnings) == 2
-
-    def test_warning_fields_correct(self, manager):
-        warnings = manager.get_warnings("test-skill")
-        w = warnings[0]
-        assert w["id"] == "frozen_native"
-        assert w["max_reminders"] == 2
-        assert "frozen" in w["trigger"]["keywords"]
-        assert w["reminder"] == "Frozen != skip native. Use Megatron primitives."
-
-    def test_warning_with_tools(self, manager):
-        warnings = manager.get_warnings("test-skill")
-        w = warnings[1]
-        assert "write_file" in w["trigger"]["tools"]
-        assert w["max_reminders"] == 1
-
-    def test_returns_empty_when_no_warnings(self, manager):
-        warnings = manager.get_warnings("minimal-skill")
-        assert warnings == []
 
 
 # ── SkillManager.get_focused_context ──────────────────────────────────────
@@ -366,154 +325,6 @@ class TestExtractSections:
         result = SkillManager._extract_sections(body, {"Deep Section"})
         assert "Deep content" in result
         assert "Other content" not in result
-
-
-# ── WarningGuard ──────────────────────────────────────────────────────────
-
-
-class TestWarningGuard:
-    def _make_ctx(self, tool_name="write_file", tool_args=None,
-                  tool_result=None, classify_fn=None):
-        return GuardContext(
-            tool_name=tool_name,
-            tool_args=tool_args or {},
-            tool_result=tool_result,
-            current_state=AgentState.EXECUTING,
-            classify_fn=classify_fn,
-        )
-
-    def test_triggered_injects_message(self):
-        warnings = [{
-            "id": "test_warn",
-            "description": "Test warning",
-            "trigger": {"tools": [], "keywords": ["frozen"]},
-            "prompt": "",
-            "reminder": "Don't skip native impl!",
-            "max_reminders": 2,
-        }]
-        guard = WarningGuard(warnings)
-        ctx = self._make_ctx(tool_args={"content": "frozen module"})
-        verdict = guard.check_pre(ctx)
-        assert verdict is not None
-        assert verdict.action == "inject_msg"
-        assert "Don't skip native impl!" in verdict.message
-
-    def test_not_triggered_allows(self):
-        warnings = [{
-            "id": "test_warn",
-            "description": "Test",
-            "trigger": {"tools": [], "keywords": ["frozen"]},
-            "prompt": "",
-            "reminder": "Reminder",
-            "max_reminders": 2,
-        }]
-        guard = WarningGuard(warnings)
-        ctx = self._make_ctx(tool_args={"content": "normal code"})
-        verdict = guard.check_pre(ctx)
-        assert verdict is None
-
-    def test_tool_filter(self):
-        warnings = [{
-            "id": "test_warn",
-            "description": "Test",
-            "trigger": {"tools": ["write_file"], "keywords": ["frozen"]},
-            "prompt": "",
-            "reminder": "Reminder",
-            "max_reminders": 2,
-        }]
-        guard = WarningGuard(warnings)
-        # Wrong tool
-        ctx = self._make_ctx(tool_name="shell", tool_args={"cmd": "frozen"})
-        assert guard.check_pre(ctx) is None
-        # Right tool
-        ctx = self._make_ctx(tool_name="write_file", tool_args={"content": "frozen"})
-        assert guard.check_pre(ctx) is not None
-
-    def test_max_reminders_respected(self):
-        warnings = [{
-            "id": "test_warn",
-            "description": "Test",
-            "trigger": {"tools": [], "keywords": ["frozen"]},
-            "prompt": "",
-            "reminder": "Reminder",
-            "max_reminders": 1,
-        }]
-        guard = WarningGuard(warnings)
-        ctx = self._make_ctx(tool_args={"content": "frozen"})
-        # First time: triggers
-        assert guard.check_pre(ctx) is not None
-        # Second time: max reached
-        assert guard.check_pre(ctx) is None
-
-    def test_classify_fn_false_skips(self):
-        warnings = [{
-            "id": "test_warn",
-            "description": "Test",
-            "trigger": {"tools": [], "keywords": ["frozen"]},
-            "prompt": "Check something",
-            "reminder": "Reminder",
-            "max_reminders": 2,
-        }]
-        guard = WarningGuard(warnings)
-        ctx = self._make_ctx(
-            tool_args={"content": "frozen"},
-            classify_fn=lambda cat, context: False,
-        )
-        verdict = guard.check_pre(ctx)
-        assert verdict is None
-
-    def test_classify_fn_true_triggers(self):
-        warnings = [{
-            "id": "test_warn",
-            "description": "Test",
-            "trigger": {"tools": [], "keywords": ["frozen"]},
-            "prompt": "Check something",
-            "reminder": "Reminder",
-            "max_reminders": 2,
-        }]
-        guard = WarningGuard(warnings)
-        ctx = self._make_ctx(
-            tool_args={"content": "frozen"},
-            classify_fn=lambda cat, context: True,
-        )
-        verdict = guard.check_pre(ctx)
-        assert verdict is not None
-        assert verdict.action == "inject_msg"
-
-    def test_no_trigger_conditions_does_not_fire(self):
-        warnings = [{
-            "id": "test_warn",
-            "description": "Test",
-            "trigger": {"tools": [], "keywords": []},
-            "prompt": "",
-            "reminder": "Reminder",
-            "max_reminders": 2,
-        }]
-        guard = WarningGuard(warnings)
-        ctx = self._make_ctx(tool_args={"content": "anything"})
-        assert guard.check_pre(ctx) is None
-
-    def test_add_warnings(self):
-        guard = WarningGuard([])
-        assert len(guard.warnings) == 0
-        guard.add_warnings([{"id": "w1", "description": "W1",
-                             "trigger": {"tools": [], "keywords": ["x"]},
-                             "prompt": "", "reminder": "R", "max_reminders": 1}])
-        assert len(guard.warnings) == 1
-
-    def test_multiple_warnings_first_match_wins(self):
-        warnings = [
-            {"id": "w1", "description": "W1",
-             "trigger": {"tools": [], "keywords": ["frozen"]},
-             "prompt": "", "reminder": "First!", "max_reminders": 2},
-            {"id": "w2", "description": "W2",
-             "trigger": {"tools": [], "keywords": ["frozen"]},
-             "prompt": "", "reminder": "Second!", "max_reminders": 2},
-        ]
-        guard = WarningGuard(warnings)
-        ctx = self._make_ctx(tool_args={"content": "frozen"})
-        verdict = guard.check_pre(ctx)
-        assert "First!" in verdict.message
 
 
 # ── Orchestrator Skill Workflow Integration ────────────────────────────────
@@ -613,7 +424,6 @@ class TestAgentSkillGuards:
         """_register_skill_guards adds frontmatter constraints to ConstraintGuard."""
         from unittest.mock import MagicMock, patch
         from flagscale.agent.react.guard.constraint import ConstraintGuard
-        from flagscale.agent.react.guard.warning import WarningGuard
         from flagscale.agent.react.guard import GuardRegistry
 
         sm = SkillManager(dirs=[str(skill_dir)])
@@ -622,22 +432,13 @@ class TestAgentSkillGuards:
         # We'll test the SkillManager + ConstraintGuard integration directly
         constraint_guard = ConstraintGuard()
         constraints = sm.get_constraints("test-skill")
-        assert len(constraints) == 2
+        assert len(constraints) == 4
         constraint_guard.add_constraints(constraints)
-        assert len(constraint_guard.constraints) == 2
+        assert len(constraint_guard.constraints) == 4
         assert constraint_guard.constraints[0].id == "no_dummy_data"
         assert constraint_guard.constraints[1].id == "read_before_write"
-
-    def test_register_skill_guards_adds_warnings(self, skill_dir):
-        """_register_skill_guards adds frontmatter warnings to WarningGuard."""
-        sm = SkillManager(dirs=[str(skill_dir)])
-
-        warnings = sm.get_warnings("test-skill")
-        assert len(warnings) == 2
-        warning_guard = WarningGuard(warnings=warnings)
-        assert len(warning_guard.warnings) == 2
-        assert warning_guard.warnings[0]["id"] == "frozen_native"
-        assert warning_guard.warnings[1]["id"] == "parallelism_check"
+        assert constraint_guard.constraints[2].id == "frozen_native"
+        assert constraint_guard.constraints[3].id == "parallelism_check"
 
     def test_constraint_guard_blocks_on_violation(self, skill_dir):
         """ConstraintGuard blocks when a frontmatter constraint is violated."""
@@ -659,35 +460,15 @@ class TestAgentSkillGuards:
         assert verdict.action == "block"
         assert "no_dummy_data" in verdict.reason
 
-    def test_warning_guard_injects_on_trigger(self, skill_dir):
-        """WarningGuard injects message when a frontmatter warning is triggered."""
-        sm = SkillManager(dirs=[str(skill_dir)])
-        warnings = sm.get_warnings("test-skill")
-        guard = WarningGuard(warnings=warnings)
-
-        # Simulate a tool call that triggers the warning
-        ctx = GuardContext(
-            tool_name="write_file",
-            tool_args={"path": "model.py", "content": "layer.requires_grad=False  # frozen"},
-            current_state=AgentState.EXECUTING,
-            classify_fn=lambda cat, ctx: True,  # Always triggered
-        )
-        verdict = guard.check_pre(ctx)
-        assert verdict is not None
-        assert verdict.action == "inject_msg"
-        assert "frozen" in verdict.message.lower() or "frozen_native" in verdict.reason.lower()
-
     def test_no_constraints_no_error(self, tmp_path):
-        """Skills without constraints/warnings don't cause errors."""
+        """Skills without constraints don't cause errors."""
         skill_path = tmp_path / "minimal-skill"
         skill_path.mkdir()
         (skill_path / "SKILL.md").write_text(SKILL_MINIMAL)
 
         sm = SkillManager(dirs=[str(tmp_path)])
         constraints = sm.get_constraints("minimal-skill")
-        warnings = sm.get_warnings("minimal-skill")
         assert constraints == []
-        assert warnings == []
 
     def test_idempotent_registration(self, skill_dir):
         """Calling _register_skill_guards twice doesn't duplicate constraints."""
@@ -709,36 +490,27 @@ class TestAgentSkillGuards:
 
         register_once("test-skill")
         register_once("test-skill")  # Should be no-op
-        assert len(constraint_guard.constraints) == 2  # Not 4
+        assert len(constraint_guard.constraints) == 4  # Not 8
 
     def test_guard_registry_integration(self, skill_dir):
-        """ConstraintGuard and WarningGuard work together in GuardRegistry."""
+        """ConstraintGuard works in GuardRegistry."""
         from flagscale.agent.react.guard import GuardRegistry
         from flagscale.agent.react.guard.constraint import ConstraintGuard
 
         sm = SkillManager(dirs=[str(skill_dir)])
 
-        # Verify constraints and warnings are loaded
+        # Verify constraints are loaded
         constraints = sm.get_constraints("test-skill")
-        warnings = sm.get_warnings("test-skill")
-        assert len(constraints) == 2
-        assert len(warnings) == 2
+        assert len(constraints) == 4
 
-        # Create registry and register guards
+        # Create registry and register guard
         registry = GuardRegistry()
         constraint_guard = ConstraintGuard(constraints=constraints)
-        warning_guard = WarningGuard(warnings=warnings)
         registry.register(constraint_guard)
-        registry.register(warning_guard)
 
-        # Verify guards are registered with correct priorities
+        # Verify guard is registered
         constraint_found = any(g.name == "constraint" for g in registry.guards)
-        warning_found = any(g.name == "warning" for g in registry.guards)
         assert constraint_found
-        assert warning_found
-
-        # Verify ConstraintGuard has lower priority (fires first)
-        assert constraint_guard.priority < warning_guard.priority
 
         # Test that constraint guard can block (test in isolation to avoid pollution)
         ctx = GuardContext(

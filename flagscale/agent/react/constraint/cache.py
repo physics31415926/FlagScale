@@ -19,7 +19,7 @@ from flagscale.agent.react import display
 logger = logging.getLogger(__name__)
 
 # Bump this when constraint extraction format changes
-_CACHE_VERSION = 2
+_CACHE_VERSION = 4
 
 
 class ConstraintCache:
@@ -90,33 +90,34 @@ class ConstraintCache:
         if skill_name in self._memory:
             return self._memory[skill_name]
 
-        # Check disk cache
-        disk_cache = self._load_disk_cache()
-        content_hash = hashlib.md5(skill_content.encode()).hexdigest()[:16]
-        if skill_name in disk_cache:
-            entry = disk_cache[skill_name]
-            if entry.get("content_hash") == content_hash and entry.get("items"):
-                self._memory[skill_name] = entry["items"]
-                print(display.dim(
-                    f"  📋 [{skill_name}] {len(entry['items'])} constraints (from cache)"
-                ))
-                logger.info(
-                    "Loaded %d cached constraints for skill '%s'",
-                    len(entry["items"]), skill_name,
-                )
-                return entry["items"]
-
-        # Extract with lock
+        # Check disk cache (read under lock to avoid race with concurrent writers)
         with self._lock:
-            return self._extract_locked(
-                skill_name, skill_content, disk_cache, content_hash, extract_fn
-            )
+            disk_cache = self._load_disk_cache()
+            content_hash = hashlib.md5(skill_content.encode()).hexdigest()[:16]
+            if skill_name in disk_cache:
+                entry = disk_cache[skill_name]
+                if entry.get("content_hash") == content_hash and entry.get("items"):
+                    self._memory[skill_name] = entry["items"]
+                    print(display.dim(
+                        f"  📋 [{skill_name}] {len(entry['items'])} constraints (from cache)"
+                    ))
+                    logger.info(
+                        "Loaded %d cached constraints for skill '%s'",
+                        len(entry["items"]), skill_name,
+                    )
+                    return entry["items"]
 
-    def _extract_locked(self, skill_name: str, skill_content: str,
-                        disk_cache: dict, content_hash: str,
-                        extract_fn) -> list[dict]:
-        """Thread-safe extraction with double-check pattern."""
-        # Double-check in case another thread just finished
+        # Extract outside lock (LLM call is slow), then save under lock
+        return self._extract_and_save(skill_name, skill_content, content_hash, extract_fn)
+
+    def _extract_and_save(self, skill_name: str, skill_content: str,
+                          content_hash: str, extract_fn) -> list[dict]:
+        """Extract constraints via LLM, then save under lock.
+
+        Re-reads disk cache under lock before writing to avoid overwriting
+        concurrent writes from other threads.
+        """
+        # Double-check memory (another thread may have finished first)
         if skill_name in self._memory:
             return self._memory[skill_name]
 
@@ -134,8 +135,11 @@ class ConstraintCache:
                     items.append(c)
             if items:
                 self._memory[skill_name] = items
-                disk_cache[skill_name] = {"content_hash": content_hash, "items": items}
-                self._save_disk_cache(disk_cache)
+                # Re-read disk under lock to merge with concurrent writes
+                with self._lock:
+                    disk_cache = self._load_disk_cache()
+                    disk_cache[skill_name] = {"content_hash": content_hash, "items": items}
+                    self._save_disk_cache(disk_cache)
                 constraint_list = ", ".join(c["id"] for c in items)
                 print(display.green(
                     f"  📋 [{skill_name}] {len(items)} constraints: {constraint_list}"

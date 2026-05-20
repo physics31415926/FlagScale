@@ -1,10 +1,15 @@
-"""CircuitBreakerGuard — prevents infinite retries by tripping on repeated errors."""
+"""CircuitBreakerGuard — prevents infinite retries by tripping on repeated errors.
+
+Uses two-phase detection via ErrorClassifierGuard's shared utilities:
+1. Cheap trigger: error keywords in output
+2. Precise judgment: classify_fn("is_error") to confirm real errors
+"""
 
 from __future__ import annotations
 
-import time
-
+from flagscale.agent.react import display
 from flagscale.agent.react.guard import Guard, GuardContext, GuardVerdict
+from flagscale.agent.react.guard.utils import get_judge_result, is_trusted
 from flagscale.agent.react.state_machine import AgentState
 
 
@@ -13,6 +18,10 @@ class CircuitBreakerGuard(Guard):
 
     States: closed (normal) → open (tripped) → half_open (probe) → closed/open.
     Activates in EXECUTING state with highest priority.
+
+    Two-phase detection:
+    1. Cheap trigger: ErrorClassifierGuard._cheap_error_trigger()
+    2. LLM confirm: classify_fn("is_error") eliminates false positives
     """
 
     name = "circuit_breaker"
@@ -37,6 +46,7 @@ class CircuitBreakerGuard(Guard):
         self._trip_iteration: dict[str, int] = {}  # category → iteration when tripped
         self._current_iteration: int = 0
         self._last_error_category: str | None = None
+        self._open_block_count: dict[str, int] = {}  # category → blocks while open
 
     def check_pre(self, ctx: GuardContext) -> GuardVerdict | None:
         # Skip pre-iteration check (no specific tool being attempted)
@@ -54,9 +64,19 @@ class CircuitBreakerGuard(Guard):
                 if elapsed > self._cooldown_iters:
                     # Transition to half-open: allow one probe
                     self._circuit_state[category] = self.HALF_OPEN
+                    self._open_block_count[category] = 0  # reset block count on state change
                     return None
                 else:
+                    self._open_block_count[category] = self._open_block_count.get(category, 0) + 1
                     remaining = self._cooldown_iters - elapsed + 1
+                    # Escalate if agent keeps hitting the open circuit
+                    if self._open_block_count.get(category, 0) >= 3:
+                        return GuardVerdict.escalate(
+                            f"[CircuitBreaker] Circuit for '{category}' is OPEN and agent "
+                            f"keeps attempting blocked operations. "
+                            f"Change your approach or ask the user for guidance.",
+                            reason=f"circuit_open_persistent_{category}",
+                        )
                     return GuardVerdict.block(
                         f"[CircuitBreaker] Tripped for '{category}' errors "
                         f"({self._error_counts.get(category, 0)} consecutive failures). "
@@ -71,38 +91,35 @@ class CircuitBreakerGuard(Guard):
         if not ctx.tool_result:
             return None
 
-        category = self._classify_error(ctx.tool_result)
+        category = self._classify_error(ctx.tool_result, ctx.classify_fn)
 
         if category is None:
-            # Success — close any half-open circuits
-            for cat in list(self._circuit_state.keys()):
-                if self._circuit_state[cat] == self.HALF_OPEN:
+            # Success: close any half-open circuits
+            for cat, state in list(self._circuit_state.items()):
+                if state == self.HALF_OPEN:
                     self._circuit_state[cat] = self.CLOSED
                     self._error_counts[cat] = 0
             self._last_error_category = None
-            # Reset counts on success
-            self._error_counts.clear()
             return None
 
-        # Error detected
+        # Error detected — track it
+        if category == self._last_error_category:
+            self._error_counts[category] = self._error_counts.get(category, 0) + 1
+        else:
+            # Different category from last error — reset this category's count
+            self._error_counts[category] = 1
+
         self._last_error_category = category
 
-        # If half-open and error recurs, re-trip
+        # Half-open probe failed → re-trip
         if self._circuit_state.get(category) == self.HALF_OPEN:
             self._circuit_state[category] = self.OPEN
             self._trip_iteration[category] = self._current_iteration
             return GuardVerdict.inject(
-                f"[CircuitBreaker] Half-open probe failed for '{category}'. "
-                f"Circuit re-tripped. The same approach keeps failing.",
+                f"[CircuitBreaker] Probe FAILED for '{category}' — re-tripped circuit. "
+                f"The issue persists. Try a fundamentally different approach.",
                 reason=f"circuit_retrip_{category}",
             )
-
-        # Increment consecutive count
-        if category == self._last_error_category or not self._error_counts.get(category):
-            self._error_counts[category] = self._error_counts.get(category, 0) + 1
-        else:
-            # Different category — reset this one
-            self._error_counts[category] = 1
 
         # Check if threshold reached
         if self._error_counts.get(category, 0) >= self._trip_threshold:
@@ -122,9 +139,29 @@ class CircuitBreakerGuard(Guard):
         # Keep circuit state across turns (session-level)
         pass
 
-    def _classify_error(self, result: str) -> str | None:
-        """Classify error — delegates to shared classifier."""
+    def _classify_error(self, result: str, classify_fn=None) -> str | None:
+        """Classify error — use LLM when available, keyword fallback otherwise.
+
+        Two-phase:
+        1. Cheap trigger: check for error keywords
+        2. LLM confirm: classify_fn("is_error") to verify
+        """
         from flagscale.agent.react.guard.error_classifier import ErrorClassifierGuard
+
+        # Phase 1: Quick check — does it even look like an error?
+        if not ErrorClassifierGuard._cheap_error_trigger(result):
+            return None
+
+        # Phase 2: Use LLM if available
+        if classify_fn:
+            is_error, source = get_judge_result(
+                classify_fn, "is_error",
+                {"result": result[:2000]}, default=False
+            )
+            if is_trusted(source) and not is_error:
+                return None  # LLM says not an error
+
+        # Fallback to keyword for category name
         return ErrorClassifierGuard._classify_static(result)
 
     @property

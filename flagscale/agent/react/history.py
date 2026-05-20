@@ -304,6 +304,7 @@ class HistoryManager:
         self._compaction_anchors: List[str] = []
         self._compaction_happened = False
         self._compaction_count = 0
+        self._plan_summary_fn: Optional[Callable[[], str]] = None
 
     def set_summarizer(self, callback: Callable[[str], str]):
         """Inject LLM summarization callback. Signature: (text) -> summary_string."""
@@ -316,6 +317,15 @@ class HistoryManager:
         Called during full compaction to decide which messages to drop first.
         """
         self._scorer = callback
+
+    def set_plan_summary_fn(self, callback: Callable[[], str]):
+        """Inject a callback that returns the current plan state as a string.
+
+        Called during compaction to include plan context in the summary so the
+        agent can recover its working state after context is dropped.
+        Signature: () -> str
+        """
+        self._plan_summary_fn = callback
 
     def set_compaction_anchors(self, anchors: List[str]):
         """Set anchors that MUST be preserved in the next compaction summary."""
@@ -429,6 +439,16 @@ class HistoryManager:
             to_drop, to_keep = _collect_droppable(result, local_target, scorer=self._scorer)
             if to_drop and self._summarizer:
                 summary_text = self._build_summary_input(to_drop, self._compaction_anchors)
+                # Append plan state so the agent can recover after compaction
+                if self._plan_summary_fn:
+                    try:
+                        plan_ctx = self._plan_summary_fn()
+                        if plan_ctx:
+                            summary_text += (
+                                f"\n\n## PLAN STATE (MUST PRESERVE IN SUMMARY):\n{plan_ctx}"
+                            )
+                    except Exception:
+                        pass
                 self._compaction_anchors = []
                 try:
                     new_summary = self._summarizer(summary_text)
@@ -452,6 +472,11 @@ class HistoryManager:
     def append(self, message: Dict[str, Any]):
         self._messages.append(message)
         self._full_log.append(message)
+        # Cap _full_log to prevent unbounded memory growth in long sessions
+        _FULL_LOG_MAX = 2000
+        if len(self._full_log) > _FULL_LOG_MAX:
+            # Keep the most recent messages; drop oldest
+            self._full_log = self._full_log[-_FULL_LOG_MAX:]
 
     def set_system_prompt(self, content: str):
         """Replace or prepend the system message."""
@@ -744,9 +769,9 @@ class HistoryManager:
         self._last_compacted_to = None
         self._compaction_happened = False
 
-        # Pressure-gated aging: only truncate old tool results when approaching budget
+        # Pressure-gated aging: truncate old tool results earlier to prevent token bloat
         pressure = total / self.max_context_tokens if self.max_context_tokens > 0 else 0
-        if pressure > 0.50:
+        if pressure > 0.35:
             self._messages = _age_tool_results(self._messages, keep_recent=AGING_WINDOW)
             estimated = sum(_message_tokens(m) for m in self._messages)
             predicted = max(int(estimated * inflation), actual)
@@ -856,7 +881,16 @@ class HistoryManager:
             merged = f"{self._accumulated_summary}\n\n---\n\n{new_summary}"
         else:
             merged = new_summary
+        _max_merge_iters = 20  # Safety cap to prevent infinite loop
+        _merge_iter = 0
         while _estimate_tokens(merged) > dynamic_limit and "\n\n---\n\n" in merged:
+            _merge_iter += 1
+            if _merge_iter > _max_merge_iters:
+                logger.warning("_merge_summary hit iteration cap (%d), forcing truncation", _max_merge_iters)
+                # Keep only the most recent section
+                sections = merged.split("\n\n---\n\n")
+                merged = sections[-1]
+                break
             # Fuse the two oldest sections instead of dropping
             sections = merged.split("\n\n---\n\n")
             if len(sections) <= 2:
@@ -1016,8 +1050,30 @@ def _merge_user_messages(msg1: Dict[str, Any], msg2: Dict[str, Any]) -> Dict[str
 
 
 def _validate_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove orphaned tool_use or tool_result blocks to prevent API 400 errors."""
+    """Remove orphaned tool_use or tool_result blocks to prevent API 400 errors.
+
+    Steps:
+    1. Merge consecutive tool_result user messages (Anthropic format splits them
+       into separate messages, but they belong to the same assistant turn).
+    2. Validate that each assistant+tool_use has a following tool_result,
+       and each tool_result has a preceding assistant+tool_use.
+    3. Merge remaining consecutive user messages for role alternation.
+    """
     result = list(messages)
+
+    # Step 1: Merge consecutive tool_result user messages only.
+    # This handles the case where multiple tool_results from one assistant turn
+    # are stored as separate user messages (Anthropic format).
+    i = 0
+    while i < len(result) - 1:
+        if (_is_tool_result(result[i]) and _is_tool_result(result[i + 1])
+                and result[i].get("role") == "user" and result[i + 1].get("role") == "user"):
+            result[i] = _merge_user_messages(result[i], result[i + 1])
+            result.pop(i + 1)
+        else:
+            i += 1
+
+    # Step 2: Remove orphaned tool_use or tool_result
     i = 0
     while i < len(result):
         msg = result[i]
@@ -1031,7 +1087,7 @@ def _validate_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 continue
         i += 1
 
-    # Merge consecutive user messages (Anthropic requires strict role alternation)
+    # Step 3: Merge remaining consecutive user messages (role alternation)
     i = 0
     while i < len(result) - 1:
         if result[i].get("role") == "user" and result[i + 1].get("role") == "user":

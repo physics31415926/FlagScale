@@ -1,101 +1,125 @@
 ---
 name: train-parallel-strategy
-description: Guide for selecting and configuring parallelism strategies (TP/PP/DP/EP/CP/SP) in Megatron-LM-FL and TransformerEngine-FL. Covers data pipeline handling under parallelism, attention strategy selection, and memory estimation. Use when porting models to FlagScale or debugging parallelism-related issues.
+description: Guide for selecting and configuring parallelism strategies (TP/PP/DP/EP/CP/SP) in Megatron-LM-FL and TransformerEngine-FL.
+  Covers data pipeline handling under parallelism, attention strategy selection, and memory estimation. Use when porting models
+  to FlagScale or debugging parallelism-related issues.
 keywords:
-  - parallel
-  - parallelism
-  - tensor parallel
-  - pipeline parallel
-  - data parallel
-  - expert parallel
-  - context parallel
-  - sequence parallel
-  - TP
-  - PP
-  - DP
-  - EP
-  - CP
-  - SP
-  - OOM
-  - memory
-  - get_batch
-  - attention
-  - transformer_engine
-  - MoE
-  - 并行策略
-  - 张量并行
-  - 流水线并行
-  - 数据并行
-  - 专家并行
-  - 显存
+- parallel
+- parallelism
+- tensor parallel
+- pipeline parallel
+- data parallel
+- expert parallel
+- context parallel
+- sequence parallel
+- TP
+- PP
+- DP
+- EP
+- CP
+- SP
+- OOM
+- memory
+- get_batch
+- attention
+- transformer_engine
+- MoE
+- 并行策略
+- 张量并行
+- 流水线并行
+- 数据并行
+- 专家并行
+- 显存
 parameters:
-  - name: model_size
-    description: "Approximate model size (e.g., 7B, 70B, 235B-MoE)"
-    default: ""
-  - name: gpu_count
-    description: "Number of GPUs available"
-    default: "8"
+- name: model_size
+  description: Approximate model size (e.g., 7B, 70B, 235B-MoE)
+  default: ''
+- name: gpu_count
+  description: Number of GPUs available
+  default: '8'
 requires: []
-suggests: [topo-detect]
-
+suggests:
+- topo-detect
 constraints:
-  - id: tp_pp_divisibility
-    description: "TP x PP x EP x CP must divide world_size evenly"
-    severity: error
-    check_phase: pre
-    trigger:
-      tools: [edit_file, write_file]
-      keywords: [tensor_model_parallel, pipeline_model_parallel, expert_model_parallel, context_parallel]
-    prompt: "Check if the parallelism config satisfies TP*PP*EP*CP divides world_size evenly"
-    correction: "Adjust parallelism dimensions so TP*PP*EP*CP divides total GPU count evenly."
-    max_violations: 0
-  - id: sp_requires_tp
-    description: "sequence_parallel requires tensor_model_parallel_size > 1"
-    severity: error
-    check_phase: pre
-    trigger:
-      tools: [edit_file, write_file]
-      keywords: [sequence_parallel]
-    prompt: "Check if sequence_parallel is enabled without TP > 1"
-    correction: "sequence_parallel only works with TP > 1. Either enable TP or disable SP."
-    max_violations: 0
-  - id: heads_divisible_by_tp
-    description: "num_attention_heads must be divisible by TP"
-    severity: error
-    check_phase: pre
-    trigger:
-      tools: [edit_file, write_file]
-      keywords: [num_attention_heads, tensor_model_parallel]
-    prompt: "Check if num_attention_heads is divisible by tensor_model_parallel_size"
-    correction: "num_attention_heads must be evenly divisible by TP. Adjust TP or model config."
-    max_violations: 0
-
-warnings:
-  - id: memory_estimation_before_launch
-    description: "Estimate memory before launching training"
-    severity: warning
-    trigger:
-      keywords: [launch, run, train, torchrun]
-    prompt: "Check if memory estimation was done before launching training"
-    reminder: "Estimate GPU memory: params*2(bf16) + grads*2 + optimizer*(8/DP). If exceeds GPU memory, increase TP/PP."
-    max_reminders: 1
-  - id: enable_sp_with_tp
-    description: "Always enable sequence_parallel when TP > 1"
-    severity: warning
-    trigger:
-      keywords: [tensor_model_parallel, TP]
-    prompt: "Check if TP > 1 is configured without sequence_parallel enabled"
-    reminder: "Always enable sequence_parallel: true with TP > 1. It reduces activation memory at no extra GPU cost."
-    max_reminders: 1
-
+- id: tp_pp_divisibility
+  description: TP x PP x EP x CP must divide world_size evenly
+  trigger:
+    tools:
+    - edit_file
+    - write_file
+    keywords:
+    - tensor_model_parallel
+    - pipeline_model_parallel
+    - expert_model_parallel
+    - context_parallel
+  prompt: Check if the parallelism config satisfies TP*PP*EP*CP divides world_size evenly
+  correction: Adjust parallelism dimensions so TP*PP*EP*CP divides total GPU count evenly.
+- id: sp_requires_tp
+  description: sequence_parallel requires tensor_model_parallel_size > 1
+  trigger:
+    tools:
+    - edit_file
+    - write_file
+    keywords:
+    - sequence_parallel
+  prompt: Check if sequence_parallel is enabled without TP > 1
+  correction: sequence_parallel only works with TP > 1. Either enable TP or disable SP.
+- id: heads_divisible_by_tp
+  description: num_attention_heads must be divisible by TP
+  trigger:
+    tools:
+    - edit_file
+    - write_file
+    keywords:
+    - num_attention_heads
+    - tensor_model_parallel
+  prompt: Check if num_attention_heads is divisible by tensor_model_parallel_size
+  correction: num_attention_heads must be evenly divisible by TP. Adjust TP or model config.
+- id: memory_estimation_before_launch
+  description: Estimate memory before launching training. Only triggers on actual training launch commands (torchrun, flagscale train),
+    not on load_skill, workspace_experiment, ps/grep, or other non-launch operations.
+  trigger:
+    tools:
+    - shell
+    keywords:
+    - torchrun
+    - flagscale train
+    - python -m torch.distributed
+    - deepspeed
+    - train.py
+    - pretrain.py
+  prompt: "SCOPE: shell command that LAUNCHES a training process (torchrun, flagscale train, python train.py, deepspeed).
+    NOT in scope: ps/grep/pgrep commands checking process status, load_skill, workspace_experiment, read_file, or any
+    non-shell tool. CHECK: Was memory estimation (params*bytes + optimizer states + activations) performed earlier in
+    the conversation before this launch command?"
+  correction: 'Estimate GPU memory: params*2(bf16) + grads*2 + optimizer*(8/DP). If exceeds GPU memory, increase TP/PP.'
+- id: enable_sp_with_tp
+  description: Always enable sequence_parallel when TP > 1
+  trigger:
+    tools:
+    - write_file
+    - edit_file
+    keywords:
+    - tensor_model_parallel
+    - tensor_model_parallel_size
+  prompt: "SCOPE: write_file or edit_file that sets tensor_model_parallel_size > 1 in a YAML config.
+    NOT in scope: shell commands (even if they mention TP for validation/calculation purposes).
+    CHECK: Is TP > 1 configured WITHOUT sequence_parallel: true in the same config file?"
+  correction: 'Always enable sequence_parallel: true with TP > 1. It reduces activation memory at no extra GPU cost.'
 context_injection:
-  always: ["Core Principle", "Parallelism Dimensions — What Each One Does"]
+  always:
+  - Core Principle
+  - Parallelism Dimensions — What Each One Does
   by_tool:
-    edit_file: ["Strategy Selection — Decision Tree", "Memory Estimation"]
-    write_file: ["Strategy Selection — Decision Tree", "Memory Estimation"]
-    shell: ["Memory Estimation"]
+    edit_file:
+    - Strategy Selection — Decision Tree
+    - Memory Estimation
+    write_file:
+    - Strategy Selection — Decision Tree
+    - Memory Estimation
+    shell:
+    - Memory Estimation
 ---
-
 # Parallel Strategy for FlagScale / Megatron-LM-FL
 
 Goal: select the right parallelism dimensions, configure them correctly, and handle data/attention so training runs without errors or hangs.

@@ -192,6 +192,26 @@ def _ensure_wget_continue(command: str) -> str:
     return _WGET_NO_CONTINUE_RE.sub("wget -c", command)
 
 
+def _inject_git_timeout(command: str) -> str:
+    """Inject network timeout env vars for git commands.
+
+    Without these, git will hang indefinitely when a remote is unreachable
+    (e.g., behind a proxy that accepts TCP but never responds to HTTPS).
+    GIT_HTTP_LOW_SPEED_LIMIT=1000 + GIT_HTTP_LOW_SPEED_TIME=60 means:
+    kill if transfer drops below 1KB/s for 60 seconds.
+    """
+    if not re.search(r'\bgit\s+(clone|fetch|pull|push|submodule)\b', command):
+        return command
+    # Don't inject if user already set these
+    if 'GIT_HTTP_LOW_SPEED' in command:
+        return command
+    timeout_vars = (
+        'GIT_HTTP_LOW_SPEED_LIMIT=1000 '
+        'GIT_HTTP_LOW_SPEED_TIME=60'
+    )
+    return f'{timeout_vars} {command}'
+
+
 def _strip_grep_patterns(command: str) -> str:
     """Remove grep/search patterns from command so they don't trigger confirm."""
     return _GREP_PATTERN_RE.sub("grep __PATTERN__", command)
@@ -444,6 +464,9 @@ class ShellTool(Tool):
 
         # Auto-add -c to wget for resume support
         command = _ensure_wget_continue(command)
+
+        # Inject git network timeout to prevent indefinite hangs
+        command = _inject_git_timeout(command)
 
         # Inject proxy exports for network commands
         command = _inject_proxy_exports(command, self._env)

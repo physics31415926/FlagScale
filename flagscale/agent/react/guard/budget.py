@@ -22,13 +22,24 @@ class BudgetGuard(Guard):
         self._max_tool_calls = max_tool_calls
         self._total_tokens: int = 0
         self._total_tool_calls: int = 0
-        self._warned_80: bool = False
-        self._warned_95: bool = False
+        self._warned_token_80: bool = False
+        self._warned_token_95: bool = False
+        self._warned_tool_80: bool = False
+        self._warned_tool_95: bool = False
+        self._exhausted_block_count: int = 0  # track repeated blocks
 
     def check_pre(self, ctx: GuardContext) -> GuardVerdict | None:
         # Check token budget
         token_pct = self._token_percent
         if token_pct >= 100:
+            self._exhausted_block_count += 1
+            if self._exhausted_block_count >= 3:
+                return GuardVerdict.escalate(
+                    "[Budget] Token budget exhausted and agent is not stopping. "
+                    "Summarize your progress and STOP immediately. "
+                    f"Used: {self._total_tokens:,} / {self._max_tokens:,} tokens.",
+                    reason="budget_tokens_exhausted_persistent",
+                )
             return GuardVerdict.block(
                 "[Budget] Token budget exhausted. "
                 "Summarize your progress and stop. "
@@ -39,6 +50,14 @@ class BudgetGuard(Guard):
         # Check tool call budget
         tool_pct = self._tool_call_percent
         if tool_pct >= 100:
+            self._exhausted_block_count += 1
+            if self._exhausted_block_count >= 3:
+                return GuardVerdict.escalate(
+                    "[Budget] Tool call budget exhausted and agent is not stopping. "
+                    "Summarize your progress and STOP immediately. "
+                    f"Used: {self._total_tool_calls} / {self._max_tool_calls} calls.",
+                    reason="budget_tool_calls_exhausted_persistent",
+                )
             return GuardVerdict.block(
                 "[Budget] Tool call budget exhausted. "
                 "Summarize your progress and stop. "
@@ -46,35 +65,33 @@ class BudgetGuard(Guard):
                 reason="budget_tool_calls_exhausted",
             )
 
-        # Warnings (inject once per threshold)
-        if token_pct >= 95 and not self._warned_95:
-            self._warned_95 = True
+        # Token warnings (inject once per threshold)
+        if token_pct >= 95 and not self._warned_token_95:
+            self._warned_token_95 = True
             return GuardVerdict.inject(
-                f"[Budget] WARNING: Budget nearly exhausted ({token_pct:.0f}% tokens, "
-                f"{tool_pct:.0f}% tool calls). Wrap up NOW — "
-                "complete the current step and summarize progress.",
-                reason="budget_95_warning",
+                f"[Budget] WARNING: Token budget nearly exhausted ({token_pct:.0f}%). "
+                f"Wrap up NOW — complete the current step and summarize progress.",
+                reason="budget_token_95_warning",
             )
 
-        if token_pct >= 80 and not self._warned_80:
-            self._warned_80 = True
+        if token_pct >= 80 and not self._warned_token_80:
+            self._warned_token_80 = True
             return GuardVerdict.inject(
-                f"[Budget] Budget at {token_pct:.0f}% tokens, "
-                f"{tool_pct:.0f}% tool calls. Prioritize completion.",
-                reason="budget_80_warning",
+                f"[Budget] Token budget at {token_pct:.0f}%. Prioritize completion.",
+                reason="budget_token_80_warning",
             )
 
-        # Same for tool calls
-        if tool_pct >= 95 and not self._warned_95:
-            self._warned_95 = True
+        # Tool call warnings (independent from token warnings)
+        if tool_pct >= 95 and not self._warned_tool_95:
+            self._warned_tool_95 = True
             return GuardVerdict.inject(
                 f"[Budget] WARNING: Tool call budget nearly exhausted "
                 f"({self._total_tool_calls}/{self._max_tool_calls}). Wrap up NOW.",
                 reason="budget_tool_95_warning",
             )
 
-        if tool_pct >= 80 and not self._warned_80:
-            self._warned_80 = True
+        if tool_pct >= 80 and not self._warned_tool_80:
+            self._warned_tool_80 = True
             return GuardVerdict.inject(
                 f"[Budget] Tool call budget at {tool_pct:.0f}%. Prioritize completion.",
                 reason="budget_tool_80_warning",

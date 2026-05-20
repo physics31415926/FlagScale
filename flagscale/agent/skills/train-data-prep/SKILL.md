@@ -1,100 +1,123 @@
 ---
 name: train-data-prep
-description: Prepare training data for FlagScale (Megatron backend). Covers two pipelines — (A) text-only via preprocess_data.py (.bin+.idx), and (B) multimodal via Megatron-Energon (WebDataset .tar + TaskEncoder). Includes tokenizer setup, data validation, Energon dataset config, custom TaskEncoder patterns, and multi-dataset blending.
+description: Prepare training data for FlagScale (Megatron backend). Covers two pipelines — (A) text-only via preprocess_data.py
+  (.bin+.idx), and (B) multimodal via Megatron-Energon (WebDataset .tar + TaskEncoder). Includes tokenizer setup, data validation,
+  Energon dataset config, custom TaskEncoder patterns, and multi-dataset blending.
 keywords:
-  - data
-  - dataset
-  - preprocess
-  - tokenizer
-  - tokenize
-  - bin
-  - idx
-  - jsonl
-  - data preparation
-  - data format
-  - energon
-  - megatron-energon
-  - webdataset
-  - wds
-  - multimodal
-  - image
-  - video
-  - vision
-  - vqa
-  - caption
-  - sft
-  - 数据
-  - 数据准备
-  - 数据预处理
-  - 数据格式
-  - 分词器
-  - 多模态
+- data
+- dataset
+- preprocess
+- tokenizer
+- tokenize
+- bin
+- idx
+- jsonl
+- data preparation
+- data format
+- energon
+- megatron-energon
+- webdataset
+- wds
+- multimodal
+- image
+- video
+- vision
+- vqa
+- caption
+- sft
+- 数据
+- 数据准备
+- 数据预处理
+- 数据格式
+- 分词器
+- 多模态
 parameters:
-  - name: data_dir
-    description: "Directory to store processed data. Use shared storage for multi-node training."
-  - name: tokenizer_dir
-    description: "Directory containing tokenizer files. Use shared storage for multi-node training."
-requires: [workspace-layout]
-suggests: [env-setup]
-
+- name: data_dir
+  description: Directory to store processed data. Use shared storage for multi-node training.
+- name: tokenizer_dir
+  description: Directory containing tokenizer files. Use shared storage for multi-node training.
+requires:
+- workspace-layout
+suggests:
+- train-env-setup
 constraints:
-  - id: no_dummy_data
-    description: "NEVER use dummy/synthetic data (torch.rand/zeros/ones) for model verification"
-    severity: error
-    check_phase: pre
-    trigger:
-      tools: [write_file, edit_file]
-      keywords: [torch.rand, torch.zeros, torch.ones, dummy, synthetic, fake_data]
-    prompt: "Check if the agent is creating dummy/synthetic data instead of using real data pipeline"
-    correction: "ALL verification must flow through the real data pipeline. No exceptions."
-    max_violations: 0
-  - id: parallelism_aware_data
-    description: "Data pipeline MUST handle parallelism (broadcast_data for TP, pre_process/post_process for PP)"
-    severity: error
-    check_phase: pre
-    trigger:
-      tools: [write_file, edit_file]
-      keywords: [get_batch, DataLoader, train_valid_test_datasets_provider]
-    prompt: "Check if the data pipeline implementation handles parallelism (TP broadcast, PP guards, DP sampling)"
-    correction: "Every get_batch must call broadcast_data() for TP, guard with pre_process/post_process for PP."
-    max_violations: 0
-  - id: know_parallelism_first
-    description: "Must know parallelism strategy before implementing data pipeline"
-    severity: warning
-    check_phase: pre
-    trigger:
-      tools: [write_file, edit_file]
-      keywords: [get_batch, DataLoader, Dataset, data_pipeline]
-    prompt: "Check if parallelism strategy (TP/PP/DP/EP/CP) is determined before implementing data pipeline"
-    correction: "Determine parallelism strategy first (use train-parallel-strategy skill). Data pipeline depends on it."
-    max_violations: 1
-
-warnings:
-  - id: validate_after_preprocess
-    description: "Validate preprocessed data before training"
-    severity: warning
-    trigger:
-      keywords: [preprocess, bin, idx, tokenize]
-    prompt: "Check if data validation is planned after preprocessing"
-    reminder: "After preprocessing, validate: check file sizes, sample a few records, verify token counts match expectations."
-    max_reminders: 1
-  - id: data_model_interface_first
-    description: "Document data→model interface contract before implementing"
-    severity: warning
-    trigger:
-      keywords: [implement, write, create, pipeline, get_batch]
-    prompt: "Check if the data→model interface contract is documented before implementation"
-    reminder: "Document the data→model interface contract BEFORE writing code. Know what get_batch produces and what model.forward expects."
-    max_reminders: 1
-
+- id: no_dummy_data
+  description: NEVER use dummy/synthetic data (torch.rand/zeros/ones) for model verification
+  trigger:
+    tools:
+    - write_file
+    - edit_file
+    keywords:
+    - torch.rand
+    - torch.zeros
+    - torch.ones
+    - dummy
+    - synthetic
+    - fake_data
+  prompt: Check if the agent is creating dummy/synthetic data instead of using real data pipeline
+  correction: ALL verification must flow through the real data pipeline. No exceptions.
+- id: parallelism_aware_data
+  description: Data pipeline MUST handle parallelism (broadcast_data for TP, pre_process/post_process for PP)
+  trigger:
+    tools:
+    - write_file
+    - edit_file
+    keywords:
+    - get_batch
+    - DataLoader
+    - train_valid_test_datasets_provider
+  prompt: Check if the data pipeline implementation handles parallelism (TP broadcast, PP guards, DP sampling)
+  correction: Every get_batch must call broadcast_data() for TP, guard with pre_process/post_process for PP.
+- id: know_parallelism_first
+  description: Must know parallelism strategy before implementing data pipeline
+  trigger:
+    tools:
+    - write_file
+    - edit_file
+    keywords:
+    - get_batch
+    - DataLoader
+    - Dataset
+    - data_pipeline
+  prompt: Check if parallelism strategy (TP/PP/DP/EP/CP) is determined before implementing data pipeline
+  correction: Determine parallelism strategy first (use train-parallel-strategy skill). Data pipeline depends on it.
+- id: validate_after_preprocess
+  description: Validate preprocessed data before training
+  trigger:
+    keywords:
+    - preprocess
+    - bin
+    - idx
+    - tokenize
+  prompt: Check if data validation is planned after preprocessing
+  correction: 'After preprocessing, validate: check file sizes, sample a few records, verify token counts match expectations.'
+- id: data_model_interface_first
+  description: Document data→model interface contract before implementing
+  trigger:
+    keywords:
+    - implement
+    - write
+    - create
+    - pipeline
+    - get_batch
+  prompt: Check if the data→model interface contract is documented before implementation
+  correction: Document the data→model interface contract BEFORE writing code. Know what get_batch produces and what model.forward
+    expects.
 context_injection:
-  always: ["CRITICAL: Data Pipeline is EQUALLY Important as Model Adaptation", "ABSOLUTE RULE: No Parallelism = Failed Megatron Integration"]
+  always:
+  - 'CRITICAL: Data Pipeline is EQUALLY Important as Model Adaptation'
+  - 'ABSOLUTE RULE: No Parallelism = Failed Megatron Integration'
   by_tool:
-    write_file: ["CRITICAL: Parallelism Strategy is a Prerequisite", "Pipeline A: Text-Only", "Pipeline B: Megatron-Energon"]
-    edit_file: ["CRITICAL: Parallelism Strategy is a Prerequisite"]
-    shell: ["Data Format", "Pre-processed Demo Data"]
+    write_file:
+    - 'CRITICAL: Parallelism Strategy is a Prerequisite'
+    - 'Pipeline A: Text-Only'
+    - 'Pipeline B: Megatron-Energon'
+    edit_file:
+    - 'CRITICAL: Parallelism Strategy is a Prerequisite'
+    shell:
+    - Data Format
+    - Pre-processed Demo Data
 ---
-
 # Data Preparation for FlagScale
 
 ## CRITICAL: Data Pipeline is EQUALLY Important as Model Adaptation

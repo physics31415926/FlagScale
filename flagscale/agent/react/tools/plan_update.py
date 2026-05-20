@@ -1,8 +1,33 @@
 """Plan update tool — modify task plan steps and status."""
 
+import re
+
 from flagscale.agent.react.tools.base import Tool, ToolEffect
 
 _EFFECT_PLAN_WRITE = ToolEffect(reads=frozenset({"plan"}), writes=frozenset({"plan"}))
+
+# Pattern to extract integer from strings like "step_1", "step 2", "Step_3", "#4"
+_STEP_ID_RE = re.compile(r'(?:step[_\s]?)?#?(\d+)', re.IGNORECASE)
+
+
+def _parse_step_id(raw) -> int | None:
+    """Parse step_id from various LLM formats: 1, "1", "step_1", "step 2", etc."""
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw)
+    if isinstance(raw, str):
+        raw = raw.strip()
+        # Try direct integer parse first
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        # Try regex extraction
+        m = _STEP_ID_RE.search(raw)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 class PlanUpdateTool(Tool):
@@ -70,29 +95,30 @@ class PlanUpdateTool(Tool):
         experiment = kwargs.get("experiment", "")
         try:
             if action == "step_done":
-                step_id = kwargs.get("step_id")
+                step_id = _parse_step_id(kwargs.get("step_id"))
                 if not step_id:
-                    return "ERROR: step_id required for step_done."
+                    return "ERROR: step_id required for step_done (integer or 'step_N' format)."
                 self._plan.update_step(step_id, "done", kwargs.get("notes", ""))
                 if experiment:
                     self._plan.link_experiment(step_id, experiment)
             elif action == "step_doing":
-                step_id = kwargs.get("step_id")
+                step_id = _parse_step_id(kwargs.get("step_id"))
                 if not step_id:
-                    return "ERROR: step_id required for step_doing."
+                    return "ERROR: step_id required for step_doing (integer or 'step_N' format)."
                 self._plan.update_step(step_id, "doing", kwargs.get("notes", ""))
                 if experiment:
                     self._plan.link_experiment(step_id, experiment)
             elif action == "step_skip":
-                step_id = kwargs.get("step_id")
+                step_id = _parse_step_id(kwargs.get("step_id"))
                 if not step_id:
-                    return "ERROR: step_id required for step_skip."
+                    return "ERROR: step_id required for step_skip (integer or 'step_N' format)."
                 self._plan.skip_step(step_id, kwargs.get("notes", ""))
             elif action == "add_steps":
                 new_steps = kwargs.get("new_steps", [])
                 if not new_steps:
                     return "ERROR: new_steps required for add_steps."
-                self._plan.add_steps(new_steps, kwargs.get("after_step_id"))
+                after = _parse_step_id(kwargs.get("after_step_id"))
+                self._plan.add_steps(new_steps, after)
             elif action == "complete":
                 self._plan.complete()
             elif action == "abandon":
@@ -116,7 +142,7 @@ class PlanUpdateTool(Tool):
                     return "ERROR: updates required for batch action."
                 status_map = {"done": "done", "doing": "doing", "skipped": "skipped"}
                 for u in updates:
-                    sid = u.get("step_id")
+                    sid = _parse_step_id(u.get("step_id"))
                     status = u.get("status", "")
                     if not sid or status not in status_map:
                         continue

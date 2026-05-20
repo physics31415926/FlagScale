@@ -27,6 +27,7 @@ from .config import AgentConfig
 from .profile import PROFILES, WorkerProfile
 from .scene import PRESETS, ScenePreset
 from .agent import WorkerAgent, WorkerResult
+from .constraint.cache import ConstraintCache
 from .judge import Judge
 
 logger = logging.getLogger(__name__)
@@ -307,7 +308,11 @@ class SubtaskRunner:
         user_input: str,
         orchestrator: "Orchestrator",
     ) -> WorkerResult:
-        """Execute subtask DAG with topological batching."""
+        """Execute subtask DAG with topological batching.
+
+        Propagates constraints across stages: skills loaded in earlier stages
+        have their constraints registered in later stages.
+        """
         template = self._templates.get(template_name)
         if template is None:
             return WorkerResult(status="failed",
@@ -316,14 +321,32 @@ class SubtaskRunner:
         subtasks = template.subtasks
         batches = self._topological_batches(subtasks)
         upstream: dict[str, str] = {}
+        # Track skills loaded across all stages for constraint propagation
+        accumulated_skills: set[str] = set()
 
         for batch in batches:
             if len(batch) == 1:
                 sub = batch[0]
                 context = self._build_upstream_summary(sub.upstream_keys, upstream)
                 worker = orchestrator._create_worker(sub.profile_name)
+                orchestrator._propagate_constraints(worker, accumulated_skills)
                 task = self._build_task(sub.description, user_input, context)
-                result = worker.execute(task)
+                try:
+                    result = worker.execute(task)
+                except KeyboardInterrupt:
+                    logger.warning("Stage '%s' interrupted by user", sub.id)
+                    return WorkerResult(
+                        status="interrupted",
+                        summary=f"Stage '{sub.id}' interrupted by user (Ctrl+C)",
+                    )
+                accumulated_skills |= worker._loaded_skills
+                if result.interrupted:
+                    logger.warning("Stage '%s' interrupted during execution", sub.id)
+                    return WorkerResult(
+                        status="interrupted",
+                        summary=f"Stage '{sub.id}' interrupted: {result.summary}",
+                        artifacts=upstream,
+                    )
                 if result.status == "failed":
                     return result
                 upstream.update(result.artifacts)
@@ -332,21 +355,39 @@ class SubtaskRunner:
                 def _run_subtask(sub):
                     context = self._build_upstream_summary(sub.upstream_keys, upstream)
                     worker = orchestrator._create_worker(sub.profile_name)
+                    orchestrator._propagate_constraints(worker, accumulated_skills)
                     task = self._build_task(sub.description, user_input, context)
-                    return sub.id, worker.execute(task)
+                    return sub.id, worker.execute(task), worker._loaded_skills
 
                 batch_results: dict[str, WorkerResult] = {}
-                with ThreadPoolExecutor(max_workers=min(len(batch), 4)) as pool:
-                    futures = {pool.submit(_run_subtask, s): s for s in batch}
-                    for future in as_completed(futures):
-                        sub_id, result = future.result()
-                        batch_results[sub_id] = result
+                batch_skills: set[str] = set()
+                try:
+                    with ThreadPoolExecutor(max_workers=min(len(batch), 4)) as pool:
+                        futures = {pool.submit(_run_subtask, s): s for s in batch}
+                        for future in as_completed(futures):
+                            sub_id, result, skills = future.result()
+                            batch_results[sub_id] = result
+                            batch_skills |= skills
+                except KeyboardInterrupt:
+                    logger.warning("Parallel batch interrupted by user")
+                    return WorkerResult(
+                        status="interrupted",
+                        summary="Parallel batch interrupted by user (Ctrl+C)",
+                        artifacts=upstream,
+                    )
 
+                accumulated_skills |= batch_skills
                 for sub in batch:
                     result = batch_results.get(sub.id)
                     if result is None:
                         return WorkerResult(status="failed",
                             summary=f"Subtask {sub.id} returned no result")
+                    if result.interrupted:
+                        return WorkerResult(
+                            status="interrupted",
+                            summary=f"Stage '{sub.id}' interrupted: {result.summary}",
+                            artifacts=upstream,
+                        )
                     if result.status == "failed":
                         return result
                     upstream.update(result.artifacts)
@@ -459,6 +500,12 @@ class Orchestrator:
         self.judge = judge
         self.config = config or AgentConfig.auto_load()
 
+        # Shared constraint cache for all workers
+        sessions_root = self.config.session_dir or os.path.join(
+            os.path.expanduser("~"), ".flagscale", "sessions"
+        )
+        self._constraint_cache = ConstraintCache(sessions_root)
+
     def handle(self, user_input: str) -> str:
         """Handle a user request. Route via LLM (primary) or keywords (fallback)."""
         # 1. Detect scene (env-based, no LLM needed)
@@ -548,6 +595,10 @@ class Orchestrator:
 
         Supports both YAML templates (route["template"]) and LLM-generated
         dynamic stages (route["dynamic_stages"]).
+
+        Constraint propagation: skills loaded in earlier stages propagate their
+        constraints to later stages, ensuring safety rules aren't lost across
+        stage boundaries.
         """
         subtasks = self._build_subtask_definitions(route, user_input)
         if not subtasks:
@@ -556,6 +607,8 @@ class Orchestrator:
         batches = self.subtask_runner._topological_batches(subtasks)
         upstream: dict[str, str] = {}
         stage_results: list[WorkerResult] = []
+        # Track skills loaded across all stages for constraint propagation
+        accumulated_skills: set[str] = set()
 
         stage_idx = 0
         total_stages = len(subtasks)
@@ -567,12 +620,27 @@ class Orchestrator:
                     sub.upstream_keys, upstream
                 )
                 worker = self._create_worker(sub.profile_name)
+
+                # Propagate constraints from skills loaded in earlier stages
+                self._propagate_constraints(worker, accumulated_skills)
+
                 task = self.subtask_runner._build_task(
                     sub.description, user_input, context
                 )
 
-                result = worker.execute(task)
+                try:
+                    result = worker.execute(task)
+                except KeyboardInterrupt:
+                    logger.warning("Stage '%s' interrupted by user", sub.id)
+                    return (
+                        f"Stage {stage_idx}/{total_stages} ({sub.id}) interrupted by user.",
+                        stage_results,
+                    )
                 stage_results.append(result)
+
+                # Collect skills loaded during this stage for propagation
+                accumulated_skills |= worker._loaded_skills
+
                 if result.status == "failed":
                     upstream.update(result.artifacts)
                     upstream[sub.id] = result.summary
@@ -580,10 +648,38 @@ class Orchestrator:
                         f"Stage {stage_idx}/{total_stages} ({sub.id}) failed: {result.summary[:200]}",
                         stage_results,
                     )
+                if result.interrupted:
+                    upstream.update(result.artifacts)
+                    upstream[sub.id] = result.summary
+                    return (
+                        f"Stage {stage_idx}/{total_stages} ({sub.id}) interrupted by user.",
+                        stage_results,
+                    )
                 upstream.update(result.artifacts)
                 upstream[sub.id] = result.summary
 
         return ("All subtasks completed", stage_results)
+
+    def _propagate_constraints(self, worker: "WorkerAgent", skills: set[str]):
+        """Propagate constraints from previously-loaded skills to a new worker.
+
+        Only registers constraints (not full skill content) — the worker doesn't
+        get the skill's system prompt, just its safety constraints. This ensures
+        constraints like "must build from source" survive across stage boundaries.
+        """
+        for skill_name in skills:
+            if skill_name in worker._loaded_skills:
+                continue  # Already loaded via profile
+            if skill_name in worker._skill_guards_registered:
+                continue  # Already registered
+            try:
+                worker._register_skill_guards(skill_name)
+                logger.debug(
+                    "Propagated constraints from skill '%s' to stage worker",
+                    skill_name,
+                )
+            except Exception:
+                pass
 
     def _build_subtask_definitions(
         self, route: dict, user_input: str
@@ -701,6 +797,7 @@ class Orchestrator:
             "template": template,
             "batch_tasks": batch_tasks,
             "dynamic_stages": dynamic_stages,
+            "reason": result.get("reason", ""),
         }
 
     def _dispatch_route(self, route: dict, user_input: str) -> str:
@@ -805,6 +902,7 @@ class Orchestrator:
         """Create a fresh WorkerAgent with shared infrastructure.
 
         Context isolation: each worker gets its OWN HistoryManager.
+        Profile skills are preloaded (semantic routing already decided them).
         """
         profile = self.profiles[profile_name]
 
@@ -824,7 +922,7 @@ class Orchestrator:
             constraints=constraints,
         )
 
-        return WorkerAgent(
+        worker = WorkerAgent(
             config=self.config,
             scene=worker_scene,
             _provider=self.provider,
@@ -833,7 +931,27 @@ class Orchestrator:
             _session_memory=self.session_memory,
             _task_plan=self.task_plan,
             _experiment_manager=self.experiment_manager,
+            _constraint_cache=self._constraint_cache,
         )
+
+        # Preload profile skills (already decided by Judge routing)
+        for skill_name in profile.skills:
+            try:
+                content = self.skill_manager.load(skill_name)
+                if content:
+                    worker._loaded_skills.add(skill_name)
+                    worker._active_skill_content[skill_name] = content
+                    worker._apply_skill_effects(skill_name)
+                    worker._register_skill_guards(skill_name)
+            except Exception:
+                pass
+        if profile.skills:
+            skill_map = {n: worker._active_skill_content.get(n, "")
+                         for n in profile.skills if n in worker._active_skill_content}
+            if skill_map:
+                worker._batch_extract_and_rebuild(skill_map)
+
+        return worker
 
     @staticmethod
     def _format_response(result: WorkerResult) -> str:

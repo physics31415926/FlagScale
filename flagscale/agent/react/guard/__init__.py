@@ -30,6 +30,7 @@ class GuardContext:
     tool_effects: ToolEffect = field(default_factory=ToolEffect)
     turn_count: int = 0
     recent_tool_names: list[str] = field(default_factory=list)
+    recent_tool_history: list[dict] = field(default_factory=list)  # [{tool, args_summary, result_summary}]
     context_pressure: float = 0.0
 
     # State machine context
@@ -121,6 +122,12 @@ class Guard(abc.ABC):
     def reset_turn(self):
         """Called at the start of each turn. Override to reset per-turn state."""
 
+    def notify_blocked(self, ctx: GuardContext):
+        """Called when a tool call was blocked by another guard AFTER this guard's check_pre passed.
+
+        Override to undo any state changes made in check_pre (e.g., remove from history).
+        """
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r}, priority={self.priority})"
 
@@ -137,12 +144,21 @@ class GuardRegistry:
         self._guards.sort(key=lambda g: g.priority)
 
     def check_pre(self, ctx: GuardContext) -> GuardVerdict | None:
-        """Run all guards' pre-checks. First non-None verdict wins."""
+        """Run all guards' pre-checks. First non-None verdict wins.
+
+        If a guard blocks/escalates, notify all earlier guards that passed
+        so they can undo state changes (e.g., remove from history).
+        """
+        passed_guards: list[Guard] = []
         for guard in self._guards:
             if guard.should_activate(ctx):
                 verdict = guard.check_pre(ctx)
                 if verdict is not None:
+                    # This guard blocked — notify all earlier guards that passed
+                    for earlier in passed_guards:
+                        earlier.notify_blocked(ctx)
                     return verdict
+                passed_guards.append(guard)
         return None
 
     def check_post(self, ctx: GuardContext) -> GuardVerdict | None:
@@ -172,6 +188,15 @@ class GuardRegistry:
         """Reset all guards for a new turn."""
         for guard in self._guards:
             guard.reset_turn()
+
+    def notify_all_blocked(self, ctx: GuardContext):
+        """Notify all guards that a tool call was blocked externally (e.g., by user deny).
+
+        Called by tool executor when a call is blocked after all guards passed check_pre.
+        """
+        for guard in self._guards:
+            if guard.should_activate(ctx):
+                guard.notify_blocked(ctx)
 
     @property
     def guards(self) -> list[Guard]:

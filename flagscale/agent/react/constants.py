@@ -3,8 +3,6 @@
 Extracted from agent.py to reduce file size and improve maintainability.
 """
 
-import re
-
 # ── Tool Sets ─────────────────────────────────────────────────────────────────
 
 READ_ONLY_TOOLS = {
@@ -49,18 +47,6 @@ PHASE_TOOL_SETS = {
         "inspect_checkpoint", "validate_config",
     },
 }
-
-# ── Regex Patterns ────────────────────────────────────────────────────────────
-
-GATE_OVERRIDE_RE = re.compile(
-    r'\[GATE_OVERRIDE:\s*([A-Z_]+)\]\s*Reason:\s*(.+?)(?:\n|$)',
-    re.IGNORECASE
-)
-
-CHECKLIST_OVERRIDE_RE = re.compile(
-    r'\[CHECKLIST_OVERRIDE:\s*([a-z0-9_]+)\]',
-    re.IGNORECASE
-)
 
 # ── Tool Behavior Configuration ───────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-"""FlagScale Agent — ReAct loop with composable Guard/Checklist/Judge architecture.
+"""FlagScale Agent — ReAct loop with composable Guard/Judge architecture.
 
 No Mixin inheritance. State is owned by Guard instances.
 Scene + Profile parameterize behavior without subclassing.
@@ -66,15 +66,14 @@ from flagscale.agent.react.guard.context_pressure import ContextPressureGuard
 from flagscale.agent.react.guard.plan import PlanGuard
 from flagscale.agent.react.guard.training_runtime import TrainingRuntimeGuard
 from flagscale.agent.react.guard.constraint import ConstraintGuard
-from flagscale.agent.react.guard.warning import WarningGuard
 from flagscale.agent.react.guard.error_classifier import ErrorClassifierGuard
 from flagscale.agent.react.guard.circuit_breaker import CircuitBreakerGuard
 from flagscale.agent.react.guard.budget import BudgetGuard
+from flagscale.agent.react.guard.env_compat import EnvCompatGuard
 from flagscale.agent.react.constraint.cache import ConstraintCache
 from flagscale.agent.react.prompt_builder import PromptBuilder
 from flagscale.agent.react.tool_executor import ToolExecutor, tool_display_summary
 
-from flagscale.agent.react.checklist.base import ChecklistEngine, ChecklistItem, Checklist
 from flagscale.agent.react.judge import Judge, JudgeBudget
 from flagscale.agent.react.scene import ScenePreset, PRESETS
 from flagscale.agent.react.profile import WorkerProfile, PROFILES
@@ -82,8 +81,6 @@ from flagscale.agent.react.constants import (
     READ_ONLY_TOOLS,
     CORE_TOOLS,
     PHASE_TOOL_SETS,
-    GATE_OVERRIDE_RE,
-    CHECKLIST_OVERRIDE_RE,
     READ_FILE_SUMMARY_THRESHOLD,
     READ_FILE_SUMMARY_THRESHOLD_PORTING,
 )
@@ -102,7 +99,7 @@ class WorkerResult:
     status: "success" | "failed" | "partial"
     """
 
-    status: str  # "success", "failed", "partial"
+    status: str  # "success", "failed", "partial", "interrupted"
     summary: str = ""
     artifacts: dict = field(default_factory=dict)
     files_read: list[str] = field(default_factory=list)
@@ -111,6 +108,7 @@ class WorkerResult:
     session_input_tokens: int = 0
     session_output_tokens: int = 0
     elapsed_seconds: float = 0.0
+    interrupted: bool = False
 
 
 # ── _ModeFlags ─────────────────────────────────────────────────────────────────
@@ -143,7 +141,7 @@ class _ModeFlags:
 # ── WorkerAgent ──────────────────────────────────────────────────────────────
 
 class WorkerAgent:
-    """Single agent class with composable Guard/Checklist/Judge architecture.
+    """Single agent class with composable Guard/Judge architecture.
 
     No Mixin inheritance. State that belongs to Guards is owned
     by Guard instances. All infrastructure is composed via __init__.
@@ -152,7 +150,8 @@ class WorkerAgent:
     def __init__(self, config: AgentConfig, scene: ScenePreset | None = None,
                  # ── Shared infrastructure (for Orchestrator injection) ──
                  _provider=None, _tool_registry=None, _skill_manager=None,
-                 _session_memory=None, _task_plan=None, _experiment_manager=None):
+                 _session_memory=None, _task_plan=None, _experiment_manager=None,
+                 _constraint_cache=None):
         setup_logging()
         self.config = config
         self.scene = scene
@@ -204,6 +203,9 @@ class WorkerAgent:
         self.history = HistoryManager(max_context_tokens=config.max_context_tokens)
         self.history.set_summarizer(self._summarize_for_compaction)
         self.history.set_scorer(self._score_messages_for_compaction)
+        self.history.set_plan_summary_fn(
+            lambda: self.task_plan.context_for_prompt() if self.task_plan.get_active() else ""
+        )
 
         # ── Orchestrator (set by run_agent_orchestrated) ──
         self._orchestrator = None
@@ -218,10 +220,9 @@ class WorkerAgent:
         self._tool_executor = ToolExecutor(self)
 
         # ── Composed components ──
-        self.judge = Judge(self.provider, budget=JudgeBudget(max_calls_per_turn=16))
+        self.judge = Judge(self.provider, budget=JudgeBudget(max_calls_per_turn=64))
         self._loaded_skills: set[str] = set()
-        self._constraint_cache = ConstraintCache(self._sessions_root)
-        self.checklist: Checklist | None = self._build_checklist()
+        self._constraint_cache = _constraint_cache or ConstraintCache(self._sessions_root)
 
         self._init_runtime_state()
         atexit.register(self._atexit_hook)
@@ -257,10 +258,12 @@ class WorkerAgent:
         self._last_checkpoint_tokens: int = 0
         self._last_tool_call: tuple | None = None
         self._tool_call_cache: dict[tuple, str] = {}
+        self._recent_tool_history: list[dict] = []  # [{tool, args_summary, result_summary}]
         self._streaming_in_code_block: bool = False
         self._last_compaction_count: int = 0
         self._recent_iters: list[dict] = []
         self._current_stage_id: str | None = None  # For focused context injection
+        self._skill_guards_registered: set[str] = set()  # Track registered skill guards
 
         self._refresh_system_prompt()
 
@@ -289,15 +292,26 @@ class WorkerAgent:
         ))
         guard_registry.register(LoopDetectGuard())
         guard_registry.register(ErrorClassifierGuard())
+        guard_registry.register(EnvCompatGuard())
 
         # Create ConstraintGuard (will be populated with Skill constraints later)
         self._constraint_guard = ConstraintGuard()
         guard_registry.register(self._constraint_guard)
 
+        # Build and register dynamic constraints (e.g., shared storage)
+        self._build_dynamic_constraints()
+
         guard_registry.register(ProgressGuard())
         guard_registry.register(ContextPressureGuard())
         guard_registry.register(PlanGuard(task_plan=self.task_plan))
-        if "is_training" in constraints or "always" in constraints or not constraints:
+
+        # Plan and experiment enforcement guards (Phase 7)
+        from flagscale.agent.react.guard.plan_update import PlanUpdateGuard
+        from flagscale.agent.react.guard.experiment import ExperimentGuard
+        guard_registry.register(PlanUpdateGuard(task_plan=self.task_plan))
+        guard_registry.register(ExperimentGuard(experiment_manager=self._experiment_manager))
+
+        if "is_training" in constraints or "is_inference" in constraints or not constraints:
             guard_registry.register(TrainingRuntimeGuard())
 
         deps = KernelDeps(
@@ -345,80 +359,61 @@ class WorkerAgent:
         self.tool_registry.register(ValidateConfigTool())
         self.tool_registry.register(InspectCheckpointTool())
 
-    def _build_checklist(self) -> Checklist | None:
-        engine = ChecklistEngine()
-        items = []
+    def _build_dynamic_constraints(self):
+        """Build runtime-detected constraints and register with ConstraintGuard.
 
-        # ── Auto-detect runtime facts for checklist evaluation ──
+        Detects shared storage and other runtime conditions, then creates
+        Constraint objects and injects them into the unified ConstraintGuard.
+        """
+        from flagscale.agent.react.constraint import Constraint, ConstraintTrigger
+
         shared_paths = self._detect_shared_storage()
         self._shared_storage_paths = shared_paths
 
-        # Inject facts into the engine so every classify() call sees them
-        engine.facts = {}
-        if shared_paths:
-            engine.facts["shared_storage"] = shared_paths
-
-        # ── Skill-based constraints (LLM-extracted from skill content) ──
-        for skill_name in self._loaded_skills:
-            constraint_specs = self._constraint_cache.items.get(skill_name)
-            if not constraint_specs:
-                continue
-            for c in constraint_specs:
-                try:
-                    items.append(ChecklistItem(
-                        id=c.get("id", f"{skill_name}_constraint"),
-                        description=c.get("description", ""),
-                        phases=set(c.get("phases", ["*"])),
-                        trigger_on=c.get("trigger_on"),
-                        prompt=c.get("prompt", ""),
-                        reminder=c.get("reminder", ""),
-                        severity=c.get("severity", "warning"),
-                        max_reminders=c.get("max_reminders", 3),
-                    ))
-                except Exception:
-                    pass
-
-        # ── Shared storage constraint (dynamic, based on actual mounts) ──
         if shared_paths:
             path_list = ", ".join(shared_paths)
-            items.append(ChecklistItem(
+            constraint = Constraint(
                 id="env_shared_storage",
                 description=f"Shared storage detected at {path_list}. Conda envs must use --prefix on shared storage.",
-                phases={"*"},
-                trigger_on={"tool": "shell"},
-                prompt=(
-                    f"DETECT if this shell command creates a conda environment using -n/--name "
-                    f"(local node storage) instead of --prefix on shared storage.\n"
-                    f"CONTEXT: shared storage IS available at: {path_list}. "
-                    f"The _facts confirm this.\n"
-                    f"MATCH: 'conda create' with -n or --name flag, WITHOUT a --prefix "
-                    f"pointing to the shared storage.\n"
-                    f"DO NOT MATCH: conda create with --prefix, or any non-conda-create command."
+                trigger=ConstraintTrigger(
+                    tool_names={"shell"},
+                    keywords=["conda create"],
                 ),
-                reminder=(
-                    f"⚠ [ENV-SETUP] Shared storage detected at: {path_list}. "
-                    f"Creating conda env with -n/--name stores it on local node only. "
-                    f"Use --prefix on shared storage instead (e.g. --prefix {shared_paths[0]}/envs/<name>). "
+                prompt=(
+                    f"SCOPE: shell command creates a conda environment using -n/--name "
+                    f"(local node storage) instead of --prefix on shared storage. "
+                    f"CHECK: 'conda create' with -n or --name flag, WITHOUT a --prefix "
+                    f"pointing to the shared storage ({path_list})."
+                ),
+                correction=(
+                    f"Shared storage detected at: {path_list}. "
+                    f"Use --prefix on shared storage instead of -n/--name "
+                    f"(e.g. --prefix {shared_paths[0]}/envs/<name>). "
                     f"This ensures multi-node training can access the same environment."
                 ),
-                severity="warning",
-                max_reminders=3,
-            ))
+            )
+            self._constraint_guard.add_constraints([constraint])
+            logger.info("Registered dynamic shared_storage constraint")
 
-        if not items:
-            return None
-        return Checklist(engine=engine, items=items)
+    def _register_llm_constraints(self, skill_name: str):
+        """Register LLM-extracted constraints from cache into ConstraintGuard."""
+        from flagscale.agent.react.constraint.extractor import _compile_one
 
-    def _rebuild_checklist(self):
-        """Rebuild the checklist to include newly loaded skill constraints."""
-        self.checklist = self._build_checklist()
-        if self.checklist and self.checklist._items:
-            print(display.dim(
-                f"  📋 Checklist now has {len(self.checklist._items)} active constraint(s)"
-            ))
+        constraint_specs = self._constraint_cache.items.get(skill_name)
+        if not constraint_specs:
+            return
+        llm_constraints = []
+        for i, c in enumerate(constraint_specs):
+            compiled = _compile_one(c, skill_name, i)
+            if compiled:
+                llm_constraints.append(compiled)
+        if llm_constraints:
+            self._constraint_guard.add_constraints(llm_constraints)
+            logger.info("Registered %d LLM-extracted constraints from skill '%s'",
+                        len(llm_constraints), skill_name)
 
     def _extract_skill_constraints(self, skill_name: str, skill_content: str):
-        """Extract checklist constraints from skill content via LLM judge."""
+        """Extract constraints from skill content via LLM judge."""
         self._constraint_cache.get_or_extract(
             skill_name, skill_content, self.judge.extract_constraints
         )
@@ -434,13 +429,14 @@ class WorkerAgent:
         self._register_skill_guards(skill_name)
         if not skip_extract:
             self._extract_skill_constraints(skill_name, skill_content)
-        self._rebuild_checklist()
+        self._register_llm_constraints(skill_name)
         self._refresh_system_prompt()
 
     def _batch_extract_and_rebuild(self, skill_map: dict[str, str]):
-        """Extract constraints from multiple skills concurrently, then rebuild once."""
+        """Extract constraints from multiple skills concurrently, then register."""
         self._constraint_cache.batch_extract(skill_map, self.judge.extract_constraints)
-        self._rebuild_checklist()
+        for skill_name in skill_map:
+            self._register_llm_constraints(skill_name)
         self._refresh_system_prompt()
 
     @staticmethod
@@ -488,37 +484,6 @@ class WorkerAgent:
         # shared path comes first for --prefix suggestions
         shared.sort(key=len)
         return shared
-
-    # Keys from session memory that are relevant to checklist evaluation.
-    # Anything not in this list is NOT injected into engine.facts to
-    # avoid polluting the LLM's context with irrelevant memory entries.
-    _FACT_KEYS_WHITELIST = frozenset({
-        "env_path", "env_name", "conda_env_path", "conda_env",
-        "cuda_version", "driver_version", "gpu_type", "gpu_count",
-        "model_path", "model_name", "checkpoint_path",
-        "data_path", "dataset_path",
-        "shared_storage", "workspace_root", "deps_dir",
-        "torch_version",
-    })
-
-    def _inject_runtime_facts(self, engine):
-        """Refresh ChecklistEngine.facts with latest session memory context.
-
-        Called before each checklist evaluation so the LLM has up-to-date
-        runtime knowledge (env path, cuda version, model path, etc.).
-        Only injects whitelisted keys to avoid context pollution.
-        """
-        base_facts = dict(engine.facts)
-        if self.session_memory:
-            for entry in self.session_memory.list_entries():
-                key = entry.get("key", "")
-                content = str(entry.get("content", ""))
-                if not key or not content:
-                    continue
-                if key not in self._FACT_KEYS_WHITELIST:
-                    continue
-                base_facts[key] = content[:300]
-        engine.facts = base_facts
 
     def _load_plugin_tools(self):
         for tool_dir in self.config.plugin_tool_dirs:
@@ -579,7 +544,7 @@ class WorkerAgent:
             tool_result=tool_result,
             tool_effects=tool_effects,
             turn_count=self.turn_count,
-            recent_tool_names=[t[0] for t in list(self._last_tool_calls_deque)[-10:]],
+            recent_tool_names=list(self._last_tool_calls_deque)[-10:],
             context_pressure=self.history.get_context_pressure() if self.history else 0.0,
             current_state=self._kernel.fsm.current_state,
             transitions_count=len(self._kernel.fsm.history),
@@ -617,18 +582,6 @@ class WorkerAgent:
         )
 
     def _exit(self):
-        # ── Checklist session summary ──
-        if self.checklist and self.checklist.total_checks > 0:
-            c = self.checklist
-            print(display.dim(
-                f"\n📋 Checklist: {c.total_checks} checks, "
-                f"{c.total_violations} violation(s) across "
-                f"{len(c.violation_by_id)} constraint(s)"
-            ))
-            if c.violation_by_id:
-                for cid, count in sorted(c.violation_by_id.items(), key=lambda x: -x[1]):
-                    print(display.dim(f"   [{cid}] violated {count}x"))
-
         display.goodbye()
         self._save_conversation(completed=True)
         mark_completed(self._session_dir)
@@ -695,6 +648,7 @@ class WorkerAgent:
                 self._react_loop()
             except KeyboardInterrupt:
                 display.interrupted()
+                self._interrupted = True
                 continue
 
             while self.config.mode == "auto" and self._should_auto_continue():
@@ -722,13 +676,25 @@ class WorkerAgent:
 
         Called from run() when self._orchestrator is set.
         Displays stage progress for subtask mode, handles Ctrl+C for cancellation.
+
+        Continuation detection: if the user input is a follow-up/confirmation
+        to the previous turn, skip re-routing and continue in single mode.
         """
         o = self._orchestrator
+
+        # ── Continuation detection: skip re-routing for follow-ups ──
+        if self.history.messages and self._is_continuation_input(user_input):
+            print(display.dim("\n[Orchestrator] Continuation detected, skipping re-route"))
+            self._run_single_mode(user_input)
+            return
+
+        print(display.dim("\n[Orchestrator] Routing..."))
         route = o.route(user_input)
 
         mode = route.get("mode", "single")
         template = route.get("template", "")
         dynamic_stages = route.get("dynamic_stages", [])
+        reason = route.get("reason", "")
 
         # ── Routing display ──
         source_parts = []
@@ -739,7 +705,17 @@ class WorkerAgent:
         if not source_parts:
             source_parts.append("default")
         source_str = ", ".join(source_parts)
-        print(display.dim(f"\n[Orchestrator] mode={mode}, {source_str}"))
+        print(display.dim(f"[Orchestrator] mode={mode}, {source_str}"))
+        if reason:
+            print(display.dim(f"[Orchestrator] reason: {reason}"))
+        else:
+            # Fallback reason when LLM didn't provide one
+            fallback_reasons = {
+                "single": "task can be handled by a single worker sequentially",
+                "subtask": "task requires multiple stages with dependencies",
+                "batch": "task compares independent variants in parallel",
+            }
+            print(display.dim(f"[Orchestrator] reason: {fallback_reasons.get(mode, mode)}"))
 
         # ── Subtask mode: show stage overview, then serial execution ──
         if mode == "subtask":
@@ -775,6 +751,18 @@ class WorkerAgent:
                         )
 
                         result = worker.execute(task)
+                        if result.interrupted:
+                            print(display.yellow(
+                                f"\n  ⚠ Stage {stage_idx}/{total} ({sub.id}) interrupted by user."
+                            ))
+                            print(display.yellow("  Progress saved. Continue later with /plan resume."))
+                            self._inject_subtask_result_to_history(
+                                f"[Stage {stage_idx}/{total}] {sub.id}: INTERRUPTED"
+                            )
+                            upstream.update(result.artifacts)
+                            upstream[sub.id] = result.summary
+                            self._current_stage_id = None
+                            return
                         if result.status == "failed":
                             print(display.red(
                                 f"  ✗ {sub.id} failed: {result.summary[:200]}"
@@ -784,6 +772,7 @@ class WorkerAgent:
                             )
                             upstream.update(result.artifacts)
                             upstream[sub.id] = result.summary
+                            self._current_stage_id = None
                             return
 
                         upstream.update(result.artifacts)
@@ -846,6 +835,10 @@ class WorkerAgent:
             return
 
         # ── Single mode: use existing ReAct loop ──
+        self._run_single_mode(user_input)
+
+    def _run_single_mode(self, user_input: str):
+        """Execute user input in single ReAct mode (no subtask/batch routing)."""
         if self.scene is None:
             self.scene = ScenePreset.auto_detect(user_input=user_input)
 
@@ -860,6 +853,7 @@ class WorkerAgent:
             self._react_loop()
         except KeyboardInterrupt:
             display.interrupted()
+            self._interrupted = True
 
         while self.config.mode == "auto" and self._should_auto_continue():
             self._auto_turn_count += 1
@@ -880,6 +874,47 @@ class WorkerAgent:
                 f"\n[Auto mode] Stopped after {self._auto_turn_count} auto turns.\n"
             ))
             self._auto_turn_count = 0
+
+    def _is_continuation_input(self, user_input: str) -> bool:
+        """Determine if user_input is a follow-up to the previous turn.
+
+        Uses Judge.is_continuation() which has a fast heuristic path
+        for common confirmations and an LLM fallback for ambiguous cases.
+        """
+        # Need at least one previous assistant message to be a "continuation"
+        prev_summary = self._get_last_assistant_summary()
+        if not prev_summary:
+            return False
+
+        judge = getattr(self, "judge", None)
+        if judge is None:
+            # No judge available — use simple heuristic only
+            stripped = user_input.strip().lower()
+            _FAST = {"确认", "好的", "可以", "是的", "对", "行", "嗯", "ok",
+                     "yes", "y", "go", "sure", "继续", "好", "是", "对的",
+                     "没问题", "确定", "同意", "proceed", "continue"}
+            return stripped in _FAST
+
+        try:
+            return judge.is_continuation(user_input, prev_summary)
+        except Exception:
+            return False
+
+    def _get_last_assistant_summary(self) -> str:
+        """Get a brief summary of the last assistant turn for continuation detection."""
+        for msg in reversed(self.history.messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content[:300]
+                if isinstance(content, list):
+                    # Extract text blocks
+                    texts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            texts.append(block.get("text", ""))
+                    return " ".join(texts)[:300]
+        return ""
 
     def _inject_subtask_result_to_history(self, summary: str):
         """Inject a structured subtask/batch result into the main agent's history.
@@ -923,6 +958,12 @@ class WorkerAgent:
         self._inject_context(task)
         self._original_user_task = task
         self.history.append({"role": "user", "content": task})
+
+        # Fix 5: Enable worker mode on ProgressGuard for tighter thresholds
+        for g in self._kernel.deps.guard_registry.guards:
+            if isinstance(g, ProgressGuard):
+                g.is_worker_mode = True
+                break
 
         # ── Run loop with error guard ──
         loop_error: str | None = None
@@ -983,6 +1024,7 @@ class WorkerAgent:
             session_input_tokens=self._session_input_tokens,
             session_output_tokens=self._session_output_tokens,
             elapsed_seconds=elapsed,
+            interrupted=self._interrupted,
         )
 
     # ── Session management ─────────────────────────────────────────────────
@@ -1118,20 +1160,18 @@ class WorkerAgent:
     # ── Auto-skill loading ─────────────────────────────────────────────────
 
     def _register_skill_guards(self, skill_name: str):
-        """Auto-register constraints and warnings from a Skill's frontmatter.
+        """Register constraints from skill YAML frontmatter AND LLM-extracted cache.
 
-        Called after a skill is loaded. Extracts structured constraints/warnings
+        Called after a skill is loaded. Extracts structured constraints
         from the Skill's YAML frontmatter and registers them with the Guard system.
-        This is separate from the LLM-based constraint extraction (_extract_skill_constraints)
-        which analyzes prose content. Idempotent — skips if already registered.
+        Also registers any LLM-extracted constraints from the cache.
+        Idempotent — skips if already registered.
         """
-        if not hasattr(self, '_skill_guards_registered'):
-            self._skill_guards_registered = set()
         if skill_name in self._skill_guards_registered:
             return
         self._skill_guards_registered.add(skill_name)
 
-        # Register hard constraints from frontmatter
+        # 1. YAML frontmatter constraints
         try:
             constraints = self.skill_manager.get_constraints(skill_name)
             if constraints:
@@ -1141,26 +1181,8 @@ class WorkerAgent:
         except Exception as e:
             logger.debug("No frontmatter constraints for skill '%s': %s", skill_name, e)
 
-        # Register soft warnings from frontmatter
-        try:
-            warnings = self.skill_manager.get_warnings(skill_name)
-            if warnings:
-                # Check if we already have a WarningGuard registered
-                guard_registry = self._kernel.deps.guard_registry
-                existing_warning_guard = None
-                for g in guard_registry.guards:
-                    if isinstance(g, WarningGuard):
-                        existing_warning_guard = g
-                        break
-                if existing_warning_guard:
-                    existing_warning_guard.add_warnings(warnings)
-                else:
-                    warning_guard = WarningGuard(warnings=warnings)
-                    guard_registry.register(warning_guard)
-                logger.info("Registered %d frontmatter warnings from skill '%s'",
-                            len(warnings), skill_name)
-        except Exception as e:
-            logger.debug("No frontmatter warnings for skill '%s': %s", skill_name, e)
+        # 2. LLM-extracted constraints from cache (if already available)
+        self._register_llm_constraints(skill_name)
 
     def _auto_load_skills(self, user_input: str):
         """Load skills based on semantic judgment (primary) or keyword fallback.
@@ -1178,7 +1200,7 @@ class WorkerAgent:
         # Primary: semantic suggestion via Judge
         if self.judge and self.judge.provider is not None:
             suggested = self.judge.suggest_skills(user_input, available)
-            loaded = set(suggested)
+            loaded = set(suggested[:2])  # Cap at 2 skills per auto-load
         else:
             # Fallback: keyword matching (Judge unavailable)
             for s in available:
@@ -1186,6 +1208,8 @@ class WorkerAgent:
                 name = s.get("name", "")
                 if any(kw.lower() in user_input.lower() for kw in keywords):
                     loaded.add(name)
+                    if len(loaded) >= 2:
+                        break
 
         for name in loaded:
             try:
@@ -1202,8 +1226,14 @@ class WorkerAgent:
             skill_map = {n: self._active_skill_content.get(n, "") for n in loaded}
             self._batch_extract_and_rebuild(skill_map)
 
-    def _apply_skill_effects(self, skill_name: str):
-        """Apply effects declared in skill frontmatter — no hardcoded skill names."""
+    def _apply_skill_effects(self, skill_name: str, _depth: int = 0):
+        """Apply effects declared in skill frontmatter — no hardcoded skill names.
+
+        _depth prevents recursive companion loading from cascading indefinitely.
+        """
+        if _depth >= 2:
+            logger.debug("Skill effects recursion cap reached (depth=%d) for %s", _depth, skill_name)
+            return
         effects = self.skill_manager.get_effects(skill_name)
         if not effects:
             return
@@ -1218,13 +1248,20 @@ class WorkerAgent:
         # Auto-load companion skills
         companions = effects.get("companion_skills")
         if companions and isinstance(companions, list):
-            self._auto_load_companion_skills(companions)
+            self._auto_load_companion_skills(companions, _depth=_depth + 1)
 
-    def _auto_load_companion_skills(self, skill_names: list[str]):
+    def _auto_load_companion_skills(self, skill_names: list[str], _depth: int = 0):
+        # Cap companion loading to prevent cascading skill explosion
+        # Only load companions that aren't already loaded, max 2 at a time
         needs_refresh = False
+        loaded_count = 0
+        _MAX_COMPANIONS = 2
         for name in skill_names:
             if name in self._loaded_skills:
                 continue
+            if loaded_count >= _MAX_COMPANIONS:
+                logger.debug("Companion skill cap reached (%d), skipping: %s", _MAX_COMPANIONS, name)
+                break
             try:
                 content = self.skill_manager.load(name)
                 if content:
@@ -1233,7 +1270,10 @@ class WorkerAgent:
                     self._skill_load_iterations[name] = self._total_iterations
                     display.skill_auto_loaded(name)
                     self._register_skill_guards(name)
+                    # Fix 3: Do NOT call _apply_skill_effects for companions
+                    # to prevent infinite cascading (companion's companion's companion...)
                     needs_refresh = True
+                    loaded_count += 1
             except Exception:
                 pass
         if needs_refresh:
@@ -1242,6 +1282,109 @@ class WorkerAgent:
                 for n in skill_names if n in self._loaded_skills
             }
             self._batch_extract_and_rebuild(skill_map)
+
+    # ── Mid-turn dynamic skill loading/unloading ───────────────────────────
+
+    _SKILL_CHECK_INTERVAL = 10  # Check every N iterations
+    _SKILL_STALE_THRESHOLD = 50  # Unload after N iterations without relevance
+
+    def _mid_turn_skill_check(self, tool_calls: list):
+        """Periodically check if new skills should be loaded based on activity.
+
+        Called from _on_kernel_tool_results every _SKILL_CHECK_INTERVAL iterations.
+        Uses Judge LLM to decide if the agent's recent activity warrants loading
+        a new skill that wasn't obvious at turn start.
+        """
+        if self._total_iterations % self._SKILL_CHECK_INTERVAL != 0:
+            return
+        if self._total_iterations == 0:
+            return
+
+        # Don't burn judge budget if already exhausted
+        if self.judge.budget.exhausted:
+            return
+
+        skills = self.skill_manager.list_skills()
+        available = [s for s in skills if s.get("name", "") not in self._loaded_skills]
+        if not available:
+            return
+
+        # Build recent activity summary from _recent_iters
+        recent_activity = []
+        for tc in tool_calls:
+            args = tc.get("arguments", {})
+            summary = ""
+            if tc["name"] == "shell":
+                summary = args.get("command", "")[:120]
+            elif tc["name"] in ("read_file", "write_file", "edit_file"):
+                summary = args.get("path", "") or args.get("file_path", "")
+            elif tc["name"] == "load_skill":
+                summary = args.get("name", "")
+            else:
+                summary = str(args)[:80]
+            recent_activity.append({"tool": tc["name"], "args_summary": summary})
+
+        # Also include recent history from deque
+        for tool_name in list(self._last_tool_calls_deque)[-10:]:
+            if not any(a["tool"] == tool_name for a in recent_activity):
+                recent_activity.append({"tool": tool_name, "args_summary": ""})
+
+        suggested = self.judge.suggest_skills_by_context(
+            task=self._original_user_task,
+            recent_activity=recent_activity,
+            loaded_skills=list(self._loaded_skills),
+            available_skills=available,
+        )
+
+        for name in suggested[:1]:  # Max 1 per check
+            try:
+                content = self.skill_manager.load(name)
+                if content:
+                    self._loaded_skills.add(name)
+                    self._active_skill_content[name] = content
+                    self._skill_load_iterations[name] = self._total_iterations
+                    self._apply_skill_effects(name)
+                    display.skill_auto_loaded(name)
+                    self._register_skill_guards(name)
+                    self._on_skill_loaded(name, content)
+                    logger.info("Mid-turn skill loaded: %s (iter %d)", name, self._total_iterations)
+            except Exception:
+                pass
+
+    def _unload_stale_skills(self):
+        """Unload skills that haven't been relevant for many iterations.
+
+        Frees context window space by removing skill content that the agent
+        hasn't needed. The skill can always be re-loaded later.
+        """
+        if self._total_iterations < self._SKILL_STALE_THRESHOLD:
+            return
+
+        stale = []
+        for name, load_iter in list(self._skill_load_iterations.items()):
+            age = self._total_iterations - load_iter
+            if age >= self._SKILL_STALE_THRESHOLD and name in self._active_skill_content:
+                # Check if skill was recently referenced (tool calls matching keywords)
+                if name in self._recently_referenced_skills:
+                    # Reset — it's still relevant
+                    self._skill_load_iterations[name] = self._total_iterations
+                    continue
+                stale.append(name)
+
+        for name in stale:
+            # Remove from active content (frees context), but keep in _loaded_skills
+            # so it won't be re-suggested immediately. It can be re-loaded via load_skill.
+            del self._active_skill_content[name]
+            del self._skill_load_iterations[name]
+            self._loaded_skills.discard(name)
+            logger.info("Unloaded stale skill: %s (iter %d)", name, self._total_iterations)
+            print(display.dim(f"  ↓ Skill '{name}' unloaded (stale, can be re-loaded)"))
+
+        if stale:
+            self._refresh_system_prompt()
+
+        # Clear referenced set each check cycle
+        self._recently_referenced_skills.clear()
 
     # ── User path confirmation ────────────────────────────────────────────
 
@@ -1272,31 +1415,11 @@ class WorkerAgent:
         self._session_output_tokens += result.output_tokens
         self._budget_guard.report_tokens(result.input_tokens, result.output_tokens)
         self._turn_iteration_count = result.iterations
-        display.turn_summary(self.turn_count, result.iterations, result.input_tokens, result.output_tokens)
+        display.turn_summary(self.turn_count, result.elapsed, result.input_tokens, result.output_tokens)
 
     def _on_kernel_response(self, response: dict):
         """Called by Kernel after LLM response is appended to history."""
-        # Gate override detection
-        if response.get("content"):
-            for m in GATE_OVERRIDE_RE.finditer(response["content"]):
-                gate_name = m.group(1).upper()
-                reason = m.group(2).strip()
-                if gate_name in (
-                    "MODE_B_DESIGN_INTEGRITY", "MEGATRON_NATIVE_INTEGRITY",
-                    "COMPONENT_MAPPING", "MIGRATION_BLUEPRINT",
-                ) and self.judge.classify("is_frozen_excuse", {"reason": reason, "gate_name": gate_name}, default=False):
-                    logger.warning("Gate override REJECTED for %s — 'frozen' is not a valid reason", gate_name)
-                    continue
-
-        # Checklist override detection
-        if response.get("content") and self.checklist:
-            for m in CHECKLIST_OVERRIDE_RE.finditer(response["content"]):
-                cid = m.group(1)
-                removed = self.checklist.override(cid)
-                if removed:
-                    print(display.green(f"  🛡 [{cid}] dismissed"))
-                else:
-                    logger.debug("Checklist override for unknown id: %s", cid)
+        pass
 
     def _on_kernel_tool_results(self, tool_calls: list, results: list):
         """Called by Kernel after tool execution and guard checks."""
@@ -1311,25 +1434,22 @@ class WorkerAgent:
         # Refresh system prompt if skill/plan tools were used
         if any(tc["name"] in ("load_skill", "plan_create", "plan_update", "plan_status")
                for tc in tool_calls):
+            # Register constraints for any newly loaded skills via load_skill tool
+            for tc, result in zip(tool_calls, results):
+                if tc["name"] == "load_skill" and isinstance(result, str) and result.startswith("SUCCESS"):
+                    skill_name = tc.get("arguments", {}).get("name", "")
+                    if skill_name and skill_name not in self._skill_guards_registered:
+                        content = self._active_skill_content.get(skill_name) or self.skill_manager.load(skill_name)
+                        if content:
+                            self._loaded_skills.add(skill_name)
+                            self._active_skill_content[skill_name] = content
+                            self._skill_load_iterations[skill_name] = self._total_iterations
+                            self._on_skill_loaded(skill_name, content)
             self._refresh_system_prompt()
 
-        # Checklist checks (per tool)
-        if self.checklist:
-            for tc, result in zip(tool_calls, results):
-                obs = self._build_obs(
-                    tool_name=tc.get("name", ""),
-                    tool_args=tc.get("arguments", {}),
-                    tool_result=result,
-                )
-                self._inject_runtime_facts(self.checklist.engine)
-                for alert in self.checklist.check(obs):
-                    if alert.severity == "error":
-                        print(display.red(f"  🛡 {alert.message}"))
-                    elif alert.severity == "info":
-                        print(display.dim(f"  🛡 {alert.message}"))
-                    else:
-                        print(display.yellow(f"  🛡 {alert.message}"))
-                    self._inject_message(alert.message)
+        # Dynamic mid-turn skill loading/unloading
+        self._mid_turn_skill_check(tool_calls)
+        self._unload_stale_skills()
 
         # Judge budget exhaustion warning
         if self.judge.budget.exhausted and self.judge.budget.skipped_detail:
@@ -1341,23 +1461,16 @@ class WorkerAgent:
                     f"Skipped: {self.judge.budget.skipped_detail}"
                 ))
 
-        # Context pressure warning
+        # Context pressure warning (inject as new message, not appending to existing)
         pressure = self.history.get_context_pressure()
         if pressure >= 0.75:
             warning = (
                 f"⚠ Context at {int(pressure*100)}%. Save key findings with memory_write. "
                 "Batch independent tool calls to reduce turn count."
             )
-            msgs = self.history.messages
-            if msgs and msgs[-1].get("role") == "user":
-                last = msgs[-1]
-                content = last.get("content", "")
-                if isinstance(content, list):
-                    content.append({"type": "text", "text": warning})
-                elif isinstance(content, str):
-                    last["content"] = content + "\n\n" + warning
-            else:
-                self.history.append({"role": "user", "content": warning})
+            # Inject as a separate user message instead of mutating the last message
+            # to prevent unbounded growth from repeated appends
+            self.history.append({"role": "user", "content": warning})
 
         self._tool_call_cache = {}
         print()
@@ -1569,6 +1682,12 @@ class WorkerAgent:
                         continue
                     else:
                         raise
+                # Non-retryable 400 errors (e.g., tool_use/tool_result pairing)
+                # should not be retried — they are permanent request errors.
+                from flagscale.agent.react.retry import _extract_status
+                _status = _extract_status(e)
+                if _status == 400:
+                    raise
                 if _stream_attempt < max_stream_retries:
                     wait = 2 ** _stream_attempt
                     logger.warning("Stream interrupted (attempt %d/%d), retrying in %ds: %s",

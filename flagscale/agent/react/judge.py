@@ -109,6 +109,19 @@ Answer YES if GPU memory is held by dead/stale processes, or memory allocation c
 Answer NO if GPU state is clean or processes are legitimately running.
 Reply ONLY: {"real": true/false, "need_more": null}""",
 
+    "is_stuck_in_loop": """\
+Is this agent stuck in a repetitive loop without making progress?
+
+Context: {context}
+
+Answer YES if: the agent is repeating the same operations without gaining new information,
+retrying failed operations without changing approach, or cycling between the same tools
+with no state change.
+Answer NO if: the agent is reading DIFFERENT files/URLs to gather diverse information,
+making incremental progress toward a goal, or following a systematic investigation plan
+where each step targets different data.
+Reply ONLY: {"real": true/false, "need_more": null}""",
+
     "is_user_porting_confirm": """\
 Is the user choosing between Mode B and Mode C?
 
@@ -159,43 +172,34 @@ Check for: {prompt}
 
 Reply ONLY: {{"match": true/false, "reason": "one-line explanation of why this does or does not violate the constraint"}}""",
 
-    "is_frozen_excuse": """\
-Determine if this gate override reason is an INVALID excuse based on "frozen parameters."
-
-A gate override is INVALID if the reason claims a component can be skipped because:
-- Parameters are frozen / no_grad / requires_grad=False
-- It's a feature extractor with no trainable params
-- It's inference-only or not trained
-- Frozen layers don't need native implementation
-- No TP benefit because parameters are frozen
-
-These are NOT valid reasons to skip design integrity gates — frozen parameters still need correct architecture mapping for inference, checkpointing, and future fine-tuning.
-
-A gate override IS VALID if the reason is about genuine architectural differences, missing features in the target framework, or legitimate design decisions unrelated to parameter freezing.
-
-Reason text: {reason}
-Gate: {gate_name}
-
-Reply ONLY: {{"real": true/false, "need_more": null}}
-(true = this IS an invalid frozen excuse, false = this is a legitimate reason)""",
-
     "extract_constraints": """\
 Read the skill content below and extract ONLY constraints that can be checked by looking at a single tool call result (shell command + output, file write, file read).
 
 Principle: a constraint is valid if, given the tool call context, an LLM can answer "does this tool call violate the rule?" with confidence. If the answer requires knowing what the agent did NOT do, or requires multi-step reasoning about the agent's plan, SKIP it.
 
-SEVERITY (critical — choose carefully):
-- "error" (HARD BLOCK): violating this constraint causes irreversible harm — package conflicts destroying environments, training on wrong data, incorrect results that waste hours. The tool call will be BLOCKED before execution when the SCOPE matches. Only use for truly destructive mistakes.
-- "warning" (soft reminder): violating this is suboptimal but not immediately destructive — suboptimal config, missing optimization, mild performance impact. The tool call still executes.
-
 For each constraint you extract, output:
 - id: snake_case prefixed with the skill name
 - description: 1 line
-- trigger_on: {{"tool": "shell"|"write_file"|"read_file"|"edit_file"}}
+- tool_names: list of tool names that can trigger this constraint, e.g. ["shell"] or ["shell", "write_file"]. MUST be non-empty — every constraint must specify which tools it applies to. Never use [].
+- keywords: list of COMPLETE phrases (>= 4 chars each) that identify the scenario. ANY one keyword match triggers the constraint (OR logic). Use multi-word phrases for precision to avoid false triggers from file paths or unrelated text.
 - prompt: "SCOPE: <concrete condition>. CHECK: <violation signal>."
-- reminder: 1-sentence warning to show the agent
-- severity: "error" or "warning"
-- max_reminders: 3-5
+- correction: 1-sentence warning to show the agent
+
+CRITICAL keyword rules:
+- Keywords use OR logic: if ANY keyword in the list appears in the command, the constraint is triggered for LLM judgment.
+- Each keyword MUST be a specific, complete phrase that uniquely identifies the scenario.
+- NEVER use single generic words like "flagscale", "torch", "python", "install" alone — these match file paths and unrelated commands, causing false triggers.
+- GOOD examples:
+  - ["pip install flagscale", "pip3 install flagscale"] — specific action+target
+  - ["pip install apex", "pip3 install apex"] — won't match "ls /path/apex/"
+  - ["conda create --name", "conda create -n"] — specific flag usage
+  - ["rm -rf", "rmdir", "shutil.rmtree"] — multiple variants of same action (OR)
+- BAD examples:
+  - ["pip install", "flagscale"] — "flagscale" alone matches any path containing it
+  - ["torch"] — matches any file path with "torch" in it
+  - ["install"] — too generic, matches everything
+
+- tool_names MUST be non-empty. If you cannot determine which tool a constraint applies to, skip it.
 
 Skill content:
 {skill_content}
@@ -218,18 +222,49 @@ Consecutive checks with no output change: {stall_count}
 Recent output:
 {output}
 
-Phase-aware monitoring - adapt check frequency to the command's lifecycle stage:
-- STARTUP (no output yet, imports loading, initializing): check frequently (10-30s). Early failures are common.
-- LOADING (model weights loading, data downloading, progress bars advancing): moderate (30-60s).
-- STABLE (training iterations running, loss printing regularly): relaxed (120-300s).
-- ANOMALY (errors in output, repeated failures, output stalled unexpectedly): check soon (10-15s) or kill.
+## Phase-aware monitoring
 
-Key judgment rules:
-- If output is actively progressing (new lines, advancing percentages): healthy, adjust interval to phase.
-- If output has stalled but the operation is known to be slow (large compile, decompression): allow more time.
-- If the command contains embedded sleep/wait and produces no output: you CANNOT verify whether the process being waited for is still alive. After a reasonable initial wait, KILL the command so the agent can check external state (process liveness, GPU status, logs) with its full tool set, then decide whether to retry.
-- If you see repeated errors, network failures, or crash signatures: kill immediately.
-- Do NOT let a silent command run indefinitely just because 'it might be working.' When in doubt, kill early.
+Identify the command's current lifecycle phase and adapt your judgment:
+
+- STARTUP (no output yet, imports loading, initializing): check frequently (10-30s). Early failures are common.
+- INSTALLING (pip/conda installing packages, "Installing collected packages", extracting wheels, compiling extensions): moderate (60-120s). Package installation involves disk I/O that produces no stdout — this is NORMAL. Large packages (transformer_engine, torch, apex, flash-attn, onnxscript) can take 3-10 minutes during the "Installing collected packages" phase with zero output.
+- COMPILING (gcc/nvcc/ninja building C++/CUDA extensions, "Building wheel", "running build_ext"): very patient (120-300s). Source builds are CPU-intensive and produce minimal output between compilation units.
+- DOWNLOADING (wget, curl, git clone, pip downloading): moderate (30-60s). Network operations MUST show progress indicators (percentages, "Receiving objects", transfer rates). If no progress indicator has EVER appeared, the connection may have failed silently.
+- LOADING (model weights loading, data loading, progress bars advancing): moderate (30-60s).
+- STABLE (training iterations running, loss printing regularly): relaxed (120-300s).
+- ANOMALY (errors in output, repeated failures, connection refused, segfault): check soon (10-15s) or kill.
+
+## Key judgment rules
+
+1. NEVER kill a command just because output hasn't changed — first determine the phase.
+   Silent phases are EXPECTED for: package installation, source compilation, large file extraction, model weight loading.
+
+2. Kill criteria (ALL must be met):
+   - Output has stalled AND
+   - The stall duration exceeds what's reasonable for the identified phase AND
+   - There is no evidence the operation is still working (no disk/CPU activity indicators in output)
+
+3. Kill immediately if:
+   - Repeated error messages or crash signatures in output
+   - Network failures with no retry mechanism (ConnectionRefused, DNS failure)
+   - Deadlock indicators (process stuck after error, infinite retry loops)
+   - The command contains embedded sleep/wait with no way to verify the waited process is alive — after 2-3 minutes of silence, kill so the agent can check external state
+
+4. Phase-specific patience limits (KILL if exceeded with no progress):
+   - `pip install` at "Installing collected packages" phase: allow up to 10 minutes of silence
+   - Source builds (pip install --no-build-isolation, setup.py, cmake, ninja): allow up to 30 minutes
+   - `git clone` / `git fetch`: allow up to 5 minutes ONLY IF progress indicators ("Receiving objects", "Resolving deltas", percentages) have appeared. If the ONLY output is "Cloning into '...'" with NO progress indicators after 2 minutes, the remote is likely unreachable — KILL.
+   - `wget` / `curl` downloads: allow up to 5 minutes ONLY IF transfer rate or progress was shown. No progress after 1 minute = KILL.
+   - conda create/install: allow up to 10 minutes (solver can be slow)
+
+5. Network operation stall detection:
+   - git/wget/curl/pip download phases MUST show progress within the first 2 minutes
+   - "Cloning into 'X'..." with no subsequent "Receiving objects" or "remote: Counting objects" = connection hanging
+   - "Connecting to..." with no follow-up = connection timeout, kill after 1-2 minutes
+   - If total elapsed > 10 minutes and output has NEVER changed from the initial message, KILL unconditionally
+
+6. When uncertain about install/compile phases: increase next_check_seconds rather than killing.
+   When uncertain about network operations: KILL — network hangs don't self-resolve.
 
 Reply with ONLY a JSON object:
 {{"kill": true/false, "reason": "...", "next_check_seconds": <int 10-300>}}
@@ -350,7 +385,7 @@ file inspection, cleanup, or Q&A that don't need domain-specific skills.
 Reference subtask templates (you may reuse or ignore these): {templates}
 
 Reply with ONLY a JSON object:
-{{"mode": "single"|"subtask"|"batch", "profile": "<profile_name>"}}
+{{"mode": "single"|"subtask"|"batch", "profile": "<profile_name>", "reason": "<1-sentence explanation of why this mode>"}}
 
 For "subtask" mode — choose one of two approaches:
 
@@ -367,7 +402,7 @@ For "subtask" mode — choose one of two approaches:
        "profile": "<default_profile_name>",
        "template": "",
        "dynamic_stages": [
-         {{"id": "stage_1", "description": "what to do", "profile": "env-setup", "depends_on": []}},
+         {{"id": "stage_1", "description": "what to do", "profile": "train-env-setup", "depends_on": []}},
          {{"id": "stage_2", "description": "what to do next", "profile": "training-reproduce", "depends_on": ["stage_1"]}},
          {{"id": "stage_3", "description": "what to do last", "profile": "training-reproduce", "depends_on": ["stage_2"]}}
        ]
@@ -383,6 +418,30 @@ For "single" mode, omit template, dynamic_stages, and batch_tasks."""
 # Register route_intent in the classify prompts dict (must be after the prompt definition)
 _CLASSIFY_PROMPTS["route_intent"] = _ROUTE_INTENT_PROMPT
 
+# ── Continuation detection (skip re-routing for follow-ups) ────────────────
+
+_CLASSIFY_PROMPTS["is_continuation"] = """\
+Determine if this user input is a CONTINUATION of the previous conversation turn,
+or a NEW independent task.
+
+User input: {user_input}
+Previous assistant action summary: {previous_summary}
+
+Answer YES (continuation) for:
+- Confirmations: "确认", "好的", "可以", "是的", "yes", "ok", "go ahead", "继续"
+- Follow-up questions about the SAME topic just discussed
+- Providing additional details requested by the previous turn
+- Short replies that only make sense in context of the previous turn
+- Corrections or adjustments to the previous action: "不对，应该是...", "改成..."
+
+Answer NO (new task) for:
+- A clearly new topic or task unrelated to the previous turn
+- Long, self-contained instructions that don't reference the previous turn
+- Requests that explicitly start a new task: "帮我做...", "新任务:", "接下来..."
+
+Reply ONLY: {{"real": true/false, "need_more": null}}
+(true = this IS a continuation, false = this is a new task)"""
+
 # ── Skill suggestion (semantic, replaces keyword matching) ────────────────────
 
 _CLASSIFY_PROMPTS["skill_suggest"] = """\
@@ -394,9 +453,34 @@ Available skills (not yet loaded):
 {available_skills}
 
 Rules:
-- Only suggest skills that are clearly relevant to the user's request.
+- ONLY suggest skills that are DIRECTLY and IMMEDIATELY needed for the current task.
+- Be CONSERVATIVE: when in doubt, do NOT suggest. Skills can always be loaded later.
+- If the task is a sub-step of a larger workflow (e.g., "install dependencies"), only suggest skills for THAT specific step, not the entire workflow.
+- Do NOT suggest skills for future steps that haven't started yet.
 - For simple operations (delete files, check status, list processes, read files), return empty list.
-- Return ONLY a JSON array of skill names, e.g. ["train-config", "train-run"] or [].
+- Maximum 2 skills per suggestion. If more seem relevant, pick only the most critical ones.
+- Return ONLY a JSON array of skill names, e.g. ["train-env-setup"] or [].
+"""
+
+_CLASSIFY_PROMPTS["skill_suggest_by_context"] = """\
+Based on the agent's recent activity, decide which skills (if any) should be loaded NOW.
+
+Original task: {task}
+
+Recent tool calls (last {window} iterations):
+{recent_activity}
+
+Currently loaded skills: {loaded_skills}
+
+Available skills (not yet loaded):
+{available_skills}
+
+Rules:
+- Suggest a skill ONLY if the recent activity clearly indicates the agent is entering that skill's domain.
+- Examples: if the agent just launched training → suggest "train-monitor"; if the agent is debugging OOM → suggest "train-monitor".
+- Do NOT suggest skills already loaded.
+- Be CONSERVATIVE: max 1 skill per suggestion. Only suggest when the need is obvious.
+- Return ONLY a JSON array of skill names, e.g. ["train-monitor"] or [].
 """
 
 # ── Constraint violation judgment (Phase 3) ──────────────────────────────────
@@ -412,8 +496,30 @@ Tool call:
 - Args: {tool_args}
 - Result: {tool_result}
 
-Reply ONLY: {{"real": true/false, "need_more": null}}
+Recent tool history (what the agent already did before this call):
+{recent_tool_history}
+
+IMPORTANT RULES for accurate judgment:
+1. SELF-REFERENTIAL CHECK: If the constraint says "must do X before Y" and the CURRENT command IS X itself (the prerequisite action), it is NOT a violation. Example: constraint says "run nvidia-smi before installing torch" — if the current command IS nvidia-smi, that's the agent fulfilling the prerequisite, NOT violating it.
+2. HISTORY CHECK: Look at the recent tool history above. If the constraint requires a prerequisite action (e.g., "check CUDA version first"), and that action ALREADY APPEARS in the history, the prerequisite is satisfied — NOT a violation.
+3. SCOPE CHECK: Only judge what the constraint actually asks about. If the constraint is about "pip install torch" but the current command is something else, it's NOT a violation.
+4. When in doubt, answer false (not violated). Only answer true when you are CONFIDENT the constraint is clearly violated.
+
+Reply ONLY: {{"real": true/false, "reason": "one-line explanation of your judgment", "need_more": null}}
 (true = constraint IS violated, false = constraint is NOT violated)"""
+
+_CLASSIFY_PROMPTS["is_warning_triggered"] = """\
+Determine if this warning applies to the current tool context.
+
+Warning: {warning}
+Judgment criteria: {prompt}
+
+Current tool call:
+- Tool: {tool_name}
+- Args: {tool_args}
+
+Reply ONLY: {{"real": true/false, "need_more": null}}
+(true = warning SHOULD fire, false = warning does NOT apply)"""
 
 # ── JudgeBudget ──────────────────────────────────────────────────────────
 
@@ -422,13 +528,16 @@ class JudgeBudget:
     """Per-turn call budget for LLM judges.
 
     Strategy:
-    - Max 16 judge calls per turn (classify may use multi-round, plus health/result/skill/complexity)
+    - Max 64 judge calls per turn for classify operations
+    - Health checks have a separate budget (not shared with classify)
     - Each judge type caches independently
     - On exhaustion: health -> heuristic, skill/complexity -> default, classify -> cached/default
     """
 
     max_calls_per_turn: int = 64
+    max_health_per_turn: int = 20
     calls_this_turn: int = 0
+    health_calls_this_turn: int = 0
     total_calls: int = 0
     total_saved_by_cache: int = 0
     _skipped_summary: str = ""  # summary of skipped categories for user-visible warning
@@ -438,11 +547,23 @@ class JudgeBudget:
     def exhausted(self) -> bool:
         return self.calls_this_turn >= self.max_calls_per_turn
 
+    @property
+    def health_exhausted(self) -> bool:
+        return self.health_calls_this_turn >= self.max_health_per_turn
+
     def consume(self) -> bool:
         """Return True if budget allows another call, incrementing if so."""
         if self.calls_this_turn >= self.max_calls_per_turn:
             return False
         self.calls_this_turn += 1
+        self.total_calls += 1
+        return True
+
+    def consume_health(self) -> bool:
+        """Return True if health budget allows another call."""
+        if self.health_calls_this_turn >= self.max_health_per_turn:
+            return False
+        self.health_calls_this_turn += 1
         self.total_calls += 1
         return True
 
@@ -455,6 +576,7 @@ class JudgeBudget:
 
     def reset_turn(self):
         self.calls_this_turn = 0
+        self.health_calls_this_turn = 0
         self._skipped_summary = ""
 
     @property
@@ -612,6 +734,12 @@ class Judge:
             if "{skill_content}" in prompt:
                 prompt = prompt.replace("{skill_content}", str(context.get("skill_content", "")))
 
+            # Generic fallback: substitute any remaining {key} placeholders from context
+            for key, val in context.items():
+                placeholder = "{" + key + "}"
+                if placeholder in prompt:
+                    prompt = prompt.replace(placeholder, str(val))
+
             data = self._call_and_parse(prompt, default={})
             need_more = data.get("need_more") if isinstance(data, dict) else None
             if need_more and isinstance(need_more, list) and round_num < self._MAX_CLASSIFY_ROUNDS - 1:
@@ -754,7 +882,7 @@ class Judge:
         output_changed: bool = True, stall_count: int = 0,
     ) -> dict:
         """Evaluate whether a long-running command is healthy."""
-        if self.budget.exhausted:
+        if self.budget.health_exhausted:
             self.budget.note_skipped("health", "health")
             if stall_count >= 3:
                 return {"kill": True, "reason": "Output stalled and health check unavailable (judge budget exhausted)"}
@@ -767,7 +895,7 @@ class Judge:
             self.budget.total_saved_by_cache += 1
             return self._health_cache[cache_key]
 
-        if not self.budget.consume():
+        if not self.budget.consume_health():
             return {"kill": False}
 
         prompt = _HEALTH_JUDGE_PROMPT.format(
@@ -908,6 +1036,77 @@ class Judge:
         valid_names = {s["name"] for s in available_skills}
         return [n for n in value if isinstance(n, str) and n in valid_names]
 
+    def suggest_skills_by_context(
+        self,
+        task: str,
+        recent_activity: list[dict],
+        loaded_skills: list[str],
+        available_skills: list[dict],
+    ) -> list[str]:
+        """Suggest skills based on recent tool activity (mid-turn).
+
+        Unlike suggest_skills() which uses user input, this uses the agent's
+        recent tool call history to detect when a new skill domain is entered.
+
+        Args:
+            task: The original user task description.
+            recent_activity: List of {"tool": ..., "args_summary": ...} dicts.
+            loaded_skills: Names of currently loaded skills.
+            available_skills: List of {"name": ..., "description": ...} for unloaded skills.
+
+        Returns:
+            List of skill names to load (max 1).
+        """
+        if not available_skills:
+            return []
+
+        skills_str = "\n".join(
+            f"- {s['name']}: {s.get('description', '')}" for s in available_skills
+        )
+        activity_str = "\n".join(
+            f"  [{a['tool']}] {a.get('args_summary', '')}" for a in recent_activity[-10:]
+        )
+        context = {
+            "task": task or "(unknown)",
+            "window": str(len(recent_activity)),
+            "recent_activity": activity_str or "(no activity yet)",
+            "loaded_skills": ", ".join(loaded_skills) if loaded_skills else "(none)",
+            "available_skills": skills_str,
+        }
+        value, source = self.classify_traced("skill_suggest_by_context", context, default=[])
+        if not isinstance(value, list):
+            return []
+        valid_names = {s["name"] for s in available_skills}
+        return [n for n in value[:1] if isinstance(n, str) and n in valid_names]
+
+    def is_continuation(self, user_input: str, previous_summary: str) -> bool:
+        """Determine if user_input is a follow-up to the previous turn.
+
+        Uses fast heuristic first, then LLM fallback.
+        Returns True if continuation (skip re-routing), False if new task.
+        """
+        # Fast path: common confirmation/continuation patterns
+        stripped = user_input.strip().lower()
+        _FAST_CONTINUATIONS = {
+            "确认", "好的", "可以", "是的", "对", "行", "嗯", "ok", "yes", "y",
+            "go", "go ahead", "sure", "继续", "好", "是", "对的", "没问题",
+            "确定", "同意", "proceed", "continue", "right", "yep", "yeah",
+        }
+        if stripped in _FAST_CONTINUATIONS:
+            return True
+
+        # Short input with no verb-like structure → likely continuation
+        if len(stripped) <= 5 and not any(c in stripped for c in "帮做请运行执行删除创建"):
+            return True
+
+        # LLM path for ambiguous cases
+        context = {
+            "user_input": user_input,
+            "previous_summary": previous_summary,
+        }
+        result = self.classify("is_continuation", context, default=False)
+        return bool(result)
+
     @property
     def trace(self) -> ClassifyTrace:
         """Expose per-turn classify trace for safety-critical callers."""
@@ -938,6 +1137,13 @@ class Judge:
     @staticmethod
     def _parse_classify_result(category: str, data: dict, default: Any) -> Any:
         """Extract classification decision from LLM response."""
+        if category == "is_constraint_violated":
+            # Return dict with violated bool + reason string
+            real = data.get("real") if isinstance(data, dict) else None
+            reason = data.get("reason", "") if isinstance(data, dict) else ""
+            if isinstance(real, bool):
+                return {"violated": real, "reason": str(reason)}
+            return {"violated": True, "reason": ""}  # conservative fallback
         if category == "is_user_porting_confirm":
             text = str(data.get("decision", "") or data.get("mode", "") or "").lower()
             if "mode_b" in text or "mode b" in text or "b" == text:
@@ -973,7 +1179,7 @@ class Judge:
             if isinstance(data, dict):
                 return data
             return default if default is not None else {"mode": "single"}
-        if category == "skill_suggest":
+        if category in ("skill_suggest", "skill_suggest_by_context"):
             # LLM should return a JSON array of skill names
             if isinstance(data, list):
                 return data

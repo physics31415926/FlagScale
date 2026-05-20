@@ -1,75 +1,109 @@
 ---
 name: train-config
-description: Generate and manage FlagScale training configuration files. Covers the two-level Hydra YAML structure (experiment config + task config), parallelism strategy (TP/PP/DP/EP/CP/VPP), mixed precision (BF16/FP16/FP8), TransformerEngine integration, checkpoint resume, multi-node setup, and topology-aware defaults.
+description: Generate and manage FlagScale training configuration files. Covers the two-level Hydra YAML structure (experiment
+  config + task config), parallelism strategy (TP/PP/DP/EP/CP/VPP), mixed precision (BF16/FP16/FP8), TransformerEngine integration,
+  checkpoint resume, multi-node setup, and topology-aware defaults.
 keywords:
-  - config
-  - configuration
-  - yaml
-  - parallel
-  - parallelism
-  - TP
-  - PP
-  - DP
-  - tensor parallel
-  - pipeline parallel
-  - mixed precision
-  - bf16
-  - fp8
-  - transformer engine
-  - hostfile
-  - multi-node
-  - 配置
-  - 并行
-  - 并行策略
-  - 训练配置
+- config
+- configuration
+- yaml
+- parallel
+- parallelism
+- TP
+- PP
+- DP
+- tensor parallel
+- pipeline parallel
+- mixed precision
+- bf16
+- fp8
+- transformer engine
+- hostfile
+- multi-node
+- 配置
+- 并行
+- 并行策略
+- 训练配置
 parameters:
-  - name: model_name
-    description: Model name for config directory (e.g., qwen3, llama3)
-  - name: model_size
-    description: Model size variant (e.g., 0_6b, 7b, 70b)
-requires: [workspace-layout]
-suggests: [topo-detect]
+- name: model_name
+  description: Model name for config directory (e.g., qwen3, llama3)
+- name: model_size
+  description: Model size variant (e.g., 0_6b, 7b, 70b)
+requires:
+- workspace-layout
+suggests:
+- topo-detect
 constraints:
-  - id: train_config_gbs_too_large_for_smoke_test
-    description: "Global batch size must be minimal for smoke tests (1-20 iters). GBS > DP*mbs*8 is wasteful."
-    severity: warning
-    check_phase: pre
-    trigger:
-      tools: [edit_file, write_file]
-      keywords: [global_batch_size, train_iters]
-    prompt: "For smoke test / environment validation / reproduce configs with train_iters <= 50, global_batch_size should equal DP * micro_batch_size (or at most 8x that). Check if GBS is far larger than DP*mbs."
-    correction: "GBS too large for smoke test — reduce to DP × micro_batch_size (e.g., GBS=4 for DP=4 mbs=1)"
-    max_violations: 2
-  - id: train_config_exp_dir_not_shared_storage
-    description: "exp_dir must use shared storage path (not ./outputs/) when shared storage is available"
-    severity: warning
-    check_phase: pre
-    trigger:
-      tools: [edit_file, write_file]
-      keywords: [exp_dir, output_dir, ./outputs]
-    prompt: "If shared_storage is available and exp_dir starts with './outputs/' or './' (local path), flag it. exp_dir should use the workspace_root from workspace-layout."
-    correction: "exp_dir should use shared storage path, not ./outputs/"
-    max_violations: 2
-
-warnings:
-  - id: smoke_test_reminder
-    description: "Remind to run a smoke test before full training"
-    severity: warning
-    trigger:
-      tools: [write_file, edit_file]
-      keywords: [train_iters, global_batch_size, num_layers]
-    prompt: "Check if this is a new config that hasn't been smoke-tested yet"
-    reminder: "Run a smoke test (train_iters=20) before launching full training."
-    max_reminders: 1
-
+- id: train_config_gbs_too_large_for_smoke_test
+  description: Global batch size must be minimal for smoke tests and initial validation runs. GBS > DP*mbs*8 is wasteful.
+  trigger:
+    tools:
+    - edit_file
+    - write_file
+    keywords:
+    - global_batch_size
+  prompt: "For smoke test / environment validation / initial '跑通' runs, global_batch_size should equal
+    DP * micro_batch_size (or at most 8x that). If train_iters <= 50 or train_samples is small or this is
+    clearly an initial validation (not full pretraining), check if GBS is far larger than DP*mbs.
+    With DP=4 mbs=1, GBS should be 4 (not 2048). The GBS=2048 in getting-started.md examples is for
+    real pretraining — never copy it for validation runs."
+  correction: "GBS too large for smoke test — reduce to DP × micro_batch_size (e.g., GBS=4 for DP=4 mbs=1).
+    Also set train_iters=20 and REMOVE train_samples entirely for smoke tests."
+- id: train_config_train_samples_too_large_for_smoke_test
+  description: train_samples should not be set for smoke tests. Use train_iters instead.
+  trigger:
+    tools:
+    - edit_file
+    - write_file
+    keywords:
+    - train_samples
+  prompt: "If this is a smoke test / environment validation / initial '跑通' run (train_iters <= 50, or
+    the user said '跑通'/'验证'/'test'), train_samples should NOT be set. Use train_iters=20 instead.
+    train_samples=244141056 (from getting-started.md) means the model will train for thousands of iterations
+    which defeats the purpose of a quick validation. Check: is train_samples being set alongside a small
+    train_iters? If train_iters is not set at all and train_samples is very large (>10000), this is likely
+    a smoke test that forgot to limit iterations."
+  correction: "Remove train_samples for smoke tests. Use train_iters=20 (or at most 50) instead.
+    train_samples controls total training duration — for validation, you only need 10-20 iterations."
+- id: train_config_exp_dir_not_shared_storage
+  description: exp_dir must use shared storage path (not ./outputs/) when shared storage is available
+  trigger:
+    tools:
+    - edit_file
+    - write_file
+    keywords:
+    - exp_dir
+    - output_dir
+    - ./outputs
+  prompt: If shared_storage is available and exp_dir starts with './outputs/' or './' (local path), flag it. exp_dir should
+    use the workspace_root from workspace-layout.
+  correction: exp_dir should use shared storage path, not ./outputs/
+- id: smoke_test_reminder
+  description: Remind to run a smoke test before full training
+  trigger:
+    tools:
+    - write_file
+    - edit_file
+    keywords:
+    - train_iters
+    - global_batch_size
+    - num_layers
+  prompt: Check if this is a new config that hasn't been smoke-tested yet
+  correction: Run a smoke test (train_iters=20) before launching full training.
 context_injection:
-  always: ["Common Configuration Pitfalls", "Config Validation Before Launch"]
+  always:
+  - Common Configuration Pitfalls
+  - Config Validation Before Launch
   by_tool:
-    write_file: ["Two-Level YAML Structure", "Config Generation Template"]
-    edit_file: ["Config Verification Checklist", "Parallelism Strategy"]
-    shell: ["Quick Test vs Real Training"]
+    write_file:
+    - Two-Level YAML Structure
+    - Config Generation Template
+    edit_file:
+    - Config Verification Checklist
+    - Parallelism Strategy
+    shell:
+    - Quick Test vs Real Training
 ---
-
 # FlagScale Training Configuration
 
 Generate and manage FlagScale training configuration files for distributed training.
@@ -378,8 +412,10 @@ Before configuring, determine the user's intent:
 
 **Quick test / environment validation** — goal is to run 1-20 steps as fast as possible. **CRITICAL: always minimize global_batch_size for smoke tests.** A GBS of 2048 for a 0.6B model on 8 GPUs is severely wasteful — with TP=2 DP=4, set GBS = DP × micro_batch_size = 4 (mbs=1). The GBS = 2048 rule from getting-started.md is for real pretraining, not for environment validation.
 
+**DO NOT copy train_samples from getting-started.md examples for smoke tests.** `train_samples: 244141056` means training for thousands of iterations. For validation, use `train_iters` only.
+
 **LR MUST be scaled with GBS.** The linear scaling rule: `lr = base_lr × (your_gbs / reference_gbs)`. For smoke tests with minimal GBS:
-- `model.train_iters`: 1-20
+- `model.train_iters`: 10-20 (NEVER use train_samples for smoke tests)
 - `model.micro_batch_size`: 1
 - `model.global_batch_size`: smallest valid value (= DP × micro_batch_size), NOT 2048
 - `model.lr`: scale down proportionally: base_lr × (smoke_gbs / reference_gbs). E.g., if reference is lr=1.5e-4 at GBS=2048, and smoke GBS=4, then lr = 1.5e-4 × (4/2048) ≈ 3e-7

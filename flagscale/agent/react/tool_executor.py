@@ -4,7 +4,6 @@ Handles single and batch tool execution with:
 - Deduplication of identical calls
 - Batch size capping
 - Guard pre-checks (block/inject)
-- Checklist pre-checks
 - Shell command confirmation
 - Parallel execution with display
 - Tool result caching within a turn
@@ -34,6 +33,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _short_path(path: str, max_len: int = 60) -> str:
+    """Show a short but distinguishing path (not just basename).
+
+    Shows the relative path from cwd if short enough, otherwise the last
+    few path components with a …/ prefix.
+    """
+    if not path:
+        return ""
+    # Try relative path from cwd
+    try:
+        rel = os.path.relpath(path)
+        if not rel.startswith("../../") and len(rel) <= max_len:
+            return rel
+    except ValueError:
+        pass
+    # Fallback: last N components that fit within max_len
+    parts = path.replace("\\", "/").split("/")
+    # Always include at least basename
+    result = parts[-1]
+    for i in range(len(parts) - 2, -1, -1):
+        candidate = "/".join(parts[i:])
+        if len(candidate) + 2 > max_len:  # +2 for "…/"
+            break
+        result = candidate
+    if result != path:
+        result = "…/" + result
+    return result
+
+
 def tool_display_summary(tool_name: str, arguments: dict) -> str:
     """Short human-readable summary for a tool call display."""
     if tool_name == "shell":
@@ -42,22 +70,28 @@ def tool_display_summary(tool_name: str, arguments: dict) -> str:
         return s[:120] + ("..." if len(s) > 120 else "")
     if tool_name == "read_file":
         path = arguments.get("path", "") or arguments.get("file_path", "")
-        return os.path.basename(path) if path else ""
+        summary = _short_path(path)
+        start = arguments.get("start_line")
+        end = arguments.get("end_line")
+        if start or end:
+            summary += f":{start or 1}-{end or 'EOF'}"
+        return summary
     if tool_name == "edit_file":
         path = arguments.get("path", "") or arguments.get("file_path", "")
         old = arguments.get("old_string", "")
         new = arguments.get("new_string", "")
         if old and new:
+            short = _short_path(path)
             old_val = old.split(":")[-1].strip() if ":" in old else ""
             new_val = new.split(":")[-1].strip() if ":" in new else ""
             if old_val and new_val and len(old_val) < 30 and len(new_val) < 30:
-                return f"{os.path.basename(path)}: {old_val} → {new_val}"
+                return f"{short}: {old_val} → {new_val}"
             old_line = old.strip().split("\n")[0][:60]
-            return f"{os.path.basename(path)}: {old_line}..."
-        return os.path.basename(path) if path else ""
+            return f"{short}: {old_line}..."
+        return _short_path(path)
     if tool_name == "write_file":
         path = arguments.get("path", "") or arguments.get("file_path", "")
-        return os.path.basename(path) if path else ""
+        return _short_path(path)
     if tool_name == "web_fetch":
         url = arguments.get("url", "")
         return url[:60] + ("..." if len(url) > 60 else "")
@@ -78,13 +112,43 @@ def tool_display_summary(tool_name: str, arguments: dict) -> str:
     if tool_name == "plan_status":
         return ""
     if tool_name == "monitor":
-        tag = arguments.get("action", "") or arguments.get("tag", "")
-        return tag or "check"
+        # Show what's being monitored: file, command, or output_dir
+        file = arguments.get("file", "")
+        command = arguments.get("command", "")
+        output_dir = arguments.get("output_dir", "")
+        duration = arguments.get("duration", 300)
+        target = arguments.get("target_step")
+        if output_dir:
+            summary = _short_path(output_dir, 40)
+        elif file:
+            summary = _short_path(file, 40)
+        elif command:
+            summary = command[:50] + ("..." if len(command) > 50 else "")
+        else:
+            summary = "poll"
+        if target:
+            summary += f" →step {target}"
+        summary += f" ({duration}s)"
+        return summary
     if tool_name == "memory_read":
         return arguments.get("key", "")
     if tool_name == "grep":
         pattern = arguments.get("pattern", "")
-        return pattern[:60] + ("..." if len(pattern) > 60 else "")
+        path = arguments.get("path", "")
+        summary = pattern[:50] + ("..." if len(pattern) > 50 else "")
+        if path:
+            summary += f" in {_short_path(path, 40)}"
+        return summary
+    if tool_name == "find_latest_log":
+        exp = arguments.get("experiment", "")
+        log_type = arguments.get("log_type", "both")
+        filt = arguments.get("filter", "")
+        summary = exp if exp else ""
+        if filt:
+            summary += f" [{filt}]"
+        elif log_type != "both":
+            summary += f" [{log_type}]"
+        return summary
     return ""
 
 
@@ -137,7 +201,7 @@ class ToolExecutor:
     """Executes tools with batching, dedup, guards, and parallel dispatch.
 
     This class encapsulates the tool execution lifecycle:
-    1. Pre-checks (guards, checklist, confirmation)
+    1. Pre-checks (guards, confirmation)
     2. Deduplication and batch capping
     3. Parallel execution with display
     4. Post-execution tracking (files, skills, cache)
@@ -218,6 +282,18 @@ class ToolExecutor:
         """Handle post-execution side effects (tracking, skill loading, etc.)."""
         agent = self._agent
 
+        # Record to recent tool history (for constraint judge context)
+        args_summary = tool_display_summary(tool_name, arguments) or str(arguments)[:120]
+        result_summary = result[:200] if result else ""
+        agent._recent_tool_history.append({
+            "tool": tool_name,
+            "args_summary": args_summary,
+            "result_summary": result_summary,
+        })
+        # Cap at 10 entries
+        if len(agent._recent_tool_history) > 10:
+            agent._recent_tool_history = agent._recent_tool_history[-10:]
+
         # Immediate compression for large shell output (saves tokens before entering history)
         if tool_name == "shell" and not error and len(result) > 3000:
             result = _compress_shell_result(result)
@@ -277,35 +353,12 @@ class ToolExecutor:
             for i in range(_MAX_BATCH, len(tool_calls)):
                 capped_indices.add(i)
 
-        # Pre-exec: Guard + Checklist checks
+        # Pre-exec: Guard checks
         skip_indices: set[int] = set()
         results = [None] * len(tool_calls)
 
         for i, tc in enumerate(tool_calls):
-            # Checklist pre-check
-            blocked_by_checklist = False
-            if agent.checklist:
-                for alert in agent.checklist.pre_check_tool(tc["name"], tc.get("arguments", {})):
-                    if alert.severity == "error":
-                        blocked_by_checklist = True
-                        print(display.red(f"  🛡 ⛔ BLOCKED by checklist: {alert.message}"))
-                        agent._inject_message(
-                            f"[CHECKLIST BLOCK] {alert.message}\n"
-                            "This command was BLOCKED by a checklist constraint. "
-                            "You must either:\n"
-                            "  1. Change the command to comply with the constraint\n"
-                            "  2. Declare an override if you believe this is a false positive: "
-                            "[CHECKLIST_OVERRIDE: <constraint_id>] Reason: <justification>"
-                        )
-                    else:
-                        print(display.yellow(f"  🛡 {alert.message}"))
-                        agent._inject_message(alert.message)
-
-            if blocked_by_checklist:
-                skip_indices.add(i)
-                continue
-
-            # Guard pre-checks
+            # Guard pre-checks (these also block)
             from flagscale.agent.react.guard import GuardContext
             from flagscale.agent.react.tools.base import ToolEffect
             tool_effects = ToolEffect()
@@ -319,6 +372,7 @@ class ToolExecutor:
                 tool_args=tc.get("arguments", {}),
                 tool_effects=tool_effects,
                 turn_count=agent.turn_count,
+                recent_tool_history=agent._recent_tool_history[-8:],
                 context_pressure=agent.history.get_context_pressure() if agent.history else 0.0,
                 current_state=agent._kernel.fsm.current_state,
                 transitions_count=len(agent._kernel.fsm.history),
@@ -328,7 +382,38 @@ class ToolExecutor:
             if verdict and verdict.action == "block":
                 skip_indices.add(i)
                 results[i] = f"⛔ TOOL NOT EXECUTED — blocked: {verdict.message}"
+                # Display: show what was blocked
+                cmd_preview = str(tc.get("arguments", {}).get("command", ""))[:120] or str(tc.get("arguments", {}))[:120]
+                print(display.red(
+                    f"  ⛔ Blocked [{tc['name']}]: {cmd_preview}"
+                ))
+                print(display.yellow(
+                    f"     Correction: {verdict.message[:200]}"
+                ))
+                # Do NOT break — continue checking remaining tools in the batch
+            elif verdict and verdict.action == "escalate":
+                # Escalate: abort the ENTIRE batch — all tools are blocked
+                for j in range(len(tool_calls)):
+                    skip_indices.add(j)
+                    if results[j] is None:
+                        results[j] = f"⛔ BATCH ABORTED — escalation: {verdict.message}"
+                cmd_preview = str(tc.get("arguments", {}).get("command", ""))[:120] or str(tc.get("arguments", {}))[:120]
+                print(display.red(
+                    f"  ⛔ ESCALATION [{tc['name']}]: {cmd_preview}"
+                ))
+                print(display.yellow(
+                    f"     {verdict.message[:200]}"
+                ))
+                # Inject the escalation message so the LLM sees it
+                agent._kernel.deps.inject_message_fn(verdict.message)
                 break
+            elif verdict and verdict.action == "inject_msg":
+                # Inject: tool still executes, but inject warning into conversation
+                # so the LLM sees it and can change behavior
+                agent._kernel.deps.inject_message_fn(verdict.message)
+                print(display.yellow(
+                    f"  ⚠ [{tc['name']}]: {verdict.message[:200]}"
+                ))
 
         # Pre-confirm shell commands
         shell_tool = agent.tool_registry.get("shell")
