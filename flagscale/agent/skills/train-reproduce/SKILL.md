@@ -55,6 +55,22 @@ constraints:
     - build vocab
   prompt: Check if the agent is regenerating artifacts (tokenizer, vocab) instead of using the official release
   correction: Download the exact tokenizer/config from the original model release. Never regenerate.
+- id: experiment_tracking_required
+  description: Every training launch must be tracked via workspace_experiment (create before launch, update after completion)
+  trigger:
+    tools:
+    - shell
+    - write_file
+    - edit_file
+    keywords:
+    - torchrun
+    - python train
+    - python -m torch
+    - deepspeed
+    - accelerate launch
+  prompt: Check if the agent is launching a training run without first creating a workspace_experiment entry to track it
+  correction: Before launching training, call workspace_experiment create with purpose/hypothesis/config. After training completes,
+    call workspace_experiment update with results/reflection/next steps.
 context_injection:
   always:
   - 'Core Principle: IMMUTABLE vs ADAPTABLE'

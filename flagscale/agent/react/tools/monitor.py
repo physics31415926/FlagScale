@@ -544,14 +544,24 @@ class MonitorTool(Tool):
         return "?"
 
     def _is_process_alive(self, process_pattern):
-        """Check if the training process is still running."""
-        pattern = process_pattern or r'torchrun|python.*train_|flagscale.*run'
+        """Check if the training process is still running.
+
+        Default pattern matches common training launchers while excluding
+        the agent's own process (which contains 'flagscale' in its path).
+        """
+        pattern = process_pattern or r'torchrun|deepspeed|python.*train\.py|python.*finetune|accelerate\s+launch'
         try:
             result = subprocess.run(
                 ["pgrep", "-f", pattern],
                 capture_output=True, text=True, timeout=5
             )
-            return result.returncode == 0
+            if result.returncode != 0:
+                return False
+            # Filter out our own process and pgrep itself
+            my_pid = os.getpid()
+            pids = [int(p) for p in result.stdout.strip().splitlines() if p.strip()]
+            alive_pids = [p for p in pids if p != my_pid]
+            return len(alive_pids) > 0
         except Exception:
             return True
 
