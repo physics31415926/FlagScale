@@ -492,47 +492,49 @@ This installs vLLM without compiling CUDA kernels — the plugin provides the ha
 
 ### Step 5: Clone and install vllm-plugin-FL
 
-**Development model**: local edit → sync to container → test remotely.
+**Development model**: local fresh workspace → git push → remote git pull → test in container.
 
-The agent edits code **locally** (or on the host machine), then syncs changes to the container's workspace for testing. This avoids installing dev tools inside the container and keeps the container environment clean.
+> **CRITICAL**: Both local AND remote must create a **fresh workspace** for each adaptation task. Never reuse existing directories. Code synchronization between local and remote is done exclusively through **git** (push/pull). This ensures both sides are always on the same branch and commit.
 
-**Initial clone (on host or local machine):**
+The agent edits code **locally** (in a fresh clone), pushes to the remote repo, then pulls inside the container for testing. This keeps the container environment clean and provides full git history of all changes.
 
-Always start from a **fresh clone** — never reuse an existing directory that may contain stale state from other tasks.
+**Step 5a: Create fresh workspace on BOTH sides**
 
 ```bash
-# On the remote host (outside container), create a fresh workspace for this adaptation
+# Remote: create fresh workspace on the host (visible inside container via volume mount)
 ssh <ssh_host> "mkdir -p /workspace/adapt/<backend>-vllm-<version> && cd /workspace/adapt/<backend>-vllm-<version> && git clone <vllm-plugin-FL-repo-url> vllm-plugin-FL && cd vllm-plugin-FL && git checkout main && git checkout -b adapt/<backend>-vllm-<version>"
 
-# Locally, also use a fresh clone (do NOT reuse other working directories)
+# Local: ALSO create a fresh clone (do NOT reuse other working directories)
 mkdir adapt-<backend>-vllm-<version> && cd adapt-<backend>-vllm-<version>
 git clone <vllm-plugin-FL-repo-url> vllm-plugin-FL && cd vllm-plugin-FL && git checkout main && git checkout -b adapt/<backend>-vllm-<version>
 ```
 
-Since the workspace is volume-mounted (`-v /host/path:/workspace`), the code is immediately visible inside the container.
+Since the workspace is volume-mounted (`-v /host/path:/workspace`), the remote clone is immediately visible inside the container.
 
-**Install plugin inside container (editable mode):**
+**Step 5b: Install plugin inside container (editable mode)**
 ```bash
 ssh <ssh_host> "docker exec <container> bash -c 'cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL && pip install -e .'"
 ```
 
-**Code sync after local edits:**
+**Step 5c: Code sync after local edits (via git)**
 
-If editing on a separate local machine (not the remote host), sync changes with:
+After making local edits, sync to remote using git push + pull:
 ```bash
-# Option 1: git push + pull (preferred — clean history, works because container uses --network host)
-# Local:
-git add -A && git commit -m "wip: <description>" && git push
-# Remote (inside container):
-ssh <ssh_host> "docker exec <container> bash -c 'cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL && git pull'"
+# Local: commit and push
+git add -A && git commit -m "wip: <description>" && git push origin adapt/<backend>-vllm-<version>
 
-# Option 2: rsync (fast incremental sync, no commit needed)
+# Remote (inside container): pull the latest
+ssh <ssh_host> "docker exec <container> bash -c 'cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL && git pull'"
+```
+
+Alternative sync methods (when git is inconvenient):
+```bash
+# rsync (fast incremental sync, no commit needed)
 rsync -avz --exclude='.git' --exclude='__pycache__' --exclude='*.egg-info' \
   ./vllm-plugin-FL/ <ssh_host>:/workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL/
 
-# Option 3: scp for single files or directories
+# scp for single files
 scp ./path/to/file.py <ssh_host>:/workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL/path/to/file.py
-scp -r ./src/dir/ <ssh_host>:/workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL/src/dir/
 ```
 
 Container uses `--network host`, so git operations inside the container have full network access (same as host). If git clone/pull fails due to proxy issues, configure git proxy (see CLAUDE.md).
