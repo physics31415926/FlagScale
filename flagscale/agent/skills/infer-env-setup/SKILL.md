@@ -498,16 +498,28 @@ This installs vLLM without compiling CUDA kernels — the plugin provides the ha
 
 The agent edits code **locally** (in a fresh clone), pushes to the remote repo, then pulls inside the container for testing. This keeps the container environment clean and provides full git history of all changes.
 
+**Prerequisites: Fork the repository**
+
+> **MUST use your own fork** — you need push access to sync code between local and remote. If you don't have a fork yet, create one first:
+> 1. Fork `https://github.com/FlagOpen/vllm-plugin-FL` to your GitHub account (e.g., `https://github.com/<your-username>/vllm-plugin-FL`)
+> 2. Use your fork URL for all `git clone` commands below
+
 **Step 5a: Create fresh workspace on BOTH sides**
 
 ```bash
 # Remote: create fresh workspace on the host (visible inside container via volume mount)
-ssh <ssh_host> "mkdir -p /workspace/adapt/<backend>-vllm-<version> && cd /workspace/adapt/<backend>-vllm-<version> && git clone <vllm-plugin-FL-repo-url> vllm-plugin-FL && cd vllm-plugin-FL && git checkout main && git checkout -b adapt/<backend>-vllm-<version>"
+# Replace <your-fork-url> with your actual fork (e.g., https://github.com/<your-username>/vllm-plugin-FL.git)
+ssh <ssh_host> "mkdir -p /workspace/adapt/<backend>-vllm-<version> && cd /workspace/adapt/<backend>-vllm-<version> && git clone <your-fork-url> vllm-plugin-FL && cd vllm-plugin-FL && git checkout main && git checkout -b adapt/<backend>-vllm-<version>"
 
-# Local: ALSO create a fresh clone (do NOT reuse other working directories)
+# Local: ALSO create a fresh clone from YOUR FORK (do NOT reuse other working directories)
 mkdir adapt-<backend>-vllm-<version> && cd adapt-<backend>-vllm-<version>
-git clone <vllm-plugin-FL-repo-url> vllm-plugin-FL && cd vllm-plugin-FL && git checkout main && git checkout -b adapt/<backend>-vllm-<version>
+git clone <your-fork-url> vllm-plugin-FL && cd vllm-plugin-FL && git checkout main && git checkout -b adapt/<backend>-vllm-<version>
 ```
+
+Both local and remote now have:
+- A fresh clone from **your fork** (not upstream)
+- A new branch `adapt/<backend>-vllm-<version>` (not main)
+- Same starting point (latest main)
 
 Since the workspace is volume-mounted (`-v /host/path:/workspace`), the remote clone is immediately visible inside the container.
 
@@ -541,7 +553,7 @@ Container uses `--network host`, so git operations inside the container have ful
 
 **After syncing, no reinstall needed** for editable installs (`pip install -e .`) — Python picks up changes immediately. Exception: if you modify `setup.py`/`pyproject.toml` or add new entry points, re-run `pip install -e .`.
 
-Plugin code always starts from the **latest `main` branch**. Create a new branch for the adaptation work (e.g., `adapt/metax-vllm-0.20.2`). If working on a fork, fork first then create the branch.
+> **Summary**: Always clone from your **own fork**, always create a **new branch** (`adapt/<backend>-vllm-<version>`), never push to upstream main directly. The final PR goes from your fork's branch → upstream main.
 
 ### Step 6: Install FlagGems
 
