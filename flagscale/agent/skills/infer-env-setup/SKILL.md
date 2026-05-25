@@ -44,7 +44,7 @@ constraints:
     - ssh
     - docker
   prompt: Check if the agent is running remote commands without having confirmed the SSH host/alias with the user
-  correction: 'Before any remote operation, confirm SSH connection info. If ssh_host parameter is not set, ask the user: "What is the SSH alias or connection string for the target machine?" Verify connectivity with a simple `ssh <host> hostname` before proceeding.'
+  correction: 'Before any remote operation, confirm SSH connection info. If ssh_host parameter is not set, ask the user: "What is the SSH alias or connection string for the target machine?" Verify connectivity with a simple `ssh <host> hostname` before proceeding. If SSH output is abnormal (empty, mixed with banners, or errors) for 3+ consecutive attempts, STOP and ask the user to verify the connection manually or provide alternative access method.'
 - id: no_gpu_install_without_container
   description: Never install vLLM or plugin directly on host — always use Docker container
   trigger:
@@ -134,8 +134,21 @@ constraints:
     keywords:
     - git clone
     - mkdir
+    - cd /workspace
   prompt: Check if the agent is cloning into or reusing an existing directory that may contain stale state from other tasks
-  correction: 'Always start from a fresh clone in a dedicated directory (e.g., /workspace/adapt/<backend>-vllm-<version>/). Do NOT cd into an existing directory and start working — create a new one.'
+  correction: 'Always start from a fresh clone in a dedicated directory (e.g., /workspace/adapt/<backend>-vllm-<version>/). Before cloning, explicitly check if the target directory already exists: `ls /workspace/adapt/<backend>-vllm-<version>/ 2>/dev/null && echo EXISTS || echo OK`. If it EXISTS, ask the user whether to remove and re-clone or reuse. Do NOT silently cd into an existing directory.'
+- id: platform_awareness
+  description: The agent may run on Windows locally while the remote target is Linux — never use Linux-only commands in local pipes
+  trigger:
+    tools:
+    - shell
+    keywords:
+    - grep
+    - sed
+    - awk
+    - xargs
+  prompt: Check if the agent is using Linux-only commands (grep, sed, awk, xargs) in a local shell pipe on Windows. These must only be used inside SSH commands (remote execution).
+  correction: 'On Windows local shell, use findstr instead of grep, or run the command remotely via SSH. All grep/sed/awk usage must be inside `ssh <host> "..."` quotes (remote execution). For local file searching, use the IDE search tools instead of shell pipes.'
 soft_constraints:
 - id: use_tmux_for_long_commands
   description: Long-running commands (install, build, test) should use tmux to survive SSH timeouts
@@ -523,6 +536,14 @@ python -c "import vllm_plugin_fl; print('Plugin loaded')"
 python -c "import flag_gems; print('FlagGems loaded')"
 python -c "import torch; print(f'torch {torch.__version__}, CUDA available: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}')"
 ```
+
+### Step 7: Create adapt-logs directory
+
+```bash
+mkdir -p /workspace/adapt-logs
+```
+
+This directory is used by `infer-hw-adapt` to store test and inference logs. Creating it during setup ensures it's ready when testing begins.
 
 ---
 
