@@ -492,57 +492,64 @@ This installs vLLM without compiling CUDA kernels — the plugin provides the ha
 
 ### Step 5: Clone and install vllm-plugin-FL
 
-**Development model**: All code editing and testing happens **inside the container**. The agent uses SSH + docker exec to edit files, run tests, and commit changes directly in the container environment.
+**Development model**: local edit → git push → container git pull → container test.
 
 > **CRITICAL**:
-> - All modifications happen **inside the container** — never edit code locally and sync.
+> - Code editing happens **locally**, testing happens **inside the container**.
+> - Code transfer between local and container uses **git only** (push/pull). Never use scp, rsync, or scripts to modify container files directly.
 > - Must use your **own fork** of the repository (need push access for the adaptation branch).
 > - Must create a **new branch** for each adaptation task (never work on main).
-> - The workspace must be a **fresh clone** — never reuse existing directories.
+> - Both local and container must have a **fresh clone** — never reuse existing directories.
 
 **Prerequisites: Fork the repository**
 
 > If you don't have a fork yet, create one first:
 > 1. Fork `https://github.com/FlagOpen/vllm-plugin-FL` to your GitHub account (e.g., `https://github.com/<your-username>/vllm-plugin-FL`)
-> 2. Use your fork URL for the `git clone` command below
+> 2. Use your fork URL for all `git clone` commands below
 
-**Step 5a: Create fresh workspace and clone (inside container)**
+**Step 5a: Create fresh workspace on BOTH sides**
 
 ```bash
-# Create fresh workspace directory
+# Local: create a fresh clone from YOUR FORK
+mkdir adapt-<backend>-vllm-<version> && cd adapt-<backend>-vllm-<version>
+git clone <your-fork-url> vllm-plugin-FL && cd vllm-plugin-FL
+git checkout main && git checkout -b adapt/<backend>-vllm-<version>
+
+# Container: also create a fresh clone from the SAME FORK
+# (inside container via ssh + docker exec)
 mkdir -p /workspace/adapt/<backend>-vllm-<version>
 cd /workspace/adapt/<backend>-vllm-<version>
-
-# Clone from YOUR FORK (not upstream)
-git clone <your-fork-url> vllm-plugin-FL
-cd vllm-plugin-FL
-
-# Create a new branch for this adaptation task
-git checkout main
-git checkout -b adapt/<backend>-vllm-<version>
+git clone <your-fork-url> vllm-plugin-FL && cd vllm-plugin-FL
+git checkout main && git checkout -b adapt/<backend>-vllm-<version>
 ```
 
-**Step 5b: Install plugin (editable mode)**
+Both sides now have the same fork, same branch, same starting point.
+
+**Step 5b: Install plugin inside container (editable mode)**
 
 ```bash
 cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL
 pip install -e .
 ```
 
-Editable install means Python picks up code changes immediately — no reinstall needed after editing files. Exception: if you modify `setup.py`/`pyproject.toml` or add new entry points, re-run `pip install -e .`.
+Editable install means Python picks up code changes immediately after `git pull` — no reinstall needed. Exception: if you modify `setup.py`/`pyproject.toml` or add new entry points, re-run `pip install -e .`.
 
-**Step 5c: Commit and push changes (inside container)**
+**Step 5c: Development cycle (local edit → git push → container pull → test)**
 
-After making edits and verifying tests pass, commit and push from inside the container:
 ```bash
-cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL
-git add -A && git commit -m "<description>"
+# 1. Local: edit code, then commit and push
+git add -A && git commit -m "wip: <description>"
 git push origin adapt/<backend>-vllm-<version>
+
+# 2. Container: pull the latest changes, then test
+cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL
+git pull
+# run tests...
 ```
 
-Container uses `--network host`, so git operations have full network access. If git push fails due to proxy issues, configure git proxy (see CLAUDE.md).
+Container uses `--network host`, so git operations have full network access. If git pull/push fails due to proxy issues, configure git proxy (see CLAUDE.md).
 
-> **Summary**: Clone your **own fork** → create a **new branch** → edit and test **inside the container** → push from container. The final PR goes from your fork's branch → upstream main.
+> **Summary**: Local edit → `git push` → container `git pull` → test. Never use scp/rsync/scripts to transfer code. The final PR goes from your fork's branch → upstream main.
 
 ### Step 6: Install FlagGems
 
