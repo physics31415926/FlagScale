@@ -149,6 +149,16 @@ constraints:
     - xargs
   prompt: Check if the agent is using Linux-only commands (grep, sed, awk, xargs) in a local shell pipe on Windows. These must only be used inside SSH commands (remote execution).
   correction: 'On Windows local shell, use findstr instead of grep, or run the command remotely via SSH. All grep/sed/awk usage must be inside `ssh <host> "..."` quotes (remote execution). For local file searching, use the IDE search tools instead of shell pipes.'
+- id: jumpserver_single_line
+  description: JumpServer (bastion host) SSH proxy only supports single-line commands — no heredocs, multi-line strings, or interactive input
+  trigger:
+    tools:
+    - shell
+    keywords:
+    - ssh
+    - docker exec
+  prompt: Check if the agent is sending multi-line commands, heredocs (<<EOF), or commands with unescaped newlines through SSH to a JumpServer-proxied host. JumpServer captures and replays stdin line-by-line, breaking multi-line constructs.
+  correction: 'When SSH goes through JumpServer (bastion proxy), strictly use single-line commands. Break complex operations into multiple `ssh <host> "<single_command>"` calls. Avoid heredocs (<<EOF), multi-line strings, and semicolons joining very long command chains. For complex scripts, write the script to a file first (`ssh <host> "echo ''<content>'' > /tmp/script.sh"`), then execute it (`ssh <host> "bash /tmp/script.sh"`).'
 soft_constraints:
 - id: use_tmux_for_long_commands
   description: Long-running commands (install, build, test) should use tmux to survive SSH timeouts
