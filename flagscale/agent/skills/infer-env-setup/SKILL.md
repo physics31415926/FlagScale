@@ -463,9 +463,26 @@ Once the user provides this, fill in a new `### <Backend Name>` section followin
 
 ## Environment Setup
 
-All commands run inside the container. System mirrors (apt, pip) are configured in the Container Setup section above.
+All commands below run inside the container.
 
-### Step 3: Install vLLM (CPU-only)
+### Step 3: Configure system mirrors (China mainland)
+
+Configure pip and apt mirrors for faster package downloads. This is a generic step applicable to all backends.
+
+```bash
+# pip mirror (Tsinghua)
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# apt mirror (Aliyun) — adjust codename (jammy/focal) to match the container's Ubuntu version
+echo "deb http://mirrors.aliyun.com/ubuntu/ jammy main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse" > /etc/apt/sources.list
+apt-get update
+```
+
+> Skip this step if the container already has mirrors configured or is not in China mainland.
+
+### Step 4: Install vLLM (CPU-only)
 
 ```bash
 VLLM_TARGET_DEVICE=empty pip install vllm==<target_version>
@@ -473,7 +490,7 @@ VLLM_TARGET_DEVICE=empty pip install vllm==<target_version>
 
 This installs vLLM without compiling CUDA kernels — the plugin provides the hardware backend.
 
-### Step 4: Clone and install vllm-plugin-FL
+### Step 5: Clone and install vllm-plugin-FL
 
 **Development model**: local edit → sync to container → test remotely.
 
@@ -524,7 +541,7 @@ Container uses `--network host`, so git operations inside the container have ful
 
 Plugin code always starts from the **latest `main` branch**. Create a new branch for the adaptation work (e.g., `adapt/metax-vllm-0.20.2`). If working on a fork, fork first then create the branch.
 
-### Step 5: Install FlagGems
+### Step 6: Install FlagGems
 
 ```bash
 cd /workspace/adapt/<backend>-vllm-<version>
@@ -538,7 +555,7 @@ git log --oneline -1                 # note the commit hash
 
 FlagGems uses the **latest `main` branch**. Record the commit hash — it will be included in the PR description and adaptation record.
 
-### Step 6: Verify installation
+### Step 7: Verify installation
 
 ```bash
 python -c "import vllm; print(f'vLLM {vllm.__version__}')"
@@ -547,7 +564,7 @@ python -c "import flag_gems; print('FlagGems loaded')"
 python -c "import torch; print(f'torch {torch.__version__}, CUDA available: {torch.cuda.is_available()}, devices: {torch.cuda.device_count()}')"
 ```
 
-### Step 7: Create adapt-logs directory
+### Step 8: Create adapt-logs directory
 
 ```bash
 mkdir -p /workspace/adapt-logs
