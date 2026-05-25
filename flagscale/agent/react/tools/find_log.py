@@ -204,6 +204,22 @@ class FindLatestLogTool(Tool):
         if not error_ranks and log_type in ("stderr", "both"):
             parts.append("\n=== No stderr errors detected ===")
 
+        # Structured summary for quick parsing
+        summary = {
+            "loss_rank": int(os.path.basename(loss_rank)) if loss_rank else None,
+            "last_iteration": loss_metrics["last_iter"] if loss_metrics else None,
+            "last_loss": loss_metrics.get("last_loss", {}) if loss_metrics else {},
+            "error_ranks": [int(os.path.basename(rd)) for rd, _ in error_ranks] if error_ranks else [],
+            "error_summary": [
+                {"rank": int(os.path.basename(rd)), "snippet": content.strip()[:150]}
+                for rd, content in (error_ranks or [])[:3]
+            ],
+            "training_started": loss_metrics.get("last_iter") is not None if loss_metrics else False,
+            "health_ok": not bool(_health_check(loss_metrics, vocab_size)) if loss_metrics else False,
+        }
+        import json
+        parts.append(f"\n=== Structured Summary (JSON) ===\n{json.dumps(summary, indent=2)}")
+
         return "\n".join(parts)
 
     def _apply_filter(self, text: str, mode: str) -> str:

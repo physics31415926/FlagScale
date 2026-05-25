@@ -495,6 +495,7 @@ def agent(
     model: str | None = typer.Option(None, "--model", "-m", help="Model name (default: provider's default)"),
     base_url: str | None = typer.Option(None, "--base-url", "-b", help="API base URL (for proxies/gateways)"),
     config: Path | None = typer.Option(None, "--config", "-c", help="Agent config YAML path"),
+    auto_resume: str | None = typer.Option(None, "--auto-resume", help="Auto-resume session ID (internal use by /reload)"),
     query: str | None = typer.Argument(None, help="Single-shot query (non-interactive mode)"),
 ):
     """Start the FlagScale interactive agent, or run a single query."""

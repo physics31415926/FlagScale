@@ -165,15 +165,41 @@ class GuardRegistry:
         """Run all guards' post-checks.
 
         Unlike check_pre, ALL guards run (to update internal state).
-        Returns the highest-priority (first) non-None verdict.
+        Collects all inject_msg verdicts and merges them.
+        For block/escalate/force_compact, returns the first (highest-priority) one.
         """
-        first_verdict: GuardVerdict | None = None
+        inject_messages: list[str] = []
+        first_hard_verdict: GuardVerdict | None = None
+        first_reason: str | None = None
+
         for guard in self._guards:
             if guard.should_activate(ctx):
                 verdict = guard.check_post(ctx)
-                if verdict is not None and first_verdict is None:
-                    first_verdict = verdict
-        return first_verdict
+                if verdict is None:
+                    continue
+                if verdict.action == "inject_msg":
+                    if verdict.message:
+                        inject_messages.append(verdict.message)
+                    if first_reason is None:
+                        first_reason = verdict.reason
+                elif first_hard_verdict is None:
+                    first_hard_verdict = verdict
+
+        # Hard verdicts (block/escalate/force_compact) take priority
+        if first_hard_verdict is not None:
+            # Prepend any inject messages to the hard verdict
+            if inject_messages and first_hard_verdict.message:
+                first_hard_verdict.message = "\n\n".join(inject_messages) + "\n\n" + first_hard_verdict.message
+            return first_hard_verdict
+
+        # Merge all inject messages into one verdict
+        if inject_messages:
+            return GuardVerdict.inject(
+                "\n\n".join(inject_messages),
+                reason=first_reason or "multi_guard_inject"
+            )
+
+        return None
 
     def check_strategic(self, ctx: GuardContext) -> GuardVerdict | None:
         """Run all guards' strategic checks."""

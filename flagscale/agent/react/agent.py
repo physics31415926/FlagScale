@@ -60,6 +60,7 @@ from flagscale.agent.react.tools.plan_update import PlanUpdateTool
 from flagscale.agent.react.tools.plan_status import PlanStatusTool
 from flagscale.agent.react.tools.validate_config import ValidateConfigTool
 from flagscale.agent.react.tools.inspect_checkpoint import InspectCheckpointTool
+from flagscale.agent.react.tools.compact_context import CompactContextTool
 
 from flagscale.agent.react.guard.safety import SafetyGuard
 from flagscale.agent.react.guard.loop_detect import LoopDetectGuard
@@ -163,7 +164,8 @@ class WorkerAgent:
         self.tool_registry = _tool_registry or ToolRegistry()
 
         self._session_id = uuid.uuid4().hex[:8]
-        sessions_root = config.session_dir or os.path.join(Path.home(), ".flagscale", "sessions")
+        from flagscale.agent.react.paths import get_sessions_root, get_memory_dir
+        sessions_root = config.session_dir or get_sessions_root()
         session_dir = os.path.join(sessions_root, self._session_id)
         os.makedirs(session_dir, exist_ok=True)
         self._session_dir = session_dir
@@ -172,22 +174,11 @@ class WorkerAgent:
         experiments_dir = os.path.join(session_dir, "experiments")
         self._experiment_manager = _experiment_manager or ExperimentManager(experiments_dir)
 
-        memory_dir = os.path.join(Path.home(), ".flagscale", "agent_memory")
+        memory_dir = get_memory_dir()
         self.session_memory = _session_memory or SessionMemory(memory_dir, config.memory_ttl_days)
 
         plan_dir = os.path.join(session_dir, "plans")
         self.task_plan = _task_plan or TaskPlan(plan_dir)
-
-        if not _tool_registry:
-            self._register_tools()
-        if not _experiment_manager:
-            self._load_plugin_tools()
-        self.tool_registry.register(MemoryWriteTool(self.session_memory, self._session_id))
-        self.tool_registry.register(MemoryReadTool(self.session_memory))
-        self.tool_registry.register(MemoryListTool(self.session_memory))
-        self.tool_registry.register(PlanCreateTool(self.task_plan, self._session_id))
-        self.tool_registry.register(PlanUpdateTool(self.task_plan))
-        self.tool_registry.register(PlanStatusTool(self.task_plan))
 
         if not config.api_key:
             raise ValueError(
@@ -208,6 +199,18 @@ class WorkerAgent:
         self.history.set_plan_summary_fn(
             lambda: self.task_plan.context_for_prompt() if self.task_plan.get_active() else ""
         )
+        self.history._pre_compaction_hook = self._extract_memories_before_compaction
+
+        if not _tool_registry:
+            self._register_tools()
+        if not _experiment_manager:
+            self._load_plugin_tools()
+        self.tool_registry.register(MemoryWriteTool(self.session_memory, self._session_id, task_plan=self.task_plan))
+        self.tool_registry.register(MemoryReadTool(self.session_memory))
+        self.tool_registry.register(MemoryListTool(self.session_memory))
+        self.tool_registry.register(PlanCreateTool(self.task_plan, self._session_id))
+        self.tool_registry.register(PlanUpdateTool(self.task_plan))
+        self.tool_registry.register(PlanStatusTool(self.task_plan))
 
         # ── Orchestrator (set by run_agent_orchestrated) ──
         self._orchestrator = None
@@ -360,6 +363,7 @@ class WorkerAgent:
         self.tool_registry.register(WorkspaceExperimentTool(self._experiment_manager, task_plan=self.task_plan))
         self.tool_registry.register(ValidateConfigTool())
         self.tool_registry.register(InspectCheckpointTool())
+        self.tool_registry.register(CompactContextTool(self.history))
 
     def _build_dynamic_constraints(self):
         """Build runtime-detected constraints and register with ConstraintGuard.
@@ -596,12 +600,25 @@ class WorkerAgent:
             self._run_single_shot(single_shot_query)
             return
 
+        # Check for --auto-resume from /reload command
+        auto_resume_id = None
+        for arg in sys.argv:
+            if arg.startswith("--auto-resume="):
+                auto_resume_id = arg.split("=", 1)[1]
+                break
+
         extra = self._startup_hints()
         display.banner(self.config.provider, self.config.model, mode=self.config.mode, extra_lines=extra)
         self._check_proxy()
-        self._check_resume()
 
-        history_file = os.path.join(os.path.expanduser("~"), ".flagscale", "input_history")
+        if auto_resume_id:
+            # Auto-resume after /reload — find and restore the session
+            self._auto_resume(auto_resume_id)
+        else:
+            self._check_resume()
+
+        from flagscale.agent.react.paths import get_input_history_file
+        history_file = get_input_history_file()
         os.makedirs(os.path.dirname(history_file), exist_ok=True)
         completer = WordCompleter(
             ["/quit", "/reload", "/skill", "/file", "/save", "/load",
@@ -660,6 +677,7 @@ class WorkerAgent:
             self._auto_turn_count = 0
             self._inject_context(user_input)
             self._check_user_porting_confirmation(user_input)
+            self._reset_guard_escalation()
             self.history.append({"role": "user", "content": user_input})
             try:
                 self._react_loop()
@@ -1110,20 +1128,91 @@ class WorkerAgent:
             print(display.dim(f"  {i}. {sid}  {ts}{skill_str}  ({s.get('user_turns', 0)} turns)"))
         print(display.dim("Type: resume <number> or resume <session_id>"))
 
+    def _auto_resume(self, session_id: str):
+        """Auto-resume a session after /reload (process restart).
+
+        Finds the session by ID, restores it, and prints a confirmation.
+        """
+        import json
+        sessions = find_resumable_sessions(self._sessions_root)
+        target = None
+        for s in sessions:
+            if s.get("session_id", "").startswith(session_id):
+                target = s
+                break
+
+        if not target:
+            print(display.yellow(f"[reload] Session {session_id} not found, starting fresh."))
+            return
+
+        session_dir = get_session_dir(target["session_id"])
+        # Load full conversation data (find_resumable_sessions only returns metadata)
+        conv_path = os.path.join(session_dir, "conversation.json")
+        try:
+            with open(conv_path, "r", encoding="utf-8") as f:
+                full_data = json.load(f)
+        except Exception as e:
+            print(display.yellow(f"[reload] Failed to load session data: {e}"))
+            return
+
+        self._restore_session(full_data, session_dir)
+        print(display.yellow(
+            f"\n[reload] Code reloaded successfully. Session {session_id[:8]} restored "
+            f"({self.turn_count} turns, {len(self.history.messages)} messages)."
+        ))
+        print(display.dim("All code changes are now active.\n"))
+
     # ── Context injection ───────────────────────────────────────────────────
 
     def _build_memory_context(self) -> str:
         entries = self.session_memory.list_entries()
         if not entries:
             return ""
+        
+        # Get current task context
+        active_plan = self.task_plan.get_active()
+        current_task = active_plan.get("title", "") if active_plan else ""
+        
+        # Prioritize: 1) task-related + high-prio, 2) task-related, 3) high-prio, 4) recent
+        task_related_high = []
+        task_related = []
+        high_prio = []
+        normal = []
+        
+        for e in entries:
+            is_high = e.get("priority") == "high"
+            is_task_related = current_task and e.get("task") == current_task
+            
+            if is_task_related and is_high:
+                task_related_high.append(e)
+            elif is_task_related:
+                task_related.append(e)
+            elif is_high:
+                high_prio.append(e)
+            else:
+                normal.append(e)
+        
+        # Combine: task-related first, then high-prio, then recent normal
+        ordered = task_related_high + task_related + high_prio + normal
+        selected = ordered[:15]  # Show up to 15 entries, 500 chars each
+        
         lines = ["<context-memory>"]
-        for e in entries[-10:]:
+        for e in selected:
             key = e.get("key", "")
             mem_type = e.get("type", "")
             content = e.get("content", "")
-            lines.append(f"<entry key=\"{key}\" type=\"{mem_type}\">{content[:300]}</entry>")
+            lines.append(f"<entry key=\"{key}\" type=\"{mem_type}\">{content[:500]}</entry>")
         lines.append("</context-memory>")
         return "\n".join(lines)
+
+    def _reset_guard_escalation(self):
+        """Reset guard escalation state on new user input — prevents stale escalations."""
+        for guard in self.guard_registry.guards:
+            if hasattr(guard, 'reset_escalation'):
+                guard.reset_escalation()
+            # Also reset loop detection history for fresh user intent
+            if hasattr(guard, '_exact_repeat_count'):
+                guard._exact_repeat_count = {}
 
     def _inject_context(self, user_input: str):
         memory_context = self._build_memory_context()
@@ -1448,6 +1537,7 @@ class WorkerAgent:
         self.turn_count += 1
         self._interrupted = False
         self._turn_iteration_count = 0
+        self._context_pressure_warned = False
         self.judge.budget._exhausted_warned = False
 
         result = self._kernel.run_turn()
@@ -1503,16 +1593,7 @@ class WorkerAgent:
                     f"Skipped: {self.judge.budget.skipped_detail}"
                 ))
 
-        # Context pressure warning (inject as new message, not appending to existing)
-        pressure = self.history.get_context_pressure()
-        if pressure >= 0.75:
-            warning = (
-                f"⚠ Context at {int(pressure*100)}%. Save key findings with memory_write. "
-                "Batch independent tool calls to reduce turn count."
-            )
-            # Inject as a separate user message instead of mutating the last message
-            # to prevent unbounded growth from repeated appends
-            self.history.append({"role": "user", "content": warning})
+        # Context pressure warning is handled by ContextPressureGuard — no duplicate check here
 
         self._tool_call_cache = {}
         print()
@@ -1759,8 +1840,13 @@ class WorkerAgent:
                 try:
                     arguments = json.loads(tc["arguments_json"]) if tc["arguments_json"] else {}
                 except json.JSONDecodeError:
-                    arguments = {}
+                    # Incomplete JSON from truncated stream — skip this tool call
+                    logger.warning("Skipping tool call %s: arguments JSON is incomplete (truncated stream)",
+                                   tc.get("name", "?"))
+                    continue
                 parsed_tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": arguments})
+            if not parsed_tool_calls:
+                parsed_tool_calls = None
 
         return {"content": "".join(content_parts) or None, "tool_calls": parsed_tool_calls, "truncated": stream_truncated}, usage
 
@@ -1785,6 +1871,137 @@ class WorkerAgent:
         return _is_context_limit_error(e)
 
     # ── Compaction helpers ─────────────────────────────────────────────────
+
+    def _extract_memories_before_compaction(self, to_drop: list[dict]):
+        """Auto-extract key findings from messages about to be dropped.
+
+        Rules (no LLM call, pure heuristics to keep it fast):
+        1. Error + fix pattern → finding
+        2. Path discoveries (checkpoint, env, config) → context
+        3. Numerical results (loss, throughput) → finding
+        """
+        import hashlib
+
+        extracted = []
+        all_text = ""
+
+        for msg in to_drop:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        parts.append(block.get("content", "") or block.get("text", ""))
+                    elif isinstance(block, str):
+                        parts.append(block)
+                content = "\n".join(parts)
+            if not isinstance(content, str):
+                continue
+            all_text += content + "\n"
+
+        # Rule 1: Error + resolution patterns
+        error_fix_patterns = [
+            # "Error: X ... fixed by Y" or "solved by"
+            (r'(?:Error|ERROR|Exception|OOM|NCCL|CUDA).*?[:]\s*(.{20,200})',
+             r'(?:fix|solve|resolv|workaround|solution).*?[:]\s*(.{20,200})'),
+        ]
+        errors_found = re.findall(
+            r'(?:Error|ERROR|Exception|Traceback|OOM|NCCL error|CUDA error)[^\n]{10,200}',
+            all_text
+        )
+        fixes_found = re.findall(
+            r'(?:fixed|solved|resolved|workaround|the fix|solution)[^\n]{10,200}',
+            all_text, re.IGNORECASE
+        )
+        if errors_found and fixes_found:
+            error_summary = errors_found[0][:150]
+            fix_summary = fixes_found[0][:150]
+            key = "auto_fix_" + hashlib.md5(error_summary.encode()).hexdigest()[:8]
+            extracted.append({
+                "key": key,
+                "type": "finding",
+                "content": f"Error: {error_summary}\nFix: {fix_summary}",
+            })
+
+        # Rule 2: Important path discoveries
+        path_patterns = [
+            (r'(?:checkpoint|ckpt|model|weight)s?\s*(?:path|dir|at|in)?[:\s]+(/\S{10,200})', "checkpoint_path"),
+            (r'(?:conda|env|environment)\s*(?:path|prefix|at|in)?[:\s]+(/\S{10,200})', "env_path"),
+            (r'(?:config|yaml|conf)\s*(?:path|file|at|in)?[:\s]+(/\S{10,200})', "config_path"),
+        ]
+        for pattern, label in path_patterns:
+            matches = re.findall(pattern, all_text, re.IGNORECASE)
+            if matches:
+                path_val = matches[-1].rstrip(".,;:\"')")  # last mention is most recent
+                key = f"auto_path_{label}_{hashlib.md5(path_val.encode()).hexdigest()[:6]}"
+                extracted.append({
+                    "key": key,
+                    "type": "context",
+                    "content": f"{label}: {path_val}",
+                })
+
+        # Rule 3: Numerical results (loss, throughput, tokens-per-sec)
+        metric_patterns = [
+            (r'(?:loss|lm.loss)\s*[:=]\s*([\d.]+(?:e[+-]?\d+)?)', "loss"),
+            (r'(?:throughput|tokens.per.sec|tps|samples.per.sec)\s*[:=]\s*([\d.]+)', "throughput"),
+            (r'(?:elapsed.time.per.iteration|iter.time)\s*[:=]\s*([\d.]+)', "iter_time"),
+        ]
+        metrics_found = []
+        for pat, label in metric_patterns:
+            matches = re.findall(pat, all_text, re.IGNORECASE)
+            if matches:
+                metrics_found.append(f"{label}={matches[-1]}")
+        if metrics_found:
+            key = "auto_metrics_" + hashlib.md5(
+                "\n".join(metrics_found).encode()
+            ).hexdigest()[:8]
+            extracted.append({
+                "key": key,
+                "type": "finding",
+                "content": "Training metrics observed: " + "; ".join(metrics_found[:5]),
+            })
+
+        # Write extracted memories (max 3 per compaction to avoid noise)
+        for entry in extracted[:3]:
+            try:
+                # Check if similar key already exists
+                existing = self.session_memory.get(entry["key"])
+                if existing:
+                    continue  # Don't overwrite existing entries
+                
+                # Check if similar content already exists (avoid near-duplicates)
+                all_entries = self.session_memory.list_entries()
+                new_words = set(re.findall(r'\w+', entry["content"].lower()))
+                new_words = {w for w in new_words if len(w) > 2}
+                
+                is_duplicate = False
+                for e in all_entries:
+                    if e.get("type") != entry["type"]:
+                        continue
+                    old_words = set(re.findall(r'\w+', e.get("content", "").lower()))
+                    old_words = {w for w in old_words if len(w) > 2}
+                    if not old_words or not new_words:
+                        continue
+                    overlap = len(new_words & old_words)
+                    smaller = min(len(new_words), len(old_words))
+                    if smaller > 0 and overlap / smaller >= 0.70:
+                        is_duplicate = True
+                        logger.debug("Auto-extract skipped (duplicate): %s", entry["key"])
+                        break
+                
+                if is_duplicate:
+                    continue
+                
+                self.session_memory.put(
+                    key=entry["key"],
+                    mem_type=entry["type"],
+                    content=entry["content"],
+                    priority="normal",
+                    scope="persistent",
+                )
+                logger.info("Auto-extracted memory: [%s] %s", entry["type"], entry["key"])
+            except Exception as e:
+                logger.debug("Failed to auto-extract memory: %s", e)
 
     def _summarize_for_compaction(self, text: str) -> str:
         response = self.provider.chat(

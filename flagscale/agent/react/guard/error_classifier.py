@@ -179,7 +179,8 @@ class ErrorClassifierGuard(Guard):
     def _cheap_error_trigger(result: str) -> bool:
         """Phase 1: Quick check if result might contain an error."""
         indicators = ("error", "Error", "ERROR", "failed", "Failed",
-                      "Traceback", "Exception", "denied", "refused")
+                      "Traceback", "Exception", "denied", "refused",
+                      "错误", "失败", "异常", "拒绝", "超时")
         return any(ind in result for ind in indicators)
 
     @staticmethod

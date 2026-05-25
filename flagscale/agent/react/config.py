@@ -66,12 +66,11 @@ class AgentConfig:
                 self.base_url = os.environ.get("OPENAI_BASE_URL")
 
         if not self.skill_dirs:
+            from flagscale.agent.react.paths import get_skill_search_paths
             builtin_dir = os.path.join(
                 os.path.dirname(os.path.dirname(__file__)), "skills"
             )
-            project_dir = os.path.join(os.getcwd(), ".flagscale", "skills")
-            user_dir = os.path.join(Path.home(), ".flagscale", "skills")
-            self.skill_dirs = [builtin_dir, project_dir, user_dir]
+            self.skill_dirs = [builtin_dir] + get_skill_search_paths()
 
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
             if var not in self.shell_env:
@@ -101,10 +100,8 @@ class AgentConfig:
         """Try loading from env var or default paths, then apply overrides."""
         config_path = os.environ.get("FLAGSCALE_AGENT_CONFIG")
         if not config_path:
-            candidates = [
-                os.path.join(os.getcwd(), ".flagscale", "agent.yaml"),
-                os.path.join(Path.home(), ".flagscale", "agent.yaml"),
-            ]
+            from flagscale.agent.react.paths import get_config_search_paths
+            candidates = get_config_search_paths()
             for c in candidates:
                 if os.path.isfile(c):
                     config_path = c

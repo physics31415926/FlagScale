@@ -1,8 +1,8 @@
 """Session persistence — save/load conversation history.
 
 Layout:
-  ~/.flagscale/sessions/{session_id}/conversation.json
-  ~/.flagscale/sessions/index.yaml
+  <project_root>/.flagscale/sessions/{session_id}/conversation.json
+  <project_root>/.flagscale/sessions/index.yaml
 """
 
 import json
@@ -15,9 +15,11 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from flagscale.agent.react.paths import get_sessions_root
+
 
 def _sessions_root() -> str:
-    return os.path.join(Path.home(), ".flagscale", "sessions")
+    return get_sessions_root()
 
 
 def get_session_dir(session_id: str) -> str:

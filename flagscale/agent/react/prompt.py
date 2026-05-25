@@ -52,7 +52,21 @@ Lifecycle: create → add_attempt → launch → update_last_attempt → finaliz
     "decision": """## Error Recovery
 
 Read full error → hypothesis → verify → fix → verify fix.
-When stuck: read more upstream code, don't try more fixes.""",
+When stuck: read more upstream code, don't try more fixes.
+
+## Code Quality Discipline
+
+**Before writing new code**:
+1. Read related existing code first (function signatures, data structures, call chains)
+2. Verify parameter names and types match exactly
+3. Check return value shapes and error handling paths
+
+**After writing**:
+1. Trace the data flow end-to-end
+2. Verify all function calls have correct argument count and names
+3. Test import and basic execution before claiming done
+
+Writing fast is good. Writing correct is better. The reload bug (3 consecutive errors) happened because I skipped step 1.""",
 
     "user_commands": """## User Commands
 

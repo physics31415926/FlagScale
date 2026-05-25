@@ -50,10 +50,7 @@ class CommandHandler:
             self.agent._exit()
             return True
         elif cmd == "/reload":
-            self.agent.config.reload()
-            self.agent.skill_manager.invalidate_cache()
-            self.agent._refresh_system_prompt()
-            print("Config and skills reloaded.")
+            self._handle_reload(user_input)
             return True
         elif cmd == "/skill":
             self._handle_skill(user_input)
@@ -254,3 +251,41 @@ class CommandHandler:
             skill_str = f" [{','.join(skills[:2])}]" if skills else ""
             print(f"  {i}. {sid}  {ts}{skill_str}  ({s.get('user_turns', 0)} turns)")
         print("Usage: /resume <number|session_id>")
+
+    def _handle_reload(self, user_input: str):
+        """Hot reload: save state, exec new process, auto-resume.
+
+        /reload        — full code reload (restart process)
+        /reload config — config-only reload (no restart)
+        """
+        parts = user_input.split()
+        if len(parts) > 1 and parts[1] == "config":
+            # Lightweight: just reload config and skills, no process restart
+            self.agent.config.reload()
+            self.agent.skill_manager.invalidate_cache()
+            self.agent._refresh_system_prompt()
+            print("Config and skills reloaded (no code reload).")
+            return
+
+        # Full code reload via process restart
+        print("Saving session state...")
+        self.agent._save_conversation(completed=False)
+
+        session_id = self.agent._session_id
+        print(f"Restarting process (session: {session_id})...")
+        print("All code changes will take effect.\n")
+
+        # Build the command to restart with auto-resume
+        import sys
+        import os
+
+        # Determine how the agent was launched
+        argv = sys.argv[:]
+
+        # Inject --auto-resume flag with session_id
+        # Remove any existing --auto-resume to avoid duplication
+        clean_argv = [a for a in argv if not a.startswith("--auto-resume")]
+        clean_argv.append(f"--auto-resume={session_id}")
+
+        # Use os.execv to replace current process — no orphan processes
+        os.execv(sys.executable, [sys.executable] + clean_argv)

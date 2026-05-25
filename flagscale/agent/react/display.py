@@ -218,20 +218,26 @@ def _stop_all_spinners():
 # ── Paste display ──────────────────────────────────────────────────────
 
 def pasted_input(text: str):
-    """Display a multi-line pasted input in collapsed form (like Claude Code).
+    """Display a multi-line pasted input in collapsed form.
 
     Shows first line, a "... (N lines)" indicator, and last line.
+    Uses terminal scroll region awareness to handle long pastes.
     """
     lines = text.splitlines()
     if len(lines) <= 3:
         return  # Short enough, prompt_toolkit already echoed it
-    # Clear the raw echoed lines and re-display collapsed
-    # Move cursor up to overwrite the echoed paste
-    for _ in range(len(lines) - 1):
+    # Get terminal height to cap how many lines we can erase
+    try:
+        term_height = os.get_terminal_size().lines
+    except (AttributeError, ValueError, OSError):
+        term_height = 24
+    # We can only erase lines still visible in the terminal (not scrolled off)
+    erase_count = min(len(lines) - 1, term_height - 2)
+    for _ in range(erase_count):
         sys.stdout.write("\033[A\033[2K")
     sys.stdout.flush()
-    first = lines[0][:80]
-    last = lines[-1][:80]
+    first = lines[0][:100]
+    last = lines[-1][:100]
     _print(f"  {first}")
     _print(dim(f"  ... ({len(lines)} lines)"))
     _print(f"  {last}")

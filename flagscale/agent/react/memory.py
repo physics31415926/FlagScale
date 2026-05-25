@@ -96,7 +96,7 @@ class SessionMemory:
                 pass
 
         # Fallback: semantic search by key words
-        keywords = re.findall(r'\w+', key.lower())
+        keywords = re.findall(r'[a-z0-9]+', key.lower())
         keywords = [w for w in keywords if len(w) > 2]
         if not keywords:
             return None
@@ -136,12 +136,18 @@ class SessionMemory:
         path = self._entry_path(safe)
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(entry, f, allow_unicode=True, default_flow_style=False)
+        self._invalidate_cache()
         return path
 
     def _find_and_merge_related(self, new_key: str, new_content: str) -> List[dict]:
-        """Find entries related to new content using LLM judgment, remove them (content merged into new key).
+        """Find entries related to new content and merge them.
 
-        If no LLM is available, falls back to keyword overlap heuristic.
+        Uses a two-phase approach to minimize LLM calls:
+        1. Fast keyword overlap check (no LLM)
+           - overlap >= 60%: auto-merge (clearly same topic)
+           - overlap 35-60%: ask LLM if available (ambiguous)
+           - overlap < 35%: skip (clearly different)
+        2. LLM confirmation only for ambiguous cases
         """
         if not os.path.isdir(self._dir):
             return []
@@ -151,30 +157,46 @@ class SessionMemory:
         if not candidates:
             return []
 
-        # Use LLM to judge relatedness
-        if self._llm_fn:
-            return self._llm_find_related(new_key, new_content, candidates)
-
-        # Fallback: keyword overlap (no LLM available)
-        new_words = set(re.findall(r'\w+', (new_key + " " + new_content).lower()))
-        new_words = {w for w in new_words if len(w) > 2}
+        new_words = set(re.findall(r'[a-z0-9]+', (new_key + " " + new_content).lower()))
+        new_words = {w for w in new_words if len(w) > 2}  # min 3 chars
         if not new_words:
             return []
 
-        merged = []
+        auto_merge = []
+        ambiguous = []
+
         for entry in candidates:
             existing_key = entry.get("key", "")
-            old_words = set(re.findall(r'\w+', (existing_key + " " + entry.get("content", "")).lower()))
+            old_words = set(re.findall(r'[a-z0-9]+', (existing_key + " " + entry.get("content", "")).lower()))
             old_words = {w for w in old_words if len(w) > 2}
             if not old_words:
                 continue
             overlap = len(new_words & old_words)
             smaller = min(len(new_words), len(old_words))
-            if smaller > 0 and overlap / smaller >= 0.5:
-                merged.append(entry)
-                path = self._entry_path(existing_key)
-                if os.path.isfile(path):
-                    os.remove(path)
+            if smaller == 0:
+                continue
+            ratio = overlap / smaller
+
+            # Require at least 3 overlapping words for auto-merge to avoid
+            # false positives when one entry has very few words
+            if ratio >= 0.60 and overlap >= 3:
+                auto_merge.append(entry)
+            elif ratio >= 0.35 and self._llm_fn:
+                ambiguous.append(entry)
+
+        # For ambiguous cases, ask LLM (batch them in one call)
+        llm_merge = []
+        if ambiguous and self._llm_fn:
+            llm_merge = self._llm_find_related(new_key, new_content, ambiguous)
+
+        # Combine and remove merged entries
+        merged = auto_merge + llm_merge
+        for entry in auto_merge:
+            path = self._entry_path(entry.get("key", ""))
+            if os.path.isfile(path):
+                os.remove(path)
+                logger.info("Memory auto-merge: '%s' → '%s' (high overlap)", entry.get("key"), new_key)
+
         return merged
 
     def _llm_find_related(self, new_key: str, new_content: str, candidates: List[dict]) -> List[dict]:
@@ -226,6 +248,7 @@ class SessionMemory:
         path = self._entry_path(safe)
         if os.path.isfile(path):
             os.remove(path)
+            self._invalidate_cache()
             return True
         return False
 
@@ -251,6 +274,17 @@ class SessionMemory:
     def list_entries(self, scope_filter: str = "") -> List[dict]:
         if not os.path.isdir(self._dir):
             return []
+        
+        # Cache: only re-scan disk if directory mtime changed
+        try:
+            dir_mtime = os.path.getmtime(self._dir)
+        except OSError:
+            dir_mtime = 0
+        
+        cache_key = (scope_filter, dir_mtime)
+        if hasattr(self, '_list_cache') and self._list_cache_key == cache_key:
+            return list(self._list_cache)  # return copy
+        
         entries = []
         for fname in sorted(os.listdir(self._dir)):
             if not fname.endswith(".yaml"):
@@ -265,7 +299,15 @@ class SessionMemory:
                     entries.append(entry)
             except Exception:
                 continue
-        return entries
+        
+        self._list_cache = entries
+        self._list_cache_key = cache_key
+        return list(entries)
+
+    def _invalidate_cache(self):
+        """Invalidate the list_entries cache after writes/deletes."""
+        self._list_cache = None
+        self._list_cache_key = None
 
     def query_relevant(self, keywords: list, max_tokens: int = 2000, current_session_id: str = "") -> List[dict]:
         """Return entries relevant to given keywords, within token budget.
@@ -289,7 +331,9 @@ class SessionMemory:
         scored = []
         for e in entries:
             text = (e.get("key", "") + " " + e.get("content", "")).lower()
-            score = sum(1 for k in kws if k in text)
+            # Use word-boundary matching to avoid false positives
+            # e.g., "train" should not match "constraint"
+            score = sum(1 for k in kws if re.search(rf'(?<![a-z]){re.escape(k)}(?![a-z])', text))
             if score > 0:
                 scored.append((score, e))
 

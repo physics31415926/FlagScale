@@ -40,19 +40,21 @@ class PlanUpdateGuard(Guard):
             self._turns_since_update = 0
             return None
 
-        # Increment counter for non-plan tools
-        if ctx.tool_name not in ("plan_status", "plan_create"):
-            self._turns_since_update += 1
+        # Count actual turns (not tool calls) since last update
+        if ctx.turn_count > self._last_update_turn:
+            turns_elapsed = ctx.turn_count - self._last_update_turn
+        else:
+            turns_elapsed = self._turns_since_update
 
-        # Inject reminder if plan hasn't been updated in 3+ turns
-        if self._turns_since_update >= 3:
+        # Inject reminder if plan hasn't been updated in 3+ actual turns
+        if turns_elapsed >= 3 and ctx.tool_name not in ("plan_status", "plan_create"):
             doing_steps = [s for s in steps if s.get("status") == "doing"]
             if doing_steps:
                 step_id = doing_steps[0].get("id")
                 return GuardVerdict.inject(
                     message=(
                         f"⚠️ PLAN UPDATE REQUIRED: You have a plan with active step {step_id}, "
-                        f"but haven't updated it in {self._turns_since_update} turns. "
+                        f"but haven't updated it in {turns_elapsed} turns. "
                         f"Call plan_update(action='step_done', step_id={step_id}) if you completed it, "
                         f"or plan_update(action='step_skip', step_id={step_id}, reason=...) if blocked."
                     ),

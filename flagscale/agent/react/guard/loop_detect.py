@@ -114,11 +114,7 @@ class LoopDetectGuard(Guard):
             if t == entry
         )
         if recent_same >= self._LOOP_THRESHOLD:
-            # Phase 2: LLM confirmation before escalation
-            if not self._confirm_loop_with_llm(ctx, "exact_match",
-                    f"Same call ({ctx.tool_name}) repeated {recent_same} times"):
-                return None  # LLM says not a loop
-
+            # Exact-match loops are unambiguous — skip LLM confirmation
             self._exact_loop_inject_count += 1
             # Escalate after 3 repeated warnings — abort the entire batch
             if self._exact_loop_inject_count >= 3:

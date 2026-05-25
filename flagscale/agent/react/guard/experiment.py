@@ -111,16 +111,14 @@ class ExperimentGuard(Guard):
                     "BEFORE launching. STOP and comply.".format(self._inject_count),
                     reason="experiment_not_created_persistent"
                 )
-            return GuardVerdict.inject(
-                message=(
-                    "⚠️ EXPERIMENT REQUIRED: You are about to launch a training/inference run, "
-                    "but no experiment has been created. Call:\n"
-                    "  workspace_experiment(action='create', name=..., purpose=..., hypothesis=...)\n"
-                    "THEN:\n"
-                    "  workspace_experiment(action='add_attempt', name=..., change=..., "
-                    "hardware={...}, config={...}, output_dir=...)\n"
-                    "BEFORE launching."
-                ),
+            return GuardVerdict.block(
+                "⚠️ EXPERIMENT REQUIRED: You are about to launch a training/inference run, "
+                "but no experiment has been created. Call:\n"
+                "  workspace_experiment(action='create', name=..., purpose=..., hypothesis=...)\n"
+                "THEN:\n"
+                "  workspace_experiment(action='add_attempt', name=..., change=..., "
+                "hardware={...}, config={...}, output_dir=...)\n"
+                "BEFORE launching.",
                 reason="experiment_not_created"
             )
 
@@ -133,13 +131,11 @@ class ExperimentGuard(Guard):
                     "BEFORE launching. STOP and comply.".format(self._inject_count),
                     reason="attempt_not_added_persistent"
                 )
-            return GuardVerdict.inject(
-                message=(
-                    "⚠️ ATTEMPT REQUIRED: Experiment exists but no attempt has been added. Call:\n"
-                    "  workspace_experiment(action='add_attempt', name=..., change=..., "
-                    "hardware={...}, config={...}, output_dir=...)\n"
-                    "BEFORE launching. This records what you're about to try."
-                ),
+            return GuardVerdict.block(
+                "⚠️ ATTEMPT REQUIRED: Experiment exists but no attempt has been added. Call:\n"
+                "  workspace_experiment(action='add_attempt', name=..., change=..., "
+                "hardware={...}, config={...}, output_dir=...)\n"
+                "BEFORE launching. This records what you're about to try.",
                 reason="attempt_not_added"
             )
 

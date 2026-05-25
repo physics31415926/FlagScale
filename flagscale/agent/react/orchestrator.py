@@ -501,9 +501,8 @@ class Orchestrator:
         self.config = config or AgentConfig.auto_load()
 
         # Shared constraint cache for all workers
-        sessions_root = self.config.session_dir or os.path.join(
-            os.path.expanduser("~"), ".flagscale", "sessions"
-        )
+        from flagscale.agent.react.paths import get_sessions_root
+        sessions_root = self.config.session_dir or get_sessions_root()
         self._constraint_cache = ConstraintCache(sessions_root)
 
     def handle(self, user_input: str) -> str:

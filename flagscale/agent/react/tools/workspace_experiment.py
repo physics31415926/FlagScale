@@ -136,7 +136,16 @@ class WorkspaceExperimentTool(Tool):
                 return "ERROR: finalize requires non-empty 'learnings' list."
             if status == "failed" and not root_cause:
                 return "ERROR: finalize with status='failed' requires 'root_cause'."
-            return self._manager.finalize(name, status, root_cause=root_cause, learnings=learnings)
+            result = self._manager.finalize(name, status, root_cause=root_cause, learnings=learnings)
+            # Auto-update plan steps linked to this experiment
+            if self._task_plan and status == "completed":
+                plan = self._task_plan.get_active()
+                if plan:
+                    for step in plan.get("steps", []):
+                        if name in step.get("experiments", []) and step.get("status") != "done":
+                            self._task_plan.update_step(step["id"], "done",
+                                notes=f"Auto-marked done: experiment '{name}' completed")
+            return result
 
         elif action == "read":
             name = kwargs.get("name")

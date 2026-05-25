@@ -305,6 +305,7 @@ class HistoryManager:
         self._compaction_happened = False
         self._compaction_count = 0
         self._plan_summary_fn: Optional[Callable[[], str]] = None
+        self._pre_compaction_hook: Optional[Callable[[List[Dict[str, Any]]], None]] = None
 
     def set_summarizer(self, callback: Callable[[str], str]):
         """Inject LLM summarization callback. Signature: (text) -> summary_string."""
@@ -813,6 +814,13 @@ class HistoryManager:
                         new_estimated, local_target)
             to_drop, to_keep = _collect_droppable(result, local_target, scorer=self._scorer)
 
+            # Pre-compaction hook: extract key info from to_drop before losing them
+            if to_drop and self._pre_compaction_hook:
+                try:
+                    self._pre_compaction_hook(to_drop)
+                except Exception as e:
+                    logger.warning("Pre-compaction hook failed: %s", e)
+
             if to_drop and self._summarizer:
                 summary_text = self._build_summary_input(to_drop, self._compaction_anchors)
                 self._compaction_anchors = []
@@ -1185,6 +1193,7 @@ def _heuristic_score(msg: Dict[str, Any]) -> int:
     """Score a message's value heuristically (0-10, higher = more valuable).
 
     Used as fallback when LLM scorer is unavailable.
+    Higher score = more likely to be kept during compaction.
     """
     content = _extract_text(msg)
     if not content:
@@ -1199,25 +1208,45 @@ def _heuristic_score(msg: Dict[str, Any]) -> int:
         if any(kw in content for kw in ("because", "decision", "approach", "strategy",
                                          "found that", "discovered", "the issue is")):
             return 8
+        # Successful write/edit operations — keep (shows what was changed)
+        if any(kw in content for kw in ("Successfully edited", "Wrote ", "write_file", "edit_file")):
+            return 8
         return 5
+
+    # User messages — always high value
+    if msg.get("role") == "user":
+        return 9
 
     # Tool results — score by content type
     lower = content[:500].lower()
+
+    # Empty or near-empty shell output — very low value
+    if len(content.strip()) < 10:
+        return 1
 
     # Install/build logs — low value
     if any(kw in lower for kw in ("installing", "collecting", "downloading",
                                    "successfully installed", "building wheel")):
         return 2
 
-    # File content — high value (expensive to re-read)
+    # plan_status, memory_list verbose output — low value (easily re-fetched)
+    if any(kw in lower for kw in ("plan:", "progress:", "showing", "entries")):
+        if "plan:" in lower and "step" in lower:
+            return 3
+
+    # Successful edit/write results — high value (shows what changed)
+    if any(kw in lower for kw in ("successfully edited", "wrote ", "created ")):
+        return 8
+
+    # File content — medium-high (expensive to re-read but can be re-read)
     if any(kw in lower for kw in ("import ", "def ", "class ", "from ", "---\n",
                                    "export ", "#include", "\"type\":")):
-        return 7
+        return 6
 
-    # Directory listings — medium
+    # Directory listings — low-medium
     lines = content.splitlines()
     if len(lines) > 5 and sum(1 for l in lines[:10] if l.strip().startswith(("/", "./"))) > 5:
-        return 4
+        return 3
 
     # Short results (likely conclusions) — medium-high
     if len(content) < 200:

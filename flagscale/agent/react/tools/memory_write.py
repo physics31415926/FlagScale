@@ -62,11 +62,16 @@ class MemoryWriteTool(Tool):
         "required": ["key", "type", "content"],
     }
 
-    def __init__(self, memory, session_id: str = ""):
+    def __init__(self, memory, session_id: str = "", task_plan=None):
         self._memory = memory
         self._session_id = session_id
+        self._task_plan = task_plan
 
     def _get_current_task(self) -> str:
+        if self._task_plan:
+            active = self._task_plan.get_active()
+            if active:
+                return active.get("title", "")
         return ""
 
     def execute(self, **kwargs) -> str:

@@ -165,10 +165,26 @@ class AgentKernel:
                 # ── No tool calls → done ──
                 if not response.get("tool_calls"):
                     result.iterations = iteration + 1
+                    # Check for explicit stop signals in assistant response
+                    assistant_text = ""
+                    if isinstance(response.get("content"), str):
+                        assistant_text = response["content"]
+                    elif isinstance(response.get("content"), list):
+                        assistant_text = "".join(
+                            b.get("text", "") for b in response["content"]
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    if "[TASK_COMPLETE]" in assistant_text or "[NEED_USER_INPUT]" in assistant_text:
+                        result.stop_reason = "explicit_signal"
+                        break
                     if not self._should_auto_continue_plan():
                         result.stop_reason = "no_tool_calls"
                         break
-                    # Plan auto-continue
+                    # Plan auto-continue — check token budget first
+                    pressure = d.history.get_context_pressure() if hasattr(d.history, 'get_context_pressure') else 0
+                    if pressure >= 0.85:
+                        result.stop_reason = "context_pressure"
+                        break
                     self._plan_auto_continue_count += 1
                     if self._plan_auto_continue_count > 10:
                         result.stop_reason = "plan_auto_continue_limit"

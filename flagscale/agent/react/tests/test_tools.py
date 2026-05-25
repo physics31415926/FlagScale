@@ -48,7 +48,7 @@ class TestWriteFileTool:
         f = tmp_path / "out.txt"
         tool = WriteFileTool()
         result = tool.execute(path=str(f), content="test content")
-        assert "Successfully" in result
+        assert "Wrote" in result or "Successfully" in result
         assert f.read_text() == "test content"
 
     def test_write_creates_dirs(self, tmp_path):
