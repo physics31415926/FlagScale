@@ -84,7 +84,7 @@ constraints:
   prompt: Check if the agent is committing changes without first reviewing whether each patch is minimal and necessary
   correction: 'Before committing: run git diff, verify each change is necessary, remove debug leftovers, ensure patches are hardware-gated, and confirm TODO comments exist for workarounds.'
 - id: no_git_add_all
-  description: Never use git add . — stage files in logical groups for separate commits
+  description: Never use git add . before squashing — stage only the files you intend to include
   trigger:
     tools:
     - shell
@@ -92,8 +92,8 @@ constraints:
     - git add .
     - git add -A
     - git add --all
-  prompt: Check if the agent is staging all files at once instead of grouping by logical change
-  correction: 'Stage files in logical groups: patches in one commit, tests in another, config/dispatch in a third. Each commit should be independently meaningful.'
+  prompt: Check if the agent is staging all files at once, which may include debug tools or unintended changes
+  correction: 'Before squashing: remove debug tools (git rm tools/probe_*.py tools/test_*.py), then use git reset --soft origin/main and git add only the files that belong in the PR. Never include probe scripts, temporary test utilities, or debug prints.'
 - id: model_path_must_exist
   description: Verify model weights exist on disk before launching any inference
   trigger:
@@ -190,6 +190,9 @@ If any of these are not ready, run `infer-env-setup` first.
 8. **Sync code before testing** — if editing locally, push changes to container before running tests.
 9. **Check device occupancy before tests** — use the backend's monitoring tool to confirm devices are free.
 10. **Use tmux for long-running commands** — SSH sessions will timeout otherwise.
+11. **Workspace orientation first** — run Step 0 probe before any test. Record plugin path, branch, vLLM version, and model path in memory. Never guess paths.
+12. **Read once, memorize** — after reading any source file, record key findings with `memory_write`. Check `memory_read` before re-opening a file. Never read the same file twice unless it was modified.
+13. **Squash before PR** — squash all adaptation commits into one clean commit with a comprehensive message. Remove debug tools before squashing.
 
 ---
 
@@ -224,6 +227,38 @@ Adaptation is **complete** when ALL of the following are true:
 2. Stage 5 patch review confirms minimum necessary diff
 3. Stage 6 PR is created with all version info recorded
 
+### Step 0: Workspace Orientation (MANDATORY before any test)
+
+Before running any test, collect all environment facts in **one batched probe**. Do NOT skip this step even if you think you know the paths.
+
+```bash
+# Run all of these in ONE shell call (batch them):
+ssh <ssh_host> "docker exec <container> bash -c '
+  echo \"=== plugin workspace ===\"
+  ls /workspace/adapt-*/vllm-plugin-FL/vllm_fl/__init__.py 2>/dev/null || \
+    ls /workspace/vllm-plugin-FL/vllm_fl/__init__.py 2>/dev/null || echo NOT FOUND
+  echo \"=== plugin git branch ===\"
+  git -C /workspace/adapt-*/vllm-plugin-FL branch --show-current 2>/dev/null || \
+    git -C /workspace/vllm-plugin-FL branch --show-current 2>/dev/null
+  echo \"=== vllm version ===\"
+  python3 -c \"import vllm; print(vllm.__version__)\"
+  echo \"=== plugin installed ===\"
+  python3 -c \"import vllm_fl; print(vllm_fl.__file__)\"
+  echo \"=== adapt-logs dir ===\"
+  ls /workspace/adapt-logs/ 2>/dev/null || echo NOT FOUND
+  echo \"=== models available ===\"
+  ls /workspace/models/ 2>/dev/null || echo NOT FOUND
+'"
+```
+
+**Record these findings immediately** with `memory_write`:
+- `infer_plugin_workspace`: absolute path to the plugin repo inside the container
+- `infer_plugin_branch`: current git branch
+- `infer_vllm_version`: installed vLLM version
+- `infer_models_path`: path to available models
+
+**Use these recorded paths for ALL subsequent commands.** Never guess or reconstruct paths from memory.
+
 ### Test Progression
 
 Run tests in strict order. Fix all failures at each stage before proceeding to the next.
@@ -237,6 +272,8 @@ VLLM_PLUGINS=fl pytest tests/unit_tests/ -x -v 2>&1 | tee /workspace/adapt-logs/
 
 Purpose: verify import compatibility, API surface, basic plugin registration.
 
+Monitor with `duration=300` (5 min). Unit tests should complete well within this window.
+
 #### Stage 2: Functional Tests
 
 ```bash
@@ -244,6 +281,8 @@ VLLM_PLUGINS=fl pytest tests/functional_tests/ -x -v 2>&1 | tee /workspace/adapt
 ```
 
 Purpose: verify operator correctness, kernel dispatch, dtype handling.
+
+Monitor with `duration=600` (10 min).
 
 #### Stage 3: Offline Inference
 
@@ -253,6 +292,8 @@ VLLM_PLUGINS=fl MODEL_PATH=/workspace/models/<model> TP_SIZE=2 \
 ```
 
 Purpose: full model execution without serving overhead. Validates model loading, forward pass, sampling.
+
+Monitor with `duration=900` (15 min). Model loading alone can take 3–5 min on first run.
 
 #### Stage 4: Serving Test
 
@@ -270,14 +311,26 @@ curl http://localhost:8000/v1/completions \
 
 Purpose: production readiness — OpenAI-compatible API serving.
 
+Monitor with `success_pattern="Uvicorn running"` and `duration=900` (15 min).
+
 #### Stage 5: Patch Review (after all tests pass)
 
-Once all 4 test stages pass, review every modification made during the process:
+Once all 4 test stages pass, review every modification made during the process.
+
+**Step 1: Pull latest code to local workspace first**
 
 ```bash
-cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL
-git diff --stat   # overview of changed files
-git diff          # full diff
+# On local machine — ensure local branch is up to date with what was tested
+git fetch origin
+git checkout <branch>
+git pull origin <branch>
+```
+
+**Step 2: Review the diff**
+
+```bash
+git diff origin/main --stat   # overview of changed files
+git diff origin/main          # full diff
 ```
 
 For each change, ask:
@@ -286,80 +339,93 @@ For each change, ask:
 3. **Is there a TODO for removal?** — Every workaround patch must have a clear condition for when it can be removed (e.g., "remove when FlagGems adds `topk` for <backend> backend").
 4. **Does it break other backends?** — Ensure patches are gated by hardware detection (`if current_platform.is_<backend>()` or equivalent), not applied unconditionally.
 
+**Step 3: Remove non-essential files**
+
+Debug tools, probe scripts, and temporary test files added during adaptation must NOT go into the PR. Remove them before committing:
+
+```bash
+git rm tools/probe_<backend>.py tools/test_*.py 2>/dev/null || true
+```
+
 Remove any changes that fail these checks. The goal is the **minimum diff** that makes the target hardware work.
 
 #### Stage 6: PR Preparation
 
-After patch review, organize changes into a clean PR:
+After patch review, organize changes into a clean PR.
 
-**Step 1: Create a feature branch**
+**Step 1: Squash commits into one clean commit**
+
 ```bash
-cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL
-git checkout -b feat/<backend>-support  # or adapt/<backend>-vllm-<version>
+# Count commits ahead of main
+git log origin/main..HEAD --oneline | wc -l
+
+# If more than 1 commit, squash them
+git reset --soft origin/main
+git commit -m "fix(<backend>): adapt for vLLM <version>
+
+- Fix 1: <what> (<why>)
+- Fix 2: <what> (<why>)
+...
+
+Tested on <hardware> (<GPU count>x <GPU model>):
+- Unit tests: PASS (349/349)
+- Functional tests: PASS (23/23)
+- Offline inference: PASS (<model>)
+- Serving: PASS (OpenAI API)
+"
 ```
 
-**Step 2: Stage changes by logical group**
+**Why squash?** Hardware adaptation PRs are feature-complete units. The intermediate "fix attempt 1", "fix attempt 2", "revert", "try again" commits are noise. One commit = one logical change = easier to review, revert, or cherry-pick.
 
-Do NOT `git add .`. Stage files in logical commits:
+**Step 2: Push to fork**
+
 ```bash
-# Commit 1: core patches (the essential fixes)
-git add <backend>/patches/
-git commit -m "feat(<backend>): add PyTorch fallback patches for unsupported Triton kernels"
-
-# Commit 2: test/example additions
-git add tests/ examples/
-git commit -m "test(<backend>): add offline inference example and test config"
-
-# Commit 3: configuration/dispatch wiring
-git add <backend>/dispatch/ <backend>/platform/
-git commit -m "feat(<backend>): wire FlagGems dispatch for backend"
+git push -f origin <branch>  # -f because we squashed
 ```
 
-Adjust commit grouping based on actual changes. Each commit should be independently meaningful.
+**Step 3: Create PR**
 
-**Step 3: Write PR description**
+```bash
+gh pr create --base main --head <branch> \
+  --title "fix(<backend>): adapt for vLLM <version>" \
+  --body-file PR_DESCRIPTION.md
+```
 
-PR title format: `feat(<backend>): adapt plugin for vLLM <version>` (under 70 characters)
+**PR_DESCRIPTION.md template:**
 
-PR description template:
 ```markdown
 ## Summary
-Adapt vllm-plugin-FL <hardware_backend> backend for vLLM <version> upgrade.
+
+Adapt vllm-plugin-FL for <backend> hardware on vLLM <version>.
 
 ## Changes
-- <list each logical change>
 
-## Version Matrix
-| Component | Version / Commit |
-|-----------|-----------------|
-| vLLM | <pinned version, e.g., 0.20.2> |
-| vllm-plugin-FL | <branch name + commit hash> |
-| FlagGems | main @ <commit hash> |
-| Docker image | <full image tag> |
-| torch | <torch version from container> |
-| Runtime / Driver | <runtime version> / <driver version> |
+1. **<file>**: <what> — <why>
+2. **<file>**: <what> — <why>
+...
 
 ## Test Results
-- Unit tests: PASS
-- Functional tests: PASS
-- Offline inference (<model>, TP=<n>): PASS
-- Serving test (OpenAI API): PASS
 
-## Hardware
-- <hardware description, e.g., MetaX C550 64GB × 8>
-- <runtime info, e.g., MACA 2.33.0, Driver 2.15.9>
+Hardware: <GPU count>x <GPU model> (<driver version>)
 
-## Known Limitations
-- <list any workarounds or performance gaps>
+| Stage | Result | Notes |
+|-------|--------|-------|
+| Unit tests | ✅ PASS | 349/349 |
+| Functional tests | ✅ PASS | 23/23 |
+| Offline inference | ✅ PASS | <model>, TP=<N> |
+| Serving | ✅ PASS | OpenAI API `/v1/completions` |
 
-## TODO (follow-up)
-- <list items for future PRs, e.g., FlagGems native ops>
-```
+## FlagGems Needed Ops
 
-**Step 4: Push and create PR**
-```bash
-git push -u origin feat/<backend>-support
-# Then create PR via GitHub CLI or web UI
+The following ops currently fall back to PyTorch and need native <backend> implementation in FlagGems:
+
+- `op_name_1` (used in <layer>)
+- `op_name_2` (used in <layer>)
+...
+
+---
+
+> 🤖 This PR was generated by [Kiro](https://kiro.dev) (FlagScale Agent). All code changes were verified by running the full test suite on real <backend> hardware.
 ```
 
 ---
@@ -411,6 +477,8 @@ When a test stage fails, follow the **test → diagnose → patch → re-test** 
 - **Gate by hardware** — use `if current_platform.is_<backend>()` or equivalent
 - **Include a TODO** — every workaround must state when it can be removed
 - **Record feedback** — if FlagGems is missing an op, note it for the team
+- **Read once, memorize** — after reading any source file, immediately record key findings with `memory_write`. Never re-read the same file unless it was modified. Check `memory_read` first before opening a file again.
+- **No debug tools in PR** — probe scripts, test utilities, and temporary tools added during adaptation must be removed before the PR. Use `git rm tools/probe_*.py tools/test_*.py` before squashing.
 
 ### Patch File Structure
 
@@ -498,14 +566,16 @@ Before submitting the adaptation PR, verify **all** items:
 - [ ] Run `git diff main | grep -iE '(password|token|secret|pem|private_key|proxy)'` — should return nothing
 
 ### Commits & PR
-- [ ] Commits are logical and atomic (one patch per commit, not one giant squash)
-- [ ] Commit messages describe *what* and *why*, not just "fix"
+- [ ] All commits squashed into one clean commit (see Stage 6 for squash instructions)
+- [ ] Commit message describes all changes with *what* and *why*
+- [ ] Commit message includes test results summary
 - [ ] Branch name follows convention: `adapt/<backend>-vllm-<version>`
 - [ ] PR description includes:
   - Target backend and vLLM version
   - Reason for each patch (what broke and why)
   - Test results summary (which stages pass, key metrics)
   - FlagGems needed-ops list (ops that currently fall back to PyTorch and need native implementation)
+  - Agent attribution footer (see PR template in Stage 6)
 
 ### Evidence
 - [ ] Test pass logs saved in `/workspace/adapt-logs/` (unit, functional, offline, serving)
