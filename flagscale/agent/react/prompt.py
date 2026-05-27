@@ -43,7 +43,15 @@ Deep reading IS productive work — separate analysis from action.""",
 
     "memory_rules": """## Memory
 
-memory_write: reusable knowledge (env quirks, workarounds). DON'T memorize temporary state.""",
+memory_write: reusable knowledge (env quirks, workarounds). DON'T memorize temporary state.
+
+## Memory-First Discipline
+
+Before reading any file or running any query command, check `memory_read` for cached info.
+If not found: read/query once, then immediately `memory_write` the key findings.
+Never read the same file twice in one session unless it was modified.
+
+Key naming convention: `<scope>_<topic>` where scope = project/model/tool name (e.g., `qwen3_model_path`, `flagscale_train_config`, `env_conda_prefix`).""",
 
     "experiment": """## Experiment Workflow
 
@@ -71,6 +79,17 @@ Writing fast is good. Writing correct is better. The reload bug (3 consecutive e
     "user_commands": """## User Commands
 
 `/mode auto|confirm`, `/memory list|clear|delete`, `/skill <name>`, `/file <path>`, `/plan`, `/plan abandon`, `/reload`, `/quit`""",
+
+    "path_management": """## Path Management Discipline
+
+**After any environment probe, immediately record ALL discovered paths to memory:**
+- `memory_write('<project>_workspace', '...')`
+- `memory_write('<project>_model_path', '...')`
+- `memory_write('<project>_log_dir', '...')`
+- `memory_write('env_conda_prefix', '...')`
+
+**Never guess paths.** Always read from memory or re-probe with `find` / `ls`.
+Path confusion between similarly-named directories is a common failure mode — memory prevents it.""",
 }
 
 # Backward compatibility alias
