@@ -205,6 +205,8 @@ Use this skill when:
 8. **Check container existence** before creating — reuse running containers, start stopped ones.
 9. **Use `--network host`** for Docker containers on GPU machines.
 10. **Use tmux for long-running commands** — SSH sessions will timeout otherwise.
+11. **Record paths to memory** — after Step 0 probe, immediately save all paths (ssh_host, container_name, workspace_root, model_path, log_dir) to memory. Use these recorded paths for all subsequent commands. Never guess paths.
+12. **Batch independent tool calls** — when multiple shell commands, file reads, or memory operations are independent, execute them in one response to reduce round-trips. Example: check container + check image + check disk space → one SSH call with `&&`, not 3 separate calls.
 
 ---
 
@@ -226,7 +228,9 @@ ssh <ssh_host> "echo '=== hostname ===' && hostname && \
   echo '=== device processes ===' && (nvidia-smi --query-compute-apps=pid,used_memory,name --format=csv,noheader 2>/dev/null || echo 'N/A — check with backend tool') && \
   echo '=== disk space ===' && df -h /workspace /home 2>/dev/null | head -5 && \
   echo '=== docker containers ===' && docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' && \
-  echo '=== docker images (vllm) ===' && docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -i vllm"
+  echo '=== docker images (vllm) ===' && docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -i vllm && \
+  echo '=== existing adapt dirs ===' && find /workspace -maxdepth 3 -name 'vllm-plugin-FL' -type d 2>/dev/null && \
+  echo '=== workspace layout ===' && ls -la /workspace/ 2>/dev/null | head -20"
 ```
 
 This gives you:
@@ -236,6 +240,16 @@ This gives you:
 - **Disk**: available space for models/containers
 - **Existing containers**: whether to reuse or create new
 - **Available images**: whether to pull or use existing
+- **Existing adapt dirs**: avoid path confusion — know what's already cloned before creating new dirs
+
+**After the probe, immediately record to memory:**
+```
+memory_write('<backend>_ssh_host', '<ssh_host>')
+memory_write('<backend>_container_name', '<container_name>')
+memory_write('<backend>_workspace_root', '/workspace/adapt/<backend>-vllm-<version>')
+memory_write('<backend>_model_path', '/workspace/models/<model_name>')
+memory_write('<backend>_log_dir', '/workspace/adapt-logs')
+```
 
 If SSH fails, ask the user to check their `~/.ssh/config` or provide full connection details (host, port, user, key file).
 

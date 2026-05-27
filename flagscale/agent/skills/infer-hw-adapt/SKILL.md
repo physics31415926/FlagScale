@@ -190,9 +190,10 @@ If any of these are not ready, run `infer-env-setup` first.
 8. **Sync code before testing** — if editing locally, push changes to container before running tests.
 9. **Check device occupancy before tests** — use the backend's monitoring tool to confirm devices are free.
 10. **Use tmux for long-running commands** — SSH sessions will timeout otherwise.
-11. **Workspace orientation first** — run Step 0 probe before any test. Record plugin path, branch, vLLM version, and model path in memory. Never guess paths.
+11. **Workspace orientation first** — run Stage 0 probe before any test. Record plugin path, branch, vLLM version, and model path in memory. Never guess paths.
 12. **Read once, memorize** — after reading any source file, record key findings with `memory_write`. Check `memory_read` before re-opening a file. Never read the same file twice unless it was modified.
 13. **Squash before PR** — squash all adaptation commits into one clean commit with a comprehensive message. Remove debug tools before squashing.
+14. **Batch independent tool calls** — when multiple shell commands, file reads, or memory operations are independent, execute them in one response to reduce round-trips. Example: read 3 patch files → one response with 3 `read_file` calls, not 3 separate responses.
 
 ---
 
@@ -259,11 +260,48 @@ ssh <ssh_host> "docker exec <container> bash -c '
 
 **Use these recorded paths for ALL subsequent commands.** Never guess or reconstruct paths from memory.
 
-### Test Progression
+## Test Progression
 
 Run tests in strict order. Fix all failures at each stage before proceeding to the next.
 
-#### Stage 1: Unit Tests
+### Stage 0: Workspace Orientation (MANDATORY)
+
+**Before any test, record all paths to memory to avoid path confusion:**
+
+```bash
+ssh <ssh_host> "docker exec <container> bash -c '
+  echo \"=== plugin workspace ===\" &&
+  find /workspace -name \"vllm_fl\" -type d 2>/dev/null | head -5 &&
+  echo \"=== plugin git info ===\" &&
+  for dir in \$(find /workspace -name \".git\" -type d 2>/dev/null | grep vllm-plugin-FL); do
+    repo=\$(dirname \$dir)
+    echo \"Repo: \$repo\"
+    git -C \$repo branch --show-current
+    git -C \$repo log -1 --oneline
+  done &&
+  echo \"=== vllm version ===\" &&
+  python3 -c \"import vllm; print(vllm.__version__)\" &&
+  echo \"=== plugin installed ===\" &&
+  python3 -c \"import vllm_fl; print(vllm_fl.__file__)\" &&
+  echo \"=== adapt-logs ===\" &&
+  ls -lh /workspace/adapt-logs/ 2>/dev/null | tail -10 &&
+  echo \"=== models ===\" &&
+  ls -lh /workspace/models/ 2>/dev/null | head -10
+'"
+```
+
+**Immediately record to memory:**
+```
+memory_write('<backend>_plugin_workspace', '<discovered_path>')
+memory_write('<backend>_plugin_branch', '<branch_name>')
+memory_write('<backend>_vllm_version', '<version>')
+memory_write('<backend>_model_path', '/workspace/models/<model_name>')
+memory_write('<backend>_log_dir', '/workspace/adapt-logs')
+```
+
+**Never guess paths. Always read from memory or re-probe.**
+
+### Stage 1: Unit Tests
 
 ```bash
 cd /workspace/adapt/<backend>-vllm-<version>/vllm-plugin-FL
@@ -272,9 +310,9 @@ VLLM_PLUGINS=fl pytest tests/unit_tests/ -x -v 2>&1 | tee /workspace/adapt-logs/
 
 Purpose: verify import compatibility, API surface, basic plugin registration.
 
-Monitor with `duration=300` (5 min). Unit tests should complete well within this window.
+Monitor with `duration=120` (2 min), `process_pattern="pytest"`. Unit tests complete in under 60s on most backends; if pytest dies the monitor returns immediately rather than waiting out the full timeout.
 
-#### Stage 2: Functional Tests
+### Stage 2: Functional Tests
 
 ```bash
 VLLM_PLUGINS=fl pytest tests/functional_tests/ -x -v 2>&1 | tee /workspace/adapt-logs/functional_$(date +%Y%m%d_%H%M%S).log
@@ -282,9 +320,9 @@ VLLM_PLUGINS=fl pytest tests/functional_tests/ -x -v 2>&1 | tee /workspace/adapt
 
 Purpose: verify operator correctness, kernel dispatch, dtype handling.
 
-Monitor with `duration=600` (10 min).
+Monitor with `duration=300` (5 min), `process_pattern="pytest"`, `fail_pattern="FAILED|ERROR|hang|timeout"`. Functional tests can hang indefinitely on graph capture failures — the `process_pattern` ensures the monitor returns if pytest dies silently. If a test hangs beyond 5 min, kill it and diagnose the specific test with `-k <test_name>`.
 
-#### Stage 3: Offline Inference
+### Stage 3: Offline Inference
 
 ```bash
 VLLM_PLUGINS=fl MODEL_PATH=/workspace/models/<model> TP_SIZE=2 \
@@ -293,9 +331,9 @@ VLLM_PLUGINS=fl MODEL_PATH=/workspace/models/<model> TP_SIZE=2 \
 
 Purpose: full model execution without serving overhead. Validates model loading, forward pass, sampling.
 
-Monitor with `duration=900` (15 min). Model loading alone can take 3–5 min on first run.
+Monitor with `duration=600` (10 min), `process_pattern="python"`, `success_pattern="Prompt.*Output:|Generated text:"`. Model loading takes 2–4 min on first run; the `success_pattern` returns as soon as output is generated rather than waiting the full timeout.
 
-#### Stage 4: Serving Test
+### Stage 4: Serving Test
 
 ```bash
 VLLM_PLUGINS=fl vllm serve /workspace/models/<model> \
@@ -311,9 +349,9 @@ curl http://localhost:8000/v1/completions \
 
 Purpose: production readiness — OpenAI-compatible API serving.
 
-Monitor with `success_pattern="Uvicorn running"` and `duration=900` (15 min).
+Monitor with `duration=600` (10 min), `process_pattern="vllm.*serve"`, `success_pattern="Uvicorn running|Application startup complete"`. The server is ready when Uvicorn reports startup; the monitor returns immediately rather than waiting the full timeout.
 
-#### Stage 5: Patch Review (after all tests pass)
+### Stage 5: Patch Review (after all tests pass)
 
 Once all 4 test stages pass, review every modification made during the process.
 
@@ -477,7 +515,7 @@ When a test stage fails, follow the **test → diagnose → patch → re-test** 
 - **Gate by hardware** — use `if current_platform.is_<backend>()` or equivalent
 - **Include a TODO** — every workaround must state when it can be removed
 - **Record feedback** — if FlagGems is missing an op, note it for the team
-- **Read once, memorize** — after reading any source file, immediately record key findings with `memory_write`. Never re-read the same file unless it was modified. Check `memory_read` first before opening a file again.
+- **Read once, memorize** — after reading any source file, immediately record key findings with `memory_write`. Check `memory_read` before opening a file again. Never re-read the same file unless it was modified. This prevents the common failure mode of reading `__init__.py` or `git log` 10+ times in one session.
 - **No debug tools in PR** — probe scripts, test utilities, and temporary tools added during adaptation must be removed before the PR. Use `git rm tools/probe_*.py tools/test_*.py` before squashing.
 
 ### Patch File Structure
