@@ -1595,8 +1595,92 @@ class WorkerAgent:
 
         # Context pressure warning is handled by ContextPressureGuard — no duplicate check here
 
+        # Efficiency hints: batching and memory
+        self._inject_efficiency_hints(tool_calls, results)
+
         self._tool_call_cache = {}
         print()
+
+    def _inject_efficiency_hints(self, tool_calls: list, results: list):
+        """Inject efficiency hints after tool execution.
+
+        Two checks:
+        1. Batching hint — if the last N assistant turns each made exactly one
+           independent tool call, remind the agent to batch them next time.
+        2. Memory hint — if read_file returned a large file (>100 lines) and
+           no memory entry exists for that path, remind the agent to memorize it.
+        """
+        hints = []
+
+        # ── 1. Batching hint ──────────────────────────────────────────────────
+        # Only fire when the current turn also had exactly one tool call
+        if len(tool_calls) == 1:
+            single_call_turns = self._count_recent_single_tool_turns(lookback=3)
+            if single_call_turns >= 3:
+                hints.append(
+                    "[Efficiency] The last 3+ tool calls were each made in a separate "
+                    "response. When tool calls are independent (no output of one is "
+                    "needed as input to another), batch them together in a single "
+                    "response to reduce round-trips."
+                )
+                # Reset counter to avoid spamming every turn
+                self._single_tool_turn_streak = 0
+
+        # ── 2. Memory hint for large file reads ───────────────────────────────
+        for tc, result in zip(tool_calls, results):
+            if tc.get("name") != "read_file":
+                continue
+            if not isinstance(result, str):
+                continue
+            # Detect "lines X-Y of Z" pattern from read_file output
+            m = re.search(r"lines \d+-\d+ of (\d+)", result)
+            if not m:
+                continue
+            total_lines = int(m.group(1))
+            if total_lines < 100:
+                continue
+            path = tc.get("arguments", {}).get("path", "")
+            if not path:
+                continue
+            # Check if memory already has an entry for this file
+            filename = path.replace("\\", "/").split("/")[-1].lower()
+            try:
+                mem_entries = self.session_memory.list_entries()
+                already_memorized = any(
+                    filename in (e.get("key", "") + " " + e.get("content", "")).lower()
+                    for e in mem_entries
+                )
+            except Exception:
+                already_memorized = True  # Don't spam if memory is unavailable
+            if not already_memorized:
+                hints.append(
+                    f"[Memory] You just read a large file ({total_lines} lines): "
+                    f"`{path}`. Consider using `memory_write` to record key findings "
+                    "so you don't need to re-read it later."
+                )
+
+        for hint in hints:
+            self._inject_message(hint)
+
+    def _count_recent_single_tool_turns(self, lookback: int = 3) -> int:
+        """Count how many of the last N assistant turns had exactly one tool call."""
+        messages = self.history.get_messages()
+        count = 0
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                break
+            tool_uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+            if len(tool_uses) == 1:
+                count += 1
+                if count >= lookback:
+                    break
+            else:
+                # Non-single-tool turn breaks the streak
+                break
+        return count
 
     def _inject_message(self, msg: str):
         self.history.append({"role": "user", "content": msg})
