@@ -73,6 +73,7 @@ from flagscale.agent.react.guard.error_classifier import ErrorClassifierGuard
 from flagscale.agent.react.guard.circuit_breaker import CircuitBreakerGuard
 from flagscale.agent.react.guard.budget import BudgetGuard
 from flagscale.agent.react.guard.env_compat import EnvCompatGuard
+from flagscale.agent.react.guard.path_validation import PathValidationGuard
 from flagscale.agent.react.constraint.cache import ConstraintCache
 from flagscale.agent.react.prompt_builder import PromptBuilder
 from flagscale.agent.react.tool_executor import ToolExecutor, tool_display_summary
@@ -270,6 +271,9 @@ class WorkerAgent:
         self._current_stage_id: str | None = None  # For focused context injection
         self._skill_guards_registered: set[str] = set()  # Track registered skill guards
 
+        # Error pattern auto-memorization state
+        self._error_pattern_history: list[dict] = []  # [{turn, tool, error_snippet, fix_action}]
+
         self._refresh_system_prompt()
 
         # ── Initialize Kernel ──
@@ -298,6 +302,7 @@ class WorkerAgent:
         guard_registry.register(LoopDetectGuard())
         guard_registry.register(ErrorClassifierGuard())
         guard_registry.register(EnvCompatGuard())
+        guard_registry.register(PathValidationGuard())
 
         # Create ConstraintGuard (will be populated with Skill constraints later)
         self._constraint_guard = ConstraintGuard()
@@ -1604,11 +1609,13 @@ class WorkerAgent:
     def _inject_efficiency_hints(self, tool_calls: list, results: list):
         """Inject efficiency hints after tool execution.
 
-        Two checks:
+        Three checks:
         1. Batching hint — if the last N assistant turns each made exactly one
            independent tool call, remind the agent to batch them next time.
         2. Memory hint — if read_file returned a large file (>100 lines) and
            no memory entry exists for that path, remind the agent to memorize it.
+        3. Monitor duration hint — if monitor timed out with default/short duration,
+           suggest a longer duration for the next call.
         """
         hints = []
 
@@ -1659,6 +1666,15 @@ class WorkerAgent:
                     "so you don't need to re-read it later."
                 )
 
+        # ── 3. Monitor duration hint ──────────────────────────────────────────
+        for tc, result in zip(tool_calls, results):
+            hint = self._check_monitor_duration(tc, result)
+            if hint:
+                hints.append(hint)
+
+        # ── 4. Error pattern auto-memorization ───────────────────────────────
+        self._track_error_pattern(tool_calls, results)
+
         for hint in hints:
             self._inject_message(hint)
 
@@ -1685,7 +1701,217 @@ class WorkerAgent:
     def _inject_message(self, msg: str):
         self.history.append({"role": "user", "content": msg})
 
-    # ── Phase tracking ─────────────────────────────────────────────────────
+    def _check_monitor_duration(self, tc: dict, result: str) -> str | None:
+        """Return a hint if a monitor call timed out with a short duration.
+
+        Fires when:
+        - tool is 'monitor'
+        - result contains a timeout signal ("timed out" / "timeout reached" / "duration reached")
+        - the duration used was <= 300 s (default) or explicitly short
+        - the process being monitored appears to still be running (no "process died" in result)
+
+        Suggests doubling the duration (capped at 1800 s) for the next call.
+        Fires at most once per unique (file/command/output_dir) target per session.
+        """
+        if tc.get("name") != "monitor":
+            return None
+        if not isinstance(result, str):
+            return None
+
+        result_lower = result.lower()
+
+        # Only fire on timeout — not on success/error/process-dead exits
+        timeout_signals = ("timed out", "timeout reached", "duration reached", "max duration")
+        if not any(sig in result_lower for sig in timeout_signals):
+            return None
+
+        # Don't fire if the process already died — no point in longer duration
+        if "process died" in result_lower or "process has died" in result_lower:
+            return None
+
+        args = tc.get("arguments", {})
+        duration_used = args.get("duration", 300)  # default is 300 s
+
+        # Build a stable key for dedup: prefer output_dir > file > command
+        target = args.get("output_dir") or args.get("file") or args.get("command", "")
+        dedup_key = f"monitor_duration:{target}"
+        if not hasattr(self, "_monitor_duration_warned"):
+            self._monitor_duration_warned: set[str] = set()
+        if dedup_key in self._monitor_duration_warned:
+            return None
+        self._monitor_duration_warned.add(dedup_key)
+
+        suggested = min(duration_used * 2, 1800)
+        target_label = (
+            f"output_dir=`{args['output_dir']}`" if args.get("output_dir")
+            else f"file=`{args['file']}`" if args.get("file")
+            else f"command=`{args.get('command', '')[:60]}`"
+        )
+        return (
+            f"[Monitor] The monitor call for {target_label} timed out after "
+            f"{duration_used}s. The process appears to still be running. "
+            f"Consider using `duration={suggested}` on the next call, or set "
+            "`target_step` / `success_pattern` so the monitor exits early on completion."
+        )
+
+    # ── Error pattern auto-memorization ──────────────────────────────────────
+
+    # Patterns that indicate a tool result is an error
+    _ERROR_SIGNALS = re.compile(
+        r'(?:error|exception|traceback|failed|failure|not found|no such file'
+        r'|permission denied|command not found|syntax error|importerror'
+        r'|modulenotfounderror|attributeerror|typeerror|valueerror'
+        r'|nameerror|keyerror|indexerror|oserror|ioerror)',
+        re.IGNORECASE,
+    )
+
+    # Patterns that indicate a tool result is a success / fix worked
+    _SUCCESS_SIGNALS = re.compile(
+        r'(?:ok\b|success|passed|done\b|completed|fixed|resolved'
+        r'|\d+ passed|\bno errors?\b|syntax ok|all tests pass)',
+        re.IGNORECASE,
+    )
+
+    def _track_error_pattern(self, tool_calls: list, results: list):
+        """Detect error → fix → success triples and auto-memorize the workaround.
+
+        State machine per session:
+          IDLE → ERROR (when a tool result looks like an error)
+          ERROR → FIX_ATTEMPTED (when the next tool call looks like a fix:
+                  edit_file, write_file, or shell with a different command)
+          FIX_ATTEMPTED → SUCCESS → auto-memorize + reset to IDLE
+          Any state → IDLE on a new unrelated error or after 5 turns without success
+        """
+        if not hasattr(self, "_error_pattern_history"):
+            self._error_pattern_history = []
+
+        for tc, result in zip(tool_calls, results):
+            if not isinstance(result, str):
+                continue
+
+            tool_name = tc.get("name", "")
+            args = tc.get("arguments", {})
+
+            is_error = bool(self._ERROR_SIGNALS.search(result[:2000]))
+            is_success = bool(self._SUCCESS_SIGNALS.search(result[:2000]))
+
+            state = self._error_pattern_history
+
+            # ── 1. Check for fix tool calls FIRST (before success check) ──
+            # This ensures edit_file/write_file that return "Successfully edited"
+            # are recorded as fix events before the success branch fires.
+            if tool_name in ("edit_file", "write_file") and state:
+                last = state[-1] if state else None
+                if last and last["phase"] == "error":
+                    state.append({
+                        "phase": "fix",
+                        "tool": tool_name,
+                        "args": args,
+                        "turn": self.turn_count,
+                    })
+
+            elif tool_name == "shell" and state:
+                # A shell command after an error might be a fix
+                last = state[-1] if state else None
+                if last and last["phase"] == "error":
+                    prev_cmd = last.get("args", {}).get("command", "")
+                    curr_cmd = args.get("command", "")
+                    # Only count as fix if the command changed
+                    if curr_cmd and curr_cmd != prev_cmd:
+                        state.append({
+                            "phase": "fix",
+                            "tool": tool_name,
+                            "args": args,
+                            "turn": self.turn_count,
+                        })
+
+            # ── 2. Check for error ──
+            if is_error and not is_success:
+                # Start or extend error tracking
+                error_snippet = self._extract_error_snippet(result)
+                state.append({
+                    "phase": "error",
+                    "tool": tool_name,
+                    "args": args,
+                    "error_snippet": error_snippet,
+                    "turn": self.turn_count,
+                })
+                # Keep only the last 10 events total to avoid unbounded growth
+                if len(state) > 10:
+                    state.pop(0)
+
+            # ── 3. Check for success (after fix recording) ──
+            elif is_success and state:
+                # Check if we have an error → fix sequence to memorize
+                error_events = [e for e in state if e["phase"] == "error"]
+                fix_events = [e for e in state if e["phase"] == "fix"]
+
+                if error_events and fix_events:
+                    self._auto_memorize_error_pattern(
+                        error_events[-1], fix_events[-1], tool_name, result
+                    )
+                    state.clear()
+
+    def _extract_error_snippet(self, result: str, max_chars: int = 300) -> str:
+        """Extract the most informative part of an error message."""
+        lines = result.splitlines()
+        # Prefer lines containing error keywords
+        error_lines = [
+            l.strip() for l in lines
+            if self._ERROR_SIGNALS.search(l) and l.strip()
+        ]
+        if error_lines:
+            snippet = " | ".join(error_lines[:3])
+        else:
+            snippet = result.strip()
+        return snippet[:max_chars]
+
+    def _auto_memorize_error_pattern(
+        self, error_event: dict, fix_event: dict, success_tool: str, success_result: str
+    ):
+        """Write a memory entry for a confirmed error→fix→success pattern.
+
+        Uses a deterministic key based on the error snippet so duplicate
+        patterns don't create duplicate entries.
+        """
+        error_snippet = error_event.get("error_snippet", "")
+        fix_tool = fix_event.get("tool", "")
+        fix_args = fix_event.get("args", {})
+
+        # Build a short key from the first meaningful words of the error
+        key_words = re.sub(r'[^a-z0-9 ]', ' ', error_snippet.lower()).split()
+        key_suffix = "_".join(key_words[:4]) if key_words else "unknown"
+        mem_key = f"workaround_{key_suffix}"[:60]
+
+        # Build fix description
+        if fix_tool == "edit_file":
+            fix_desc = (
+                f"edit_file: replaced `{fix_args.get('old_string', '')[:80]}` "
+                f"with `{fix_args.get('new_string', '')[:80]}`"
+            )
+        elif fix_tool == "write_file":
+            fix_desc = f"write_file: rewrote `{fix_args.get('path', '')}`"
+        elif fix_tool == "shell":
+            fix_desc = f"shell: `{fix_args.get('command', '')[:120]}`"
+        else:
+            fix_desc = f"{fix_tool}: {str(fix_args)[:120]}"
+
+        content = (
+            f"Error: {error_snippet}\n"
+            f"Fix that worked: {fix_desc}\n"
+            f"Confirmed by: {success_tool} returning success signal."
+        )
+
+        try:
+            self.session_memory.put(
+                key=mem_key,
+                mem_type="finding",
+                content=content,
+            )
+        except Exception:
+            pass  # Never crash the main loop for a memory write
+
+    # ── Phase tracking ────────────────────────────────────────────────────────
 
     @property
     def phase(self) -> str:
